@@ -859,6 +859,175 @@ bool IsBufferDwordLoad(Decoder::Opcode opcode) {
 	}
 }
 
+// Experiment MovRelBounds: how many VGPRs from its base each V_MOVRELS/V_MOVRELD_B32 can reach,
+// by pc. Without it every one selects over all the registers after its base (NHL 27's compute
+// 6cb32e43: 31 of them over up to 128 registers, 2.7k guest instructions became 19.5k host ones and
+// 256 VGPRs plus scratch). The guest compiler indexes register arrays by M0 = index * stride, with
+// the index in an SGPR: within a block, M0's value is traced to such an SGPR and stride, and an
+// index variable's count is the fewest elements any of its arrays has before the next array that
+// variable indexes (the arrays a loop counter indexes are live together). Without an array after
+// one of them, or with M0 not traced, the full range stays. Counts are in units of the index SGPR, so
+// a stride hidden in it keeps them valid; bases closer than 4 (or the stride) are one array's
+// components (a vec3 at v0, v1 and v2 by M0 = index * 3, a pair at v0 and v1).
+std::unordered_map<uint32_t, uint32_t> MovRelExtents(const Decoder::Program& decoded, const CFG::Graph& cfg,
+                                                      uint32_t vector_limit) {
+	struct Sym {
+		int32_t  var  = -1; // the SGPR holding the index
+		uint32_t mult = 0;
+	};
+	struct MovRel {
+		uint32_t pc   = 0;
+		uint32_t base = 0;
+		Sym      index;
+	};
+	const auto key_of = [](const Decoder::Operand& operand) -> int32_t {
+		switch (operand.kind) {
+			case Decoder::OperandKind::Sgpr: return static_cast<int32_t>(operand.reg);
+			case Decoder::OperandKind::VccLo: return 1000;
+			case Decoder::OperandKind::VccHi: return 1001;
+			case Decoder::OperandKind::M0: return 1002;
+			default: return -1;
+		}
+	};
+	const auto constant_of = [](const Decoder::Operand& operand, uint32_t& value) {
+		if (operand.kind == Decoder::OperandKind::LiteralConstant ||
+		    operand.kind == Decoder::OperandKind::IntegerInlineConstant) {
+			value = operand.value;
+			return true;
+		}
+		return false;
+	};
+	std::vector<MovRel> movrels;
+	// A block with one predecessor starts with what that one ended with.
+	std::unordered_map<uint32_t, std::unordered_map<int32_t, Sym>> block_end;
+	for (const auto& cfg_block: cfg.blocks) {
+		std::unordered_map<int32_t, Sym> sym;
+		if (cfg_block.predecessors.size() == 1) {
+			if (const auto found = block_end.find(cfg_block.predecessors.front()); found != block_end.end()) {
+				sym = found->second;
+			}
+		}
+		const auto forget = [&](const Decoder::Operand& operand) {
+			const auto key = key_of(operand);
+			if (key < 0) return;
+			if (key < 1000) {
+				for (int32_t r = key; r < key + 16; r++) sym.erase(r); // up to an SMEM X16 load
+			} else {
+				sym.erase(key);
+			}
+		};
+		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end && index < decoded.instructions.size();
+		     index++) {
+			const auto& inst = decoded.instructions[index];
+			const auto  dst  = key_of(inst.dst);
+			uint32_t    k    = 0;
+			if (inst.opcode == Decoder::Opcode::V_MOVRELS_B32 || inst.opcode == Decoder::Opcode::V_MOVRELD_B32) {
+				const auto found = sym.find(1002);
+				movrels.push_back({inst.pc,
+				                   inst.opcode == Decoder::Opcode::V_MOVRELS_B32 ? inst.src0.reg : inst.dst.reg,
+				                   found != sym.end() ? found->second : Sym {}});
+				continue;
+			}
+			if (inst.opcode == Decoder::Opcode::S_MOV_B32 && dst >= 0) {
+				const auto src = key_of(inst.src0);
+				if (const auto found = sym.find(src); src >= 0 && found != sym.end()) {
+					sym[dst] = found->second;
+				} else if (inst.src0.kind == Decoder::OperandKind::Sgpr) {
+					sym[dst] = {src, 1};
+				} else {
+					sym.erase(dst);
+				}
+				continue;
+			}
+			if (inst.opcode == Decoder::Opcode::S_MUL_I32 && dst >= 0) {
+				const Decoder::Operand* reg = nullptr;
+				if (constant_of(inst.src1, k) && inst.src0.kind == Decoder::OperandKind::Sgpr) {
+					reg = &inst.src0;
+				} else if (constant_of(inst.src0, k) && inst.src1.kind == Decoder::OperandKind::Sgpr) {
+					reg = &inst.src1;
+				}
+				const auto src = reg != nullptr ? key_of(*reg) : -1;
+				const auto found = sym.find(src);
+				if (reg != nullptr && k != 0 && k <= 64) {
+					sym[dst] = found != sym.end() ? Sym {found->second.var, found->second.mult * k} : Sym {src, k};
+				} else {
+					sym.erase(dst);
+				}
+				continue;
+			}
+			forget(inst.dst);
+			forget(inst.dst2);
+			// Compares and carries write VCC without naming it.
+			if (inst.family == Decoder::Family::VOPC || inst.opcode == Decoder::Opcode::V_ADDC_U32 ||
+			    inst.opcode == Decoder::Opcode::V_SUB_CO_CI_U32 ||
+			    inst.opcode == Decoder::Opcode::V_SUBREV_CO_CI_U32) {
+				sym.erase(1000);
+				sym.erase(1001);
+			}
+			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 || inst.opcode == Decoder::Opcode::S_SETPC_B64) {
+				sym.clear();
+			}
+		}
+		block_end.emplace(cfg_block.id, std::move(sym));
+	}
+	// Per index SGPR: its bases, and the fewest elements an array before another one has.
+	std::unordered_map<int32_t, std::vector<const MovRel*>> by_var;
+	for (const auto& movrel: movrels) {
+		if (movrel.index.var >= 0 && movrel.index.var < 1000 && movrel.index.mult != 0) {
+			by_var[movrel.index.var].push_back(&movrel);
+		}
+	}
+	std::unordered_map<uint32_t, uint32_t> extents;
+	for (const auto& [var, list]: by_var) {
+		uint32_t count = UINT32_MAX;
+		for (const auto* movrel: list) {
+			// Bases closer than the stride (or than 4) with the same stride are components of one
+			// array (a vec3 array at v0, v1 and v2): the next array starts after the group.
+			const uint32_t gap   = std::max(movrel->index.mult, 4u);
+			uint32_t       first = movrel->base;
+			uint32_t       last  = movrel->base;
+			for (bool grew = true; grew;) {
+				grew = false;
+				for (const auto* other: list) {
+					if (other->index.mult != movrel->index.mult) continue;
+					if (other->base < first && first - other->base < gap) {
+						first = other->base;
+						grew  = true;
+					} else if (other->base > last && other->base - last < gap) {
+						last = other->base;
+						grew = true;
+					}
+				}
+			}
+			uint32_t next = UINT32_MAX;
+			for (const auto* other: list) {
+				if (other->base > last) {
+					next = std::min(next, other->base);
+				}
+			}
+			if (next != UINT32_MAX) {
+				count = std::min(count, (next - movrel->base - 1u) / movrel->index.mult + 1u);
+			}
+		}
+		if (count == UINT32_MAX) continue;
+		for (const auto* movrel: list) {
+			const auto extent = (count - 1u) * movrel->index.mult + 1u;
+			extents[movrel->pc] = std::min(extent, vector_limit > movrel->base ? vector_limit - movrel->base : 1u);
+		}
+	}
+	static const bool debug = std::getenv("KYTY_DBG_MOVREL") != nullptr;
+	if (debug && !movrels.empty()) {
+		std::printf("NHL27MOVREL: %zu movrels, %zu bounded\n", movrels.size(), extents.size());
+		for (const auto& movrel: movrels) {
+			const auto found = extents.find(movrel.pc);
+			std::printf("NHL27MOVREL: pc=0x%x base=v%u index=s%d*%u extent=%u\n", movrel.pc, movrel.base,
+			            movrel.index.var, movrel.index.mult, found != extents.end() ? found->second : 0u);
+		}
+		std::fflush(stdout);
+	}
+	return extents;
+}
+
 void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_t& vector_limit) {
 	const auto include_vector = [&](const Decoder::Operand& operand, uint32_t count = 1u) {
 		if (operand.kind == Decoder::OperandKind::Vgpr) {
@@ -1075,6 +1244,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			IncludeInstructionVectorRegisters(instruction, vector_limit);
 		}
 	}
+	const auto movrel_extents = ShaderMovRelBounds() ? MovRelExtents(decoded, cfg, vector_limit)
+	                                                 : std::unordered_map<uint32_t, uint32_t> {};
 	// KYTY_DBG_SHADER_SHAPE=1: the guest program's size and VGPR use, to compare with the host's.
 	static const bool shape_debug = std::getenv("KYTY_DBG_SHADER_SHAPE") != nullptr;
 	if (shape_debug) {
@@ -1431,6 +1602,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		Translator translator(result, block, vector_limit, flush_f32_inputs,
 		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute,
 		    fp16_coverage_ptr);
+		translator.SetMovRelExtents(&movrel_extents);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

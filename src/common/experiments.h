@@ -98,6 +98,9 @@ enum Bit : uint64_t {
 	// KYTY_FTZ32 (default on): shaders declare DenormFlushToZero for 32-bit floats (the guest's MODE
 	// flushes them) and transcendental inputs are no longer flushed by hand; part of shader keys.
 	Ftz32 = uint64_t {1} << 54u,
+	// KYTY_MOVREL_BOUNDS (default on): a V_MOVRELS/D_B32 selects over the registers of its array only
+	// (see MovRelExtents) instead of all after its base; part of shader keys.
+	MovRelBounds = uint64_t {1} << 55u,
 	// KYTY_EARLY_LATE_FRAGMENT_TESTS (default on): pixel shaders whose only side effects are the emulator's
 	// address fault records keep early depth tests (EarlyAndLateFragmentTestsAMD); shader key bit.
 	EarlyLateFragmentTests = uint64_t {1} << 53u,

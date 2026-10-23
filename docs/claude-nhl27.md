@@ -1120,6 +1120,16 @@ Toward 120 fps (2026-10-23):
   (`KYTY_DIRECT_EOP_INTERRUPTS`) or a label written on the execution thread drains first. In-boot
   A/B (AbPending6, bit 57: the old waits): drain waits ~55 -> ~12 ms/s, execution 13.4 vs 14.3 ms a
   frame, 71.0 vs 66.0 fps in the same match. Soak: 66.4 fps at 60 Hz, no errors.
+* Bit 55 `KYTY_MOVREL_BOUNDS` (default on; key bit 524288): `V_MOVRELS/D_B32` (register arrays
+  indexed by M0) selected over every VGPR after their base; compute `6cb32e43` (in play ~0.9 ms a
+  frame) has 31 of them over up to 128 registers: 2.7k guest instructions became 19.5k host ones
+  (2.9k `v_cndmask`) with 256 VGPRs and 192 bytes of scratch. `MovRelExtents` (Translate.cpp)
+  traces M0 within a block (and into single-predecessor blocks) to an SGPR times a stride, groups
+  bases closer than 4 (or the stride) as one array's components, and bounds an index SGPR by the
+  fewest elements one of its arrays has before the next array it indexes; untraced ones keep the
+  full range (`KYTY_DBG_MOVREL=1` prints them, `NHL27MOVREL`). `6cb32e43`: 23 of 31 bounded (4 and
+  10 registers), 247 VGPRs, no scratch. Paused A/B/A: 12.94 / 12.67 / 12.98 and 11.30 / 11.13 /
+  11.24 ms per flip (-1.2 to -2.2%); frames captured in play unchanged.
 * Tried: `KYTY_FUSED_MAD` again with GPU time per flip: 12.32 / 12.18 / 12.32 ms (-1.1%); left off
   (it changes rounding).
 * Match-start device losses (a GPU hang: flips stop, then `ErrorDeviceLost`, no fault addresses):

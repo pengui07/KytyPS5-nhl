@@ -415,7 +415,7 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	const auto m0       = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
 	                                    IR::U32(IR::Value(0xffu)));
 	auto       selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
-	for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
+	for (uint32_t index = base + 1u, end = MovRelEnd(inst, base); index < end; index++) {
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 		selected = ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
 	}
@@ -435,7 +435,7 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	const auto value = ReadU32(inst.src0);
 	const auto m0    = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
 	                                 IR::U32(IR::Value(0xffu)));
-	for (uint32_t index = base; index < current_vector_limit; index++) {
+	for (uint32_t index = base, end = MovRelEnd(inst, base); index < end; index++) {
 		const auto reg   = static_cast<IR::VectorReg>(index);
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 		const auto write = ir.LogicalAnd(ir.GetExec(), match);
