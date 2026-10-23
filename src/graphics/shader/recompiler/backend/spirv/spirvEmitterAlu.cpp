@@ -320,6 +320,10 @@ uint32_t EmitConvertU8U32(EmitterState& state, uint32_t arg0) {
 }
 
 uint32_t EmitConvertF16F32(EmitterState& state, uint32_t arg0) {
+	if (ShaderF16Converts()) {
+		state.builder.RequireCapability(spv::CapabilityFloat16);
+		return HalfToLow(state, Unary(state, spv::OpFConvert, TypeF16(state), arg0));
+	}
 	const auto pair = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 2), pair, arg0,
 	                          ConstantF32(state, 0));

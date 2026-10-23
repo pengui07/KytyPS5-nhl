@@ -78,6 +78,9 @@ enum Bit : uint64_t {
 	AbPending5 = uint64_t {1} << 56u,
 	AbPending6 = uint64_t {1} << 57u,
 	AbPending7 = uint64_t {1} << 58u,
+	// KYTY_F16_CONVERTS (default on; with NativeFp16): f32 <-> f16 conversions as OpFConvert on f16
+	// instead of PackHalf2x16 / UnpackHalf2x16; part of shader keys.
+	F16Converts = uint64_t {1} << 59u,
 	// KYTY_GUEST_OFF_STAGE_CORES (default on): threads without a CPU of their own (guest, driver
 	// and helper threads) keep off both logical CPUs of the execution and resolve threads' cores.
 	GuestOffStageCores = uint64_t {1} << 46u,

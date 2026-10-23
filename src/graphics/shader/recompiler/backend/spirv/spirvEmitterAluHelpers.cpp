@@ -248,6 +248,15 @@ uint32_t EmitTrigCycleF32(EmitterState& state, uint32_t src, bool preserve_signe
 }
 
 uint32_t EmitF16BitsToF32(EmitterState& state, uint32_t bits) {
+	if (ShaderF16Converts()) {
+		// See ShaderF16Converts: the low half as f16, converted.
+		state.builder.RequireCapability(spv::CapabilityFloat16);
+		const auto half_type = state.builder.Type(spv::OpTypeFloat, 16u);
+		const auto vector    = Unary(state, spv::OpBitcast, state.builder.Type(spv::OpTypeVector, half_type, 2u), bits);
+		const auto half      = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, half_type, half, vector, 0u);
+		return Unary(state, spv::OpFConvert, TypeF32(state), half);
+	}
 	const auto unpacked = state.builder.AllocateId();
 	const auto ret      = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpExtInst, TypeF32Vector(state, 2), unpacked, GlslStd450(state),

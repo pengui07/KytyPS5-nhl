@@ -1137,6 +1137,14 @@ Toward 120 fps (2026-10-23):
   through a direct-mapped cache (0.8%). In-boot A/B (AbPending7, bit 58: the old way): 3.68 vs 3.74
   us per draw. NHL 27 issues no occlusion queries in play (a run with every query counting no
   samples saw none).
+* GPU time in play by pass (per-draw timestamps): compute 55% (dispatches 28%, indirect 26%, async
+  2%), the 2348x1320 HDR draws 26%, the 3520x1980 ones 6%, depth-only 5%.
+* Bit 59 `KYTY_F16_CONVERTS` (default on with native f16; key bit 1048576): the f32 emulation of a
+  scalar f16 op packed its result with `PackHalf2x16`, which the AMD compiler emits as
+  `v_cvt_pk_rtz_f16_f32` (rounding toward zero, the guest rounds to nearest even); conversions are
+  now `OpFConvert` on f16 (`v_cvt_f16_f32`), and the host compiler folds ops between them into f16
+  forms. Compute `a36f0b4f`: 2622 -> 2493 instructions, 222 -> 123 `v_cvt_pk_rtz` (the rest pack
+  image results). Paused A/B/A: 10.47 / 10.31 / 10.49 ms per flip (-1.6%); frames normal.
 * Tried: `KYTY_FUSED_MAD` again with GPU time per flip: 12.32 / 12.18 / 12.32 ms (-1.1%); left off
   (it changes rounding).
 * Match-start device losses (a GPU hang: flips stop, then `ErrorDeviceLost`, no fault addresses):
