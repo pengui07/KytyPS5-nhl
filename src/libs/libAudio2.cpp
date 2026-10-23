@@ -213,6 +213,10 @@ struct AudioOut2LatencyState {
 };
 
 static Common::Mutex                              g_audioout2_state_mutex;
+// Held across a context's output to the backend, which can block for a grain while pacing SDL's
+// queue: it keeps the audio handles open (closing them takes it too), so the state mutex, which the
+// game's threads take for every port call, need not be held meanwhile.
+static Common::Mutex                              g_audioout2_output_mutex;
 static std::array<AudioOut2ContextState, 16>      g_audioout2_contexts;
 static std::array<AudioOut2PortStateEntry, 256>   g_audioout2_ports;
 static std::vector<AudioOut2UserHandle>          g_audioout2_users;
@@ -404,36 +408,64 @@ static void audioout2_mix_object(AudioOut2ContextState&         context,
 }
 
 static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
-	// The backend consumes the buffers synchronously, but can block while pacing SDL's queue.
-	// Keep both PCM storage and port handles alive until it returns.
-	Common::LockGuard lock(g_audioout2_state_mutex);
-	auto*             context = audioout2_find_context_locked(ctx);
-	if (context == nullptr) {
-		return;
-	}
-	context->object_mix.clear();
-	std::vector<AudioInternal::OutputParam> params;
-	params.reserve(AudioInternal::OUT_PORTS_MAX);
-	for (const auto& state: g_audioout2_ports) {
-		if (!state.used || state.context != ctx || state.pcm_data.empty()) {
-			continue;
+	// The backend consumes the buffers synchronously, but can block while pacing SDL's queue. The
+	// PCM and gains are copied under the state mutex and output without it (the game's threads
+	// waited in AudioOut2PortGetState behind the blocking output: 20-34% of NHL 27's job threads);
+	// the output mutex keeps the handles open until the output returns.
+	struct PortOutput {
+		int                   handle = 0;
+		std::vector<uint8_t>  pcm;
+		std::array<float, 16> gains {};
+	};
+	thread_local std::vector<PortOutput> outputs;
+	thread_local std::vector<float>      object_mix;
+	Common::LockGuard                    output_lock(g_audioout2_output_mutex);
+	size_t                               count         = 0;
+	int                                  object_handle = 0;
+	{
+		Common::LockGuard lock(g_audioout2_state_mutex);
+		auto*             context = audioout2_find_context_locked(ctx);
+		if (context == nullptr) {
+			return;
 		}
-		if (audioout2_port_type_is_object(state.port_type)) {
-			audioout2_mix_object(*context, state);
-		} else if (state.audio_handle > 0 && params.size() < AudioInternal::OUT_PORTS_MAX) {
-			params.push_back({state.audio_handle, state.pcm_data.data(), state.gains.data()});
+		context->object_mix.clear();
+		for (const auto& state: g_audioout2_ports) {
+			if (!state.used || state.context != ctx || state.pcm_data.empty()) {
+				continue;
+			}
+			if (audioout2_port_type_is_object(state.port_type)) {
+				audioout2_mix_object(*context, state);
+			} else if (state.audio_handle > 0 && count < AudioInternal::OUT_PORTS_MAX) {
+				if (outputs.size() <= count) {
+					outputs.emplace_back();
+				}
+				auto& output  = outputs[count++];
+				output.handle = state.audio_handle;
+				output.pcm.assign(state.pcm_data.begin(), state.pcm_data.end());
+				output.gains = state.gains;
+			}
+		}
+		if (!context->object_mix.empty() && count < AudioInternal::OUT_PORTS_MAX) {
+			object_mix.assign(context->object_mix.begin(), context->object_mix.end());
+			object_handle = context->object_audio_handle;
 		}
 	}
-	if (!context->object_mix.empty() && params.size() < AudioInternal::OUT_PORTS_MAX) {
-		params.push_back({context->object_audio_handle, context->object_mix.data()});
+	std::array<AudioInternal::OutputParam, AudioInternal::OUT_PORTS_MAX> params {};
+	uint32_t                                                             params_num = 0;
+	for (size_t i = 0; i < count; i++) {
+		params[params_num++] = {outputs[i].handle, outputs[i].pcm.data(), outputs[i].gains.data()};
 	}
-	if (!params.empty()) {
-		(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
-		                                     blocking);
+	if (object_handle != 0) {
+		params[params_num++] = {object_handle, object_mix.data()};
+	}
+	if (params_num != 0) {
+		(void)AudioInternal::AudioOutOutputs(params.data(), params_num, blocking);
 	}
 }
 static void audioout2_close_audio_handle(int audio_handle) {
 	if (audio_handle > 0) {
+		// Not while an output may still use it.
+		Common::LockGuard output_lock(g_audioout2_output_mutex);
 		AudioInternal::AudioOutClose(audio_handle);
 	}
 }
