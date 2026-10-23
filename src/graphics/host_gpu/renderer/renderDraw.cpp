@@ -1840,41 +1840,6 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
-	// Experiment LazyGuestBarriers: an owed guest barrier is recorded here when the draw needs it.
-	GuestBarriers::CheckedScope guest_checked;
-	if (GuestBarriers::Active()) {
-		thread_local std::vector<GuestBarriers::Range> reads, writes;
-		reads.clear();
-		writes.clear();
-		if (draw.IsIndexed() && index_source.address != 0) {
-			reads.emplace_back(index_source.address,
-			                   static_cast<uint64_t>(draw.index_count) * index_source.guest_element_size);
-		}
-		const auto& vs_input = state.vertex_info[0];
-		for (int i = 0; !mesh_active && i < vs_input.buffers_num; i++) {
-			const auto size = VertexBufferDescriptorSize(i, vs_input);
-			if (size != 0) reads.emplace_back(vs_input.buffers[i].addr, size);
-		}
-		if (emit.indirect != nullptr) {
-			reads.emplace_back(emit.indirect->args_addr, emit.indirect->ArgsSize());
-			if (emit.indirect->count_addr != 0) reads.emplace_back(emit.indirect->count_addr, sizeof(uint32_t));
-		}
-		for (uint32_t i = 0; i < state.color_count; i++) {
-			const auto& data = state.colors[i].desc.info.data;
-			if (data.size != 0) writes.emplace_back(data.address, data.size);
-		}
-		for (uint32_t i = 0; i < state.color_count; i++) {
-			const auto& metadata = state.colors[i].desc.info.metadata.range;
-			if (metadata.size != 0) writes.emplace_back(metadata.address, metadata.size);
-		}
-		if (state.depth->image_id) {
-			for (const auto& range: {state.depth->desc.info.data, state.depth->desc.info.stencil,
-			                         state.depth->desc.info.metadata.range}) {
-				if (range.size != 0) writes.emplace_back(range.address, range.size);
-			}
-		}
-		GuestBarriers::CheckWork(buffer, stages, reads, writes, false);
-	}
 	if (draw.IsIndexed()) {
 		LogDrawPhase(draw.Name(), "CreatePipeline");
 	}

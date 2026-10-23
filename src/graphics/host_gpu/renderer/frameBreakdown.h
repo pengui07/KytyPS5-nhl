@@ -250,6 +250,7 @@ inline PipelineStats g_pl;
 struct BufStats {
 	// ObtainBuffer (rebind scope)
 	std::atomic<uint64_t> ob_calls {0}, ob_written {0}, ob_stream {0}, ob_find_calls {0}, ob_syncs {0};
+	std::atomic<uint64_t> ob_clean {0}; // reads of CPU-clean ranges that skipped SynchronizeBuffer
 	std::atomic<uint64_t> ob_stream_check_ns {0};  // stream fast-path GPU/CPU-modified walks (tracker)
 	std::atomic<uint64_t> ob_stream_copy_ns {0};   // stream Map + memcpy + Commit
 	std::atomic<uint64_t> ob_find_ns {0};          // FindBuffer when the supplied id was not usable
@@ -1257,14 +1258,14 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            ms(c_get), ms(c_prep), ms(c_bind), per(c_n), per(c_rep), per(c_b), per(c_sk));
 			auto& bf = g_buf;
 			const uint64_t o_calls = Take(bf.ob_calls), o_wr = Take(bf.ob_written), o_st = Take(bf.ob_stream);
-			const uint64_t o_fc = Take(bf.ob_find_calls), o_sy = Take(bf.ob_syncs);
+			const uint64_t o_fc = Take(bf.ob_find_calls), o_sy = Take(bf.ob_syncs), o_cl = Take(bf.ob_clean);
 			const uint64_t o_sck = Take(bf.ob_stream_check_ns), o_scp = Take(bf.ob_stream_copy_ns);
 			const uint64_t o_fn = Take(bf.ob_find_ns), o_tn = Take(bf.ob_touch_ns), o_sn = Take(bf.ob_sync_ns);
 			const uint64_t o_bk = Take(bf.ob_book_ns), o_inv = Take(bf.ob_invalidate_ns);
 			std::printf("NHL27BUFFERS2 rebind_lookup=%.2fms obtain: calls=%.1f written=%.1f stream_path=%.1f "
-			            "find_calls=%.1f syncs=%.1f stream_check=%.2fms stream_copy=%.2fms find=%.2fms touch=%.2fms "
-			            "sync=%.2fms book=%.2fms invalidate_gpu=%.2fms\n",
-			            ms(dp_rebind_lookup_ns), per(o_calls), per(o_wr), per(o_st), per(o_fc), per(o_sy), ms(o_sck),
+			            "find_calls=%.1f syncs=%.1f clean=%.1f stream_check=%.2fms stream_copy=%.2fms find=%.2fms "
+			            "touch=%.2fms sync=%.2fms book=%.2fms invalidate_gpu=%.2fms\n",
+			            ms(dp_rebind_lookup_ns), per(o_calls), per(o_wr), per(o_st), per(o_fc), per(o_sy), per(o_cl), ms(o_sck),
 			            ms(o_scp), ms(o_fn), ms(o_tn), ms(o_sn), ms(o_bk), ms(o_inv));
 			std::printf("NHL27BUFFERS2 obtain_cache: hits=%.1f misses=%.1f\n", per(obtain_cache_hits), per(obtain_cache_misses));
 			static const char* const sb_name[2] = {"rebind", "bda"};

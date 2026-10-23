@@ -392,6 +392,9 @@ private:
 	// and the description each had, so draws that alternate programs on a stage skip the
 	// description lookups of unchanged T#s (see PrepareBindings()).
 	std::unordered_map<const void*, ProgramImageMemo> m_program_image_memos;
+	// Per program too: its buffer slots, so an unchanged V# finds what it bound the program's last
+	// draw (see PrepareBindings()).
+	std::unordered_map<const void*, ProgramBufferMemo> m_program_buffer_memos;
 	// The last TextureDescDerivation::Found::serial given out.
 	uint64_t m_found_serial = 0;
 

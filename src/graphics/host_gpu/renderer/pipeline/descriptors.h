@@ -82,6 +82,8 @@ struct ProgramImageMemo {
 	const void*                 holder = nullptr;
 };
 
+struct ProgramBufferMemo;
+
 struct PreparedBindings {
 	struct BufferSource {
 		uint64_t address = 0;
@@ -140,6 +142,23 @@ struct PreparedBindings {
 	std::vector<ShaderRecompiler::IR::DescriptorValue> last_samplers;
 	// The image memo of `last_program` (RenderExecutor::m_program_image_memos).
 	ProgramImageMemo* image_memo = nullptr;
+	// The buffer memo of `last_program` (RenderExecutor::m_program_buffer_memos).
+	ProgramBufferMemo* buffer_memo = nullptr;
+};
+
+// A program's buffer slots (sources, V# keys and bind memos) while another program uses its stage:
+// swapped with the PreparedBindings ones, which `holder` has meanwhile.
+struct ProgramBufferMemo {
+	std::vector<PreparedBindings::BufferSource>   buffer_sources;
+	std::vector<PreparedBindings::BufferSlotKey>  buffer_keys;
+	std::vector<PreparedBindings::BufferSlotMemo> buffer_memos;
+	const void*                                   holder = nullptr;
+
+	void Swap(PreparedBindings& prepared) noexcept {
+		buffer_sources.swap(prepared.buffer_sources);
+		buffer_keys.swap(prepared.buffer_keys);
+		buffer_memos.swap(prepared.buffer_memos);
+	}
 };
 
 [[nodiscard]] vk::DescriptorType
@@ -170,37 +189,6 @@ void DrawBegin();
 void DrawEnd();
 } // namespace DrawRepeats
 
-class CommandBuffer;
-
-// Experiment LazyGuestBarriers (bit 52, KYTY_LAZY_GUEST_BARRIERS): a guest global barrier is owed to the
-// recording target instead of recorded, and recorded before the first later draw or dispatch that reads
-// a range written before it, writes a range read or written before it, or accesses memory by address,
-// and before any other work that accesses memory there (CommandRecorder::GuestWork). The ranges are the
-// bound buffers, the images (data, stencil, metadata), the attachments and the index, vertex and indirect
-// ranges. KYTY_DBG_BARRIER_HAZARDS=1 prints how the barriers went (NHL27HAZARDS every 5 s).
-namespace GuestBarriers {
-using Range = std::pair<uint64_t, uint64_t>; // address, size
-[[nodiscard]] bool Lazy();
-[[nodiscard]] bool StatsEnabled();
-// ExecuteGlobalBarrier with the experiment on: owes `barrier` to `buffer`'s recording target. False:
-// record it now (not all the work since the last recorded barrier was tracked, or too many ranges).
-[[nodiscard]] bool Owe(CommandBuffer& buffer, const vk::MemoryBarrier2& barrier);
-// ExecuteGlobalBarrier recorded the barrier: nothing is owed and tracking starts over.
-void Recorded();
-// A draw or dispatch is checked, or a barrier is owed: CheckWork has something to do.
-[[nodiscard]] bool Active();
-// Until it ends, the checked draw's or dispatch's commands do not record an owed barrier.
-struct CheckedScope {
-	CheckedScope() = default;
-	~CheckedScope();
-	CheckedScope(const CheckedScope&)            = delete;
-	CheckedScope& operator=(const CheckedScope&) = delete;
-};
-// A draw or dispatch about to record its commands, with its ranges besides its stages' bindings:
-// records an owed barrier first when the work overlaps the work before it.
-void CheckWork(CommandBuffer& buffer, std::span<PreparedBindings* const> stages, std::span<const Range> reads,
-               std::span<const Range> writes, bool unknown);
-} // namespace GuestBarriers
 
 } // namespace Libs::Graphics
 

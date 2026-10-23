@@ -1898,7 +1898,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		TouchBuffer(buffer);
 	}
 	bool synced_from_image = false;
-	{
+	// A read of a range without CPU-dirty pages has nothing to upload, and a texel read with no
+	// image at the address nothing to copy from one: SynchronizeBuffer would walk the region's
+	// pages under its lock and find nothing (about 5,000 of the 5,200 synchronizations a frame of
+	// binds made in play). The check reads the bit words without the lock, as the memo above does.
+	if ((plain_read || texel_read) && !m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		if (bon) bs.ob_clean.fetch_add(1, std::memory_order_relaxed);
+	} else {
 		FrameBreakdown::Timer sync_timer(bs.ob_sync_ns, bon);
 		if (bon) bs.ob_syncs.fetch_add(1, std::memory_order_relaxed);
 		synced_from_image = SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);

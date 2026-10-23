@@ -62,7 +62,6 @@ uint64_t EnvironmentMask() {
 	set("KYTY_EXEC_BRANCH_MEMORY", ExecBranchMemory, true);
 	set("KYTY_EXEC_BRANCH_CONTINUE", ExecBranchContinue, true);
 	set("KYTY_F16_LANE_VIEWS", F16LaneViews, true);
-	set("KYTY_LAZY_GUEST_BARRIERS", LazyGuestBarriers, false);
 	set("KYTY_EARLY_LATE_FRAGMENT_TESTS", EarlyLateFragmentTests, true);
 	set("KYTY_BDA_LOAD_GROUPS", BdaLoadGroups, true);
 	// On since 2026-10-22: with the stage cores kept for the stages, the resolve thread limited the

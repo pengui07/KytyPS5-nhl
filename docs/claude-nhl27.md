@@ -1005,20 +1005,21 @@ Toward 120 fps (2026-10-23):
 * `KYTY_DBG_DRAW_REPEATS=1` (`NHL27REPEATS`): per stage, against the last use of its program, the
   T#s were the same 84% of the time, the S#s 99.5%, all V#s 49% (40% of the buffer slots changed),
   the user data 12%. 66% of the draws had every stage's T#s and S#s unchanged; 0.1% repeated all.
-* `KYTY_DBG_BARRIER_HAZARDS=1` (`NHL27HAZARDS`): a guest barrier stays pending until a later draw or
+* `KYTY_DBG_BARRIER_HAZARDS=1` (`NHL27HAZARDS`, since removed): a guest barrier stays pending until a later draw or
   dispatch reads a range written before it, writes a range read or written before it, or accesses
   memory by address (bound buffers, images, attachments, index, vertex and indirect ranges; the
   emulator's own passes and copies are not counted). In play 59% of the guest barriers (11.7k/s)
   would be kept: 23k read-after-write, 16k write-after-write, 7.5k write-after-read, 6k by-address
   in 5 s; 19% of the draws and dispatches use addresses.
-* Bit 52 `KYTY_LAZY_GUEST_BARRIERS` (default off): the guest barrier is owed to the recording target
+* Bit 52 `KYTY_LAZY_GUEST_BARRIERS` (tried, removed again with the `NHL27HAZARDS` probe: its checks cost
+  0.3% of the execution thread even while off): the guest barrier is owed to the recording target
   and recorded before the first draw or dispatch whose ranges overlap the work before it (or that
   uses addresses), and before any other command there that accesses memory (`CommandRecorder::GuestWork`:
   copies, fills, clears, dispatches, render pass begins; draws only after a check). With it 18% of the
   guest barriers went unrecorded (the other commands, mostly the emulator's own uploads, took 28k of
   the 50k recorded in 5 s); images were normal. Paused GPU A/B/A without per-draw timestamps:
   14.46 / 14.24 / 14.40 ms per flip (-1.4%), while draws cost 3.74 -> 4.09 us on the execution thread
-  (collecting the ranges): in play 61.5 vs 65.5 fps. Left off. The paused scene was 95% GPU-busy at
+  (collecting the ranges): in play 61.5 vs 65.5 fps. The paused scene was 95% GPU-busy at
   14.4 ms per flip: the GPU limits it to about 69 fps.
 * GPU time by shader in 60 Hz play (`KYTY_PERF_GPU_TIMING=2`, 744 frames): compute `a36f0b4f` 0.98 ms
   a frame, pixel `33037c605e42f4ce` (a full-screen pass) 0.88, compute `d7cfa519` about 1.1 over three
@@ -1045,6 +1046,18 @@ Toward 120 fps (2026-10-23):
   `33037c60` lost all 312 stores and half its branches and its 170 vector loads became scalar, but
   SGPR spills to VGPR lanes went 183 -> 575 `v_readlane` and VGPRs 252 -> 243 only; a heavy paused
   scene took 25.27 / 25.73 / 25.43 ms per flip (A/B/A, +1.5%).
+* Buffer binds per frame (`KYTY_PERF_STATS_VERBOSE=1`, `NHL27BUFFERS2`): `RebindBuffers` sent 11.5k
+  bindings to `ObtainBuffer` (926 written, 1 stream copy, 2.6k plain reads through the obtain cache,
+  the rest texel reads), and 5.2k of them walked the tracker's pages under the region lock in
+  `SynchronizeBuffer` to upload 3 ranges. Now a read of a range without CPU-dirty pages (lock-free bit
+  check; a texel read only when no image starts at the address) skips `SynchronizeBuffer` (1.1k walks
+  left), and the buffer slots (sources, V# keys, bind memos) are kept per program like the image
+  memo, so a slot compares with the program's last draw rather than the stage's (10.3k bindings sent).
+  In-boot A/B, 6 rounds: 66.3 fps and 906 ms/s of execution with both, 64.3 / 944 with the old syncs,
+  65.6 / 938 with the old slot memos.
+* Tried: skipping the region lock in the BDA dirty-span drain when the span had no CPU-dirty page
+  (`ForEachCpuDirtySpanBefore`, where the profile showed 2.8% spinning on that lock): 63.2 vs 64.3 fps,
+  draw 3.80 vs 3.82 us; dropped.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

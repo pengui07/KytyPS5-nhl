@@ -6,7 +6,6 @@
 #include "common/spscQueue.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
-#include <atomic>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -203,18 +202,6 @@ private:
 	Common::SpscQueue<ChunkPtr> m_recycled;
 };
 
-class CommandRecorder;
-
-// Experiment LazyGuestBarriers (GuestBarriers in pipeline/descriptors.h): the recording target whose
-// work the execution thread tracks, and whether it owes a guest global barrier not recorded yet.
-// Commands that access memory there outside a draw or dispatch that checked its ranges
-// (t_guest_work_checked) record an owed barrier first.
-inline std::atomic<const void*> g_guest_barrier_target {nullptr};
-inline std::atomic<bool>        g_guest_barrier_owed {false};
-inline thread_local bool        t_guest_work_checked = false;
-void RecordOwedGuestBarrier(const CommandRecorder& recorder);
-void NoteUncheckedGuestDraw();
-
 // The vkCmd* subset used by the renderer. A recorder either calls the Vulkan command buffer
 // directly or appends the command to a CommandStream; the method names and signatures follow
 // vk::CommandBuffer so recording code does not depend on the mode.
@@ -232,21 +219,6 @@ public:
 	[[nodiscard]] const void* Key() const noexcept {
 		return m_stream != nullptr ? static_cast<const void*>(m_stream)
 		                           : static_cast<const void*>(static_cast<VkCommandBuffer>(m_direct));
-	}
-	// Work outside a render pass that reads or writes memory: an owed guest barrier comes first
-	// (a render pass begins with beginRendering, which checks).
-	void GuestWork() const {
-		if (g_guest_barrier_owed.load(std::memory_order_relaxed) && !t_guest_work_checked &&
-		    g_guest_barrier_target.load(std::memory_order_relaxed) == Key()) {
-			RecordOwedGuestBarrier(*this);
-		}
-	}
-	// Draws: only checked draws may meet an owed barrier (counted otherwise, see NHL27HAZARDS).
-	void GuestDraw() const {
-		if (g_guest_barrier_owed.load(std::memory_order_relaxed) && !t_guest_work_checked &&
-		    g_guest_barrier_target.load(std::memory_order_relaxed) == Key()) {
-			NoteUncheckedGuestDraw();
-		}
 	}
 	// The Vulkan command buffer of a direct recorder (presentation paths that are never deferred).
 	[[nodiscard]] vk::CommandBuffer Direct() const {
@@ -296,7 +268,6 @@ public:
 	}
 
 	void dispatch(uint32_t x, uint32_t y, uint32_t z) const {
-		GuestWork();
 		if (m_stream == nullptr) {
 			m_direct.dispatch(x, y, z);
 			return;
@@ -304,7 +275,6 @@ public:
 		m_stream->Record([=](vk::CommandBuffer c) { c.dispatch(x, y, z); });
 	}
 	void dispatchIndirect(vk::Buffer buffer, vk::DeviceSize offset) const {
-		GuestWork();
 		if (m_stream == nullptr) {
 			m_direct.dispatchIndirect(buffer, offset);
 			return;
@@ -313,7 +283,6 @@ public:
 	}
 	void draw(uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex,
 	          uint32_t first_instance) const {
-		GuestDraw();
 		if (m_stream == nullptr) {
 			m_direct.draw(vertex_count, instance_count, first_vertex, first_instance);
 			return;
@@ -324,7 +293,6 @@ public:
 	}
 	void drawIndexed(uint32_t index_count, uint32_t instance_count, uint32_t first_index,
 	                 int32_t vertex_offset, uint32_t first_instance) const {
-		GuestDraw();
 		if (m_stream == nullptr) {
 			m_direct.drawIndexed(index_count, instance_count, first_index, vertex_offset,
 			                     first_instance);
@@ -335,7 +303,6 @@ public:
 		});
 	}
 	void drawMeshTasksEXT(uint32_t x, uint32_t y, uint32_t z) const {
-		GuestDraw();
 		if (m_stream == nullptr) {
 			m_direct.drawMeshTasksEXT(x, y, z);
 			return;
@@ -344,7 +311,6 @@ public:
 	}
 	void drawIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                  uint32_t stride) const {
-		GuestDraw();
 		if (m_stream == nullptr) {
 			m_direct.drawIndirect(buffer, offset, count, stride);
 			return;
@@ -353,7 +319,6 @@ public:
 	}
 	void drawIndexedIndirect(vk::Buffer buffer, vk::DeviceSize offset, uint32_t count,
 	                         uint32_t stride) const {
-		GuestDraw();
 		if (m_stream == nullptr) {
 			m_direct.drawIndexedIndirect(buffer, offset, count, stride);
 			return;
@@ -363,7 +328,6 @@ public:
 	}
 	void drawIndirectCount(vk::Buffer buffer, vk::DeviceSize offset, vk::Buffer count_buffer,
 	                       vk::DeviceSize count_offset, uint32_t max_count, uint32_t stride) const {
-		GuestDraw();
 		if (m_stream == nullptr) {
 			m_direct.drawIndirectCount(buffer, offset, count_buffer, count_offset, max_count, stride);
 			return;
@@ -375,7 +339,6 @@ public:
 	void drawIndexedIndirectCount(vk::Buffer buffer, vk::DeviceSize offset,
 	                              vk::Buffer count_buffer, vk::DeviceSize count_offset,
 	                              uint32_t max_count, uint32_t stride) const {
-		GuestDraw();
 		if (m_stream == nullptr) {
 			m_direct.drawIndexedIndirectCount(buffer, offset, count_buffer, count_offset, max_count,
 			                                  stride);
@@ -456,7 +419,6 @@ public:
 	}
 	void fillBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                uint32_t value) const {
-		GuestWork();
 		if (m_stream == nullptr) {
 			m_direct.fillBuffer(buffer, offset, size, value);
 			return;

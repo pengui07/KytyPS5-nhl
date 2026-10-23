@@ -3823,16 +3823,11 @@ void CommandProcessor::ExecuteGlobalBarrier() {
 		barrier.dstAccessMask |= vk::AccessFlagBits2::eConditionalRenderingReadEXT;
 	}
 
-	// Experiment LazyGuestBarriers: owed until later work needs it (GuestBarriers::CheckWork).
-	if (GuestBarriers::Lazy() && GuestBarriers::Owe(CurrentBuffer(), barrier)) {
-		return;
-	}
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
-	GuestBarriers::Recorded();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
