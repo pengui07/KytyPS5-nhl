@@ -1106,6 +1106,12 @@ Toward 120 fps (2026-10-23):
   event types emit nothing. In-boot A/B: operations -12% (322k vs 368k a second), execution 3.52 vs
   3.65 us per draw. The CPU-side crumb ring for hang reports holds 4096 commands (16384, 640 KiB, kept
   missing the L2 cache: 0.9% of the execution thread). Soak: 67.6 fps at 60 Hz, no errors.
+* Then a barrier is not emitted whenever nothing since the previous one may record GPU work (only
+  barriers, BDA boundaries, end-of-pipe labels and interrupts, WRITE_DATA: label writes order their
+  own GPU copies), and a BDA boundary is no operation of its own: the next draw or dispatch, the
+  only ones that synchronize, carries it and executes it first. In-boot A/B: operations -13.5%
+  (269k vs 311k a second; barriers 18k vs 39k, BDA boundaries 1.3k vs 17k), execution 13.2 vs 13.7
+  ms a frame (per draw within noise). Soak: 69.0 fps at 60 Hz over 132 s, no errors.
 * Tried: `KYTY_FUSED_MAD` again with GPU time per flip: 12.32 / 12.18 / 12.32 ms (-1.1%); left off
   (it changes rounding).
 * Match-start device losses (a GPU hang: flips stop, then `ErrorDeviceLost`, no fault addresses):

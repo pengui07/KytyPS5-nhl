@@ -1305,13 +1305,26 @@ GpuRegisterState CommandProcessor::SnapshotState(uint64_t sequence) {
 // last BDA boundary emitted: one command processor thread emits them all.
 static uint64_t g_work_emitted     = 0;
 static uint64_t g_bda_work_emitted = ~uint64_t {0};
+// Whether an operation that may record GPU work was emitted since the last global barrier (see
+// EmitGlobalBarrier): not a barrier, BDA boundary, end-of-pipe label or interrupt, or WRITE_DATA.
+static bool g_work_since_barrier = true;
+// A BDA boundary the next draw or dispatch carries (see BdaBoundary).
+static bool g_bda_boundary_pending = false;
 
 uint64_t CommandProcessor::Emit(GpuOperation&& operation) {
 	if (m_pipeline != nullptr) {
 		EXIT_IF(operation.kind != GpuOperationKind::Callback &&
 		        m_pipeline->NextSequence() !=
 		            m_ctx_snapshots.last_use[m_ctx_snapshots.current]);
-		g_work_emitted += operation.kind != GpuOperationKind::Callback ? 1u : 0u;
+		if (operation.kind != GpuOperationKind::Callback) {
+			++g_work_emitted;
+			operation.bda_boundary = std::exchange(g_bda_boundary_pending, false);
+		}
+		g_work_since_barrier = g_work_since_barrier || operation.kind != GpuOperationKind::Callback ||
+		                       (operation.callback_tag != GpuCallbackTag::Barrier &&
+		                        operation.callback_tag != GpuCallbackTag::Bda &&
+		                        operation.callback_tag != GpuCallbackTag::Eop &&
+		                        operation.callback_tag != GpuCallbackTag::WriteData);
 		return m_pipeline->EmitOperation(std::move(operation));
 	}
 	Execute(operation);
@@ -1355,6 +1368,12 @@ void CommandProcessor::BdaBoundary(RenderContext::BdaBoundary kind) {
 		return;
 	}
 	g_bda_work_emitted = g_work_emitted;
+	// Only the next draw or dispatch synchronizes (PrepareBda): it executes the boundary first
+	// (20k boundary operations a second). AbPending5: an operation of its own.
+	if (!FrameBreakdown::Enabled() && !Common::Experiments::Enabled(Common::Experiments::AbPending5)) {
+		g_bda_boundary_pending = true;
+		return;
+	}
 	// KYTY_BDA_BATCH orders boundaries with the draws and dispatches that execute around them.
 	const auto saved_trace_op = g_trace_op;
 	g_trace_op                = static_cast<uint16_t>(g_trace_op | 0x4000u);
@@ -1371,6 +1390,9 @@ uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback, GpuCallbackTag t
 
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
+	if (operation.bda_boundary) {
+		m_renderer.BdaBatchBoundary(RenderContext::BdaBoundary::Other);
+	}
 	m_renderer.SetOperationWriteEpoch(operation.write_epoch);
 	BindState(operation.state);
 	auto& executor = m_renderer.GetRenderExecutor();
@@ -3781,23 +3803,26 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 	                 interrupt_context_id, false);
 }
 
-// The sequence of the last global barrier operation a pipelined command processor emitted.
-static uint64_t g_barrier_sequence = 0;
-
 void CommandProcessor::EmitGlobalBarrier() {
-	// A barrier right after another one, with no operation between them, orders nothing more: the
-	// execution thread skipped it (KYTY_GUEST_BARRIER_DEDUP), after its trip through the pipeline
-	// (in play 118k barrier and flush-event operations a second for 13k recorded barriers; in-boot
-	// A/B: operations -12%, execution 3.52 vs 3.65 us per draw).
-	if (m_pipeline != nullptr) {
-		const auto sequence = m_pipeline->NextSequence();
-		if (g_barrier_sequence != 0 && sequence == g_barrier_sequence + 1 &&
-		    Common::RuntimeFlags::Current().guest_barrier_dedup) {
+	// A barrier with no operation since the previous one that may record GPU work orders nothing
+	// more: the execution thread skipped it (KYTY_GUEST_BARRIER_DEDUP: no draw, dispatch or helper
+	// pass since), after its trip through the pipeline (in play 118k barrier and flush-event operations a
+	// second for 13k recorded barriers; skipping just back-to-back ones, in-boot A/B: operations
+	// -12%, execution 3.52 vs 3.65 us per draw). AbPending5: only back-to-back ones.
+	if (m_pipeline != nullptr && Common::RuntimeFlags::Current().guest_barrier_dedup) {
+		static uint64_t last_sequence = 0;
+		const auto      sequence      = m_pipeline->NextSequence();
+		const bool      redundant     = Common::Experiments::Enabled(Common::Experiments::AbPending5)
+		                                    ? last_sequence != 0 && sequence == last_sequence + 1
+		                                    : !g_work_since_barrier;
+		if (redundant) {
 			return;
 		}
-		g_barrier_sequence = sequence;
+		last_sequence        = sequence;
+		g_work_since_barrier = false;
 	}
 	EmitCallback([this] { ExecuteGlobalBarrier(); }, GpuCallbackTag::Barrier);
+	g_work_since_barrier = false;
 }
 
 void CommandProcessor::ExecuteGlobalBarrier() {
