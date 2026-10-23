@@ -1149,6 +1149,12 @@ Toward 120 fps (2026-10-23):
   packed as f16 pairs from `OpFConvert` (the `PackHalf2x16` per lane avoided an RDNA4 driver crash
   on two components of one sample; this form compiles). `a36f0b4f`: 2493 -> 2362 instructions,
   `v_cvt_pk_rtz` 123 -> 31. Paused A/B/A: 21.40 / 20.94 / 21.03 ms per flip (-1.3%); frames normal.
+* Bit 61 `KYTY_EXEC_RUN_TRANSPARENT` (default on; key bit 4194304): `KYTY_DBG_EXEC_BRANCH=2`
+  (`NHL27EXECBREAK`) counts what ends a stretch of ExecBranches candidates that holds EXEC selects; in
+  the heaviest shaders mostly `Reference` (no code), `GetImageResource`, `GetBufferResource`,
+  `GetSrtResource` and `LaneId`, which do not depend on EXEC. They no longer end a run (used after
+  it, they are emitted before the branch). Paused A/B/A: 12.56 / 12.36 / 12.51 ms per flip
+  (-1.4%); frames normal.
 * Tried: `KYTY_FUSED_MAD` again with GPU time per flip: 12.32 / 12.18 / 12.32 ms (-1.1%); left off
   (it changes rounding).
 * Match-start device losses (a GPU hang: flips stop, then `ErrorDeviceLost`, no fault addresses):

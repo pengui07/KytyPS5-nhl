@@ -180,6 +180,12 @@ inline std::atomic<bool> g_shader_ftz32 {false};
 [[nodiscard]] inline bool ShaderF16ImagePack() {
 	return ShaderF16Converts() && Common::Experiments::Enabled(Common::Experiments::F16ImagePack);
 }
+// Codegen option: experiment ExecRunTransparent (key bit 4194304). ExecBranches runs ended at any
+// instruction that is not lane-wise: in NHL 27's heaviest shaders mostly resource handles (Get*Resource),
+// LaneId and Reference (no code), which do not depend on EXEC and may sit in or before the branch.
+[[nodiscard]] inline bool ShaderExecRunTransparent() {
+	return ShaderExecBranches() && Common::Experiments::Enabled(Common::Experiments::ExecRunTransparent);
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
@@ -192,7 +198,7 @@ inline std::atomic<bool> g_shader_ftz32 {false};
 	       (ShaderF16LaneViews() ? 32768u : 0u) | (ShaderEarlyLateFragmentTests() ? 65536u : 0u) |
 	       (ShaderUndefVgprs() ? 131072u : 0u) | (ShaderFtz32() ? 262144u : 0u) |
 	       (ShaderMovRelBounds() ? 524288u : 0u) | (ShaderF16Converts() ? 1048576u : 0u) |
-	       (ShaderF16ImagePack() ? 2097152u : 0u);
+	       (ShaderF16ImagePack() ? 2097152u : 0u) | (ShaderExecRunTransparent() ? 4194304u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

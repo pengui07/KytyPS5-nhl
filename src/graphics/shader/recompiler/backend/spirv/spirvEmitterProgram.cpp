@@ -490,6 +490,10 @@ uint32_t ExecRunMinSelects() {
 	return minimum;
 }
 
+// KYTY_DBG_EXEC_BRANCH=2: per shader, the instructions that end a stretch of run candidates holding
+// EXEC selects, and the EXEC selects left outside runs.
+thread_local std::unordered_map<std::string_view, uint32_t>* t_exec_breakers = nullptr;
+
 std::vector<ExecRun> FindExecRuns(const IR::Block& block) {
 	std::vector<const IR::Inst*> insts;
 	for (const auto& inst: block) insts.push_back(&inst);
@@ -509,9 +513,24 @@ std::vector<ExecRun> FindExecRuns(const IR::Block& block) {
 	const auto  is_memory      = [memory_ops](const IR::Inst& inst) {
 		return memory_ops && IR::IsExecPredicatedMemoryOp(inst) && !IR::ReadsNeighborLanesOpcode(inst.GetOpcode());
 	};
+	const bool transparent_ops = ShaderExecRunTransparent();
+	const auto transparent     = [transparent_ops](IR::ValueOpcode op) {
+		if (!transparent_ops) return false;
+		switch (op) {
+			case IR::ValueOpcode::Reference:
+			case IR::ValueOpcode::ReferenceU32:
+			case IR::ValueOpcode::GetSrtResource:
+			case IR::ValueOpcode::GetBufferResource:
+			case IR::ValueOpcode::GetAddressResource:
+			case IR::ValueOpcode::GetImageResource:
+			case IR::ValueOpcode::GetSamplerResource:
+			case IR::ValueOpcode::LaneId: return true;
+			default: return false;
+		}
+	};
 	const auto candidate = [&](const IR::Inst& inst) {
 		const auto op = inst.GetOpcode();
-		return is_memory(inst) ||
+		return is_memory(inst) || transparent(op) ||
 		       ((IR::IsLaneWiseOpcode(op) || IsSelectOpcode(op)) && op != IR::ValueOpcode::Phi && !inst.MayHaveSideEffects());
 	};
 	std::vector<ExecRun> runs;
@@ -523,6 +542,14 @@ std::vector<ExecRun> FindExecRuns(const IR::Block& block) {
 		}
 		size_t end = start;
 		while (end < insts.size() && candidate(*insts[end])) end++;
+		if (t_exec_breakers != nullptr && end < insts.size()) {
+			for (size_t i = start; i < end; i++) {
+				if (IsSelectOpcode(insts[i]->GetOpcode())) {
+					(*t_exec_breakers)[IR::ValueOpcodeName(insts[end]->GetOpcode())]++;
+					break;
+				}
+			}
+		}
 		const auto index_of = [&](const IR::Inst* inst) {
 			const auto it = position.find(inst);
 			return it != position.end() ? it->second : SIZE_MAX;
@@ -759,6 +786,12 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 	// KYTY_DBG_EXEC_BRANCH=1: runs, selects (and LogicalAnds) under EXEC turned into branch code,
 	// phis and hoisted instructions per shader (NHL27EXECBR).
 	static const bool exec_branch_debug = std::getenv("KYTY_DBG_EXEC_BRANCH") != nullptr;
+	static const bool breaker_debug     = [] {
+		const char* v = std::getenv("KYTY_DBG_EXEC_BRANCH");
+		return v != nullptr && v[0] == '2';
+	}();
+	std::unordered_map<std::string_view, uint32_t> breakers;
+	t_exec_breakers = breaker_debug ? &breakers : nullptr;
 	size_t            stat_runs = 0, stat_branch = 0, stat_phis = 0, stat_hoisted = 0;
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
@@ -783,6 +816,17 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		EmitStructuredTerminator(ctx, block);
 	}
 	PatchStructuredPhis(ctx, structured);
+	t_exec_breakers = nullptr;
+	if (breaker_debug && !breakers.empty()) {
+		std::vector<std::pair<std::string_view, uint32_t>> sorted(breakers.begin(), breakers.end());
+		std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+		std::string line;
+		for (size_t i = 0; i < sorted.size() && i < 8; i++) {
+			line += " " + std::string(sorted[i].first) + "=" + std::to_string(sorted[i].second);
+		}
+		std::printf("NHL27EXECBREAK: hash=0x%016llx%s\n", static_cast<unsigned long long>(program.shader_hash),
+		            line.c_str());
+	}
 	if (exec_branch_debug && exec_branches) {
 		std::printf("NHL27EXECBR: hash=0x%016llx stage=%u runs=%zu branch_insts=%zu phis=%zu hoisted=%zu\n",
 		            static_cast<unsigned long long>(program.shader_hash), static_cast<unsigned>(program.stage), stat_runs,
