@@ -63,7 +63,8 @@ uint64_t EnvironmentMask() {
 	set("KYTY_EXEC_BRANCH_CONTINUE", ExecBranchContinue, true);
 	set("KYTY_F16_LANE_VIEWS", F16LaneViews, true);
 	set("KYTY_LAZY_GUEST_BARRIERS", LazyGuestBarriers, false);
-	set("KYTY_BDA_LOAD_GROUPS", BdaLoadGroups, false);
+	set("KYTY_EARLY_LATE_FRAGMENT_TESTS", EarlyLateFragmentTests, true);
+	set("KYTY_BDA_LOAD_GROUPS", BdaLoadGroups, true);
 	// On since 2026-10-22: with the stage cores kept for the stages, the resolve thread limited the
 	// heavier scenes; sharing its core with the game, the second resolver took 60 Hz play 57.4 ->
 	// 59.4 fps (paired rounds 413 / 447). Measured on 16 logical CPUs (its default CPU is 14): with

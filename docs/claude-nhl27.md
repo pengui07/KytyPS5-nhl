@@ -1020,6 +1020,31 @@ Toward 120 fps (2026-10-23):
   14.46 / 14.24 / 14.40 ms per flip (-1.4%), while draws cost 3.74 -> 4.09 us on the execution thread
   (collecting the ranges): in play 61.5 vs 65.5 fps. Left off. The paused scene was 95% GPU-busy at
   14.4 ms per flip: the GPU limits it to about 69 fps.
+* GPU time by shader in 60 Hz play (`KYTY_PERF_GPU_TIMING=2`, 744 frames): compute `a36f0b4f` 0.98 ms
+  a frame, pixel `33037c605e42f4ce` (a full-screen pass) 0.88, compute `d7cfa519` about 1.1 over three
+  indirect dispatch sites, compute `c556aaf3` 0.72, pixel `9eaaf80c6d8ef848` 0.64 (15 draws), compute
+  `9380d724` 0.61, pixel `136eed67e0cb25f8` 0.51, compute `62ece4db` 0.48, crowd 0.38.
+  `KYTY_DBG_GUEST_VGPRS=1` prints the guest's VGPR allocation (`NHL27GUESTREGS`); against the host's
+  (`NHL27PSTAT`): pixel `33037c60` 128 -> 252, `136eed67` 152 -> 256 + scratch, `9eaaf80c` 148 -> 256 +
+  scratch, compute `d7cfa519` 152 -> 256 + scratch, `c556aaf3` 96 -> 133, `62ece4db` 60 -> 96 + 256 bytes
+  of scratch, `a36f0b4f` 48 -> 59. The three pixel shaders load 136-232 DWORDs through addresses, each
+  with a page lookup and a fault record (two stores) in a branch of its own; with those stores and a
+  kill, LLPC tests depth only after them (`z_order` LATE_Z in the pipeline's metadata).
+* Bit 53 `KYTY_EARLY_LATE_FRAGMENT_TESTS` (default on; key bit 65536; needs
+  `VK_AMD_shader_early_and_late_fragment_tests`): a pixel shader that reads through addresses, writes
+  no guest memory and exports no depth or sample mask declares `EarlyAndLateFragmentTestsAMD`; the two
+  shaders then get EARLY_Z_THEN_LATE_Z. Paused A/B/A without per-draw timestamps: 10.63 / 10.53 /
+  10.68 ms per flip (-1.2%).
+* Bit 42 `KYTY_BDA_LOAD_GROUPS` is now on by default: the three pixel shaders have 20-36 groups (all
+  their address loads); paused A/B/A 13.17 / 12.93 / 13.04 ms per flip (-1.3%). With both, a 5-round
+  in-match A/B: 65-66 fps either way (play is CPU-bound); frames normal. Soak with both on: 66.3 and
+  64.4 fps at 60 Hz, no errors (an earlier soak lost the device once at a match start, without
+  breadcrumbs; five boots since were clean).
+* Tried and dropped: loads through addresses without branches (a missing page read a zero page that
+  BDA page table entry 0 points to; the shader recorded its last missing page when it returned).
+  `33037c60` lost all 312 stores and half its branches and its 170 vector loads became scalar, but
+  SGPR spills to VGPR lanes went 183 -> 575 `v_readlane` and VGPRs 252 -> 243 only; a heavy paused
+  scene took 25.27 / 25.73 / 25.43 ms per flip (A/B/A, +1.5%).
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

@@ -908,10 +908,17 @@ void DefineModule(EmitterState& state) {
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
 		}
-		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
-		    !state.input_info.pixel->ps_depth_export_enable &&
-		    !state.input_info.pixel->ps_sample_mask_export_enable) {
+		const auto& pixel = *state.input_info.pixel;
+		if (pixel.ps_early_z && !pixel.ps_pixel_kill_enable && !pixel.ps_depth_export_enable &&
+		    !pixel.ps_sample_mask_export_enable) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
+		} else if (ShaderEarlyLateFragmentTests() && state.program.info.uses_dma && state.depth_variable == 0 &&
+		           state.sample_mask_variable == 0 && !pixel.ps_depth_export_enable &&
+		           !pixel.ps_sample_mask_export_enable && !state.program.info.uses_gds &&
+		           !state.program.has_address_writes && !IR::HasShaderMemoryWrites(state.program)) {
+			// Experiment EarlyLateFragmentTests: the fault records are the only side effects.
+			state.builder.RequireExtension("SPV_AMD_shader_early_and_late_fragment_tests");
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyAndLateFragmentTestsAMD);
 		}
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {

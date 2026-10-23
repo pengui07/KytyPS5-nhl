@@ -593,8 +593,17 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	const bool early_late_extension =
+	    HasExtension(device_extensions, VK_AMD_SHADER_EARLY_AND_LATE_FRAGMENT_TESTS_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderEarlyAndLateFragmentTestsFeaturesAMD early_late {};
+	if (early_late_extension) {
+		early_late.pNext          = supported_features2.pNext;
+		supported_features2.pNext = &early_late;
+	}
 	physical_device.getFeatures2(&supported_features2);
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	const bool early_late_enabled = early_late_extension && early_late.shaderEarlyAndLateFragmentTests == VK_TRUE;
+	g_shader_early_late_tests.store(early_late_enabled, std::memory_order_relaxed);
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
@@ -849,6 +858,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		pipeline_executable.pNext                  = const_cast<void*>(create_info.pNext);
 		pipeline_executable.pipelineExecutableInfo = VK_TRUE;
 		create_info.pNext                          = &pipeline_executable;
+	}
+	vk::PhysicalDeviceShaderEarlyAndLateFragmentTestsFeaturesAMD early_late_enable {};
+	if (early_late_enabled) {
+		early_late_enable.pNext                           = const_cast<void*>(create_info.pNext);
+		early_late_enable.shaderEarlyAndLateFragmentTests = VK_TRUE;
+		create_info.pNext                                 = &early_late_enable;
 	}
 	// VK_EXT_device_fault: lets a device loss report the faulting GPU address.
 	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
@@ -1286,7 +1301,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
 		                             VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME,
 	                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
-	                             VK_AMD_BUFFER_MARKER_EXTENSION_NAME}) {
+	                             VK_AMD_BUFFER_MARKER_EXTENSION_NAME,
+	                             VK_AMD_SHADER_EARLY_AND_LATE_FRAGMENT_TESTS_EXTENSION_NAME}) {
 			if (RenderDocSkipsExtension(extension)) {
 				LOGF("RenderDoc compat: skipping %s\n", extension);
 				continue;

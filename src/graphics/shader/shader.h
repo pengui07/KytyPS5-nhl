@@ -138,6 +138,17 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 [[nodiscard]] inline bool ShaderBdaLoadGroups() {
 	return Common::Experiments::Enabled(Common::Experiments::BdaLoadGroups);
 }
+// The device has VK_AMD_shader_early_and_late_fragment_tests (vulkanWindow sets it).
+inline std::atomic<bool> g_shader_early_late_tests {false};
+// Codegen option: experiment EarlyLateFragmentTests (key bit 65536). A pixel shader that reads memory
+// by address records missing pages in the fault buffer, and with those stores (and a kill) the host
+// compiler tests depth only after the shader: occluded pixels ran it too. When the guest shader itself
+// writes no memory and exports no depth or sample mask, it declares EarlyAndLateFragmentTestsAMD:
+// depth is tested before it as well (a fragment that fails the early test records no fault).
+[[nodiscard]] inline bool ShaderEarlyLateFragmentTests() {
+	return g_shader_early_late_tests.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::EarlyLateFragmentTests);
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
@@ -147,7 +158,7 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 	       (ShaderRobustSpillLoads() ? 512u : 0u) | (ShaderBranchlessFormattedLoads() ? 1024u : 0u) |
 	       (ShaderExecBranches() ? 2048u : 0u) | (ShaderExecBranchMemory() ? 4096u : 0u) |
 	       (ShaderBdaLoadGroups() ? 8192u : 0u) | (ShaderExecBranchContinue() ? 16384u : 0u) |
-	       (ShaderF16LaneViews() ? 32768u : 0u);
+	       (ShaderF16LaneViews() ? 32768u : 0u) | (ShaderEarlyLateFragmentTests() ? 65536u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);
