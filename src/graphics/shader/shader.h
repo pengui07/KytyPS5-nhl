@@ -176,6 +176,10 @@ inline std::atomic<bool> g_shader_ftz32 {false};
 [[nodiscard]] inline bool ShaderF16Converts() {
 	return ShaderNativeFp16() && Common::Experiments::Enabled(Common::Experiments::F16Converts);
 }
+// Codegen option: experiment F16ImagePack (key bit 2097152), see ShaderF16Converts.
+[[nodiscard]] inline bool ShaderF16ImagePack() {
+	return ShaderF16Converts() && Common::Experiments::Enabled(Common::Experiments::F16ImagePack);
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
@@ -187,7 +191,8 @@ inline std::atomic<bool> g_shader_ftz32 {false};
 	       (ShaderBdaLoadGroups() ? 8192u : 0u) | (ShaderExecBranchContinue() ? 16384u : 0u) |
 	       (ShaderF16LaneViews() ? 32768u : 0u) | (ShaderEarlyLateFragmentTests() ? 65536u : 0u) |
 	       (ShaderUndefVgprs() ? 131072u : 0u) | (ShaderFtz32() ? 262144u : 0u) |
-	       (ShaderMovRelBounds() ? 524288u : 0u) | (ShaderF16Converts() ? 1048576u : 0u);
+	       (ShaderMovRelBounds() ? 524288u : 0u) | (ShaderF16Converts() ? 1048576u : 0u) |
+	       (ShaderF16ImagePack() ? 2097152u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

@@ -1145,6 +1145,10 @@ Toward 120 fps (2026-10-23):
   now `OpFConvert` on f16 (`v_cvt_f16_f32`), and the host compiler folds ops between them into f16
   forms. Compute `a36f0b4f`: 2622 -> 2493 instructions, 222 -> 123 `v_cvt_pk_rtz` (the rest pack
   image results). Paused A/B/A: 10.47 / 10.31 / 10.49 ms per flip (-1.6%); frames normal.
+* Bit 60 `KYTY_F16_IMAGE_PACK` (default on with it; key bit 2097152): 16-bit float image results are
+  packed as f16 pairs from `OpFConvert` (the `PackHalf2x16` per lane avoided an RDNA4 driver crash
+  on two components of one sample; this form compiles). `a36f0b4f`: 2493 -> 2362 instructions,
+  `v_cvt_pk_rtz` 123 -> 31. Paused A/B/A: 21.40 / 20.94 / 21.03 ms per flip (-1.3%); frames normal.
 * Tried: `KYTY_FUSED_MAD` again with GPU time per flip: 12.32 / 12.18 / 12.32 ms (-1.1%); left off
   (it changes rounding).
 * Match-start device losses (a GPU hang: flips stop, then `ErrorDeviceLost`, no fault addresses):

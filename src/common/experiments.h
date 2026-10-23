@@ -81,6 +81,9 @@ enum Bit : uint64_t {
 	// KYTY_F16_CONVERTS (default on; with NativeFp16): f32 <-> f16 conversions as OpFConvert on f16
 	// instead of PackHalf2x16 / UnpackHalf2x16; part of shader keys.
 	F16Converts = uint64_t {1} << 59u,
+	// KYTY_F16_IMAGE_PACK (default on; with F16Converts): 16-bit float image results packed as f16
+	// pairs from OpFConvert instead of PackHalf2x16 per lane; part of shader keys.
+	F16ImagePack = uint64_t {1} << 60u,
 	// KYTY_GUEST_OFF_STAGE_CORES (default on): threads without a CPU of their own (guest, driver
 	// and helper threads) keep off both logical CPUs of the execution and resolve threads' cores.
 	GuestOffStageCores = uint64_t {1} << 46u,
