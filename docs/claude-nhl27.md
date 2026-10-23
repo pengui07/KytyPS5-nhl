@@ -1099,6 +1099,15 @@ Toward 120 fps (2026-10-23):
 * Execution-thread waits in play (`NHL27EXECIDLE`, now split): ~30 ms/s for the second draw
   resolver's slots, ~27 ms/s for the resolve thread, 11-30 ms/s of them in the first 256 operations
   after a flip. Fault windows of 4 pages instead of 16 (bit 15 off): 3.38 us per draw either way.
+* Guest barriers at the command processor: a partial-flush or cache write-back event becomes a
+  global barrier operation there, and a barrier right after another one, with no operation between
+  them, is not emitted (the execution thread skipped those anyway, `KYTY_GUEST_BARRIER_DEDUP`, after
+  a trip through the pipeline: 118k such operations a second for 13k recorded barriers); ignored
+  event types emit nothing. In-boot A/B: operations -12% (322k vs 368k a second), execution 3.52 vs
+  3.65 us per draw. The CPU-side crumb ring for hang reports holds 4096 commands (16384, 640 KiB, kept
+  missing the L2 cache: 0.9% of the execution thread). Soak: 67.6 fps at 60 Hz, no errors.
+* Tried: `KYTY_FUSED_MAD` again with GPU time per flip: 12.32 / 12.18 / 12.32 ms (-1.1%); left off
+  (it changes rounding).
 * Match-start device losses (a GPU hang: flips stop, then `ErrorDeviceLost`, no fault addresses):
   2 in 13 boots with bits 42 and 53 on, 0 in 8 with `KYTY_DBG_BREADCRUMBS=1`, 0 in 3 with bit 53 off.
   Too rare to bisect by boots; bit 53 stays on.
