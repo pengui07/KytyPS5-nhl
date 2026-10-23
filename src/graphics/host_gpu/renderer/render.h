@@ -395,6 +395,21 @@ private:
 	// Per program too: its buffer slots, so an unchanged V# finds what it bound the program's last
 	// draw (see PrepareBindings()).
 	std::unordered_map<const void*, ProgramBufferMemo> m_program_buffer_memos;
+	// The two memos of a program by its address, direct-mapped in front of the maps (their lookups
+	// were 0.8% of the execution thread). The maps never erase, and their elements stay in place.
+	struct ProgramMemos {
+		const void*        program = nullptr;
+		ProgramImageMemo*  image   = nullptr;
+		ProgramBufferMemo* buffer  = nullptr;
+	};
+	std::array<ProgramMemos, 256> m_program_memo_cache {};
+	ProgramMemos& ProgramMemosOf(const void* program) {
+		auto& entry = m_program_memo_cache[(reinterpret_cast<uintptr_t>(program) >> 6u) & 255u];
+		if (entry.program != program) {
+			entry = {program, &m_program_image_memos[program], &m_program_buffer_memos[program]};
+		}
+		return entry;
+	}
 	// The last TextureDescDerivation::Found::serial given out.
 	uint64_t m_found_serial = 0;
 

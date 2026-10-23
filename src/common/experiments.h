@@ -77,6 +77,7 @@ enum Bit : uint64_t {
 	// A/B only and read by nothing else: a pending change's A/B changes nothing more.
 	AbPending5 = uint64_t {1} << 56u,
 	AbPending6 = uint64_t {1} << 57u,
+	AbPending7 = uint64_t {1} << 58u,
 	// KYTY_GUEST_OFF_STAGE_CORES (default on): threads without a CPU of their own (guest, driver
 	// and helper threads) keep off both logical CPUs of the execution and resolve threads' cores.
 	GuestOffStageCores = uint64_t {1} << 46u,

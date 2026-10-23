@@ -120,6 +120,16 @@ struct PreparedBindings {
 		uint32_t                 buffer_offset = 0;
 	};
 	std::vector<BufferSlotMemo> buffer_memos;
+	// RebindBuffers: the shader data and flattened SRT the program last uploaded, where, and in
+	// which command buffer and stream-buffer lap (the copy is reused only there).
+	struct UploadMemo {
+		std::vector<uint32_t>    data;
+		vk::DescriptorBufferInfo info;
+		uint64_t                 tick = ~uint64_t {0};
+		uint64_t                 lap  = ~uint64_t {0};
+	};
+	UploadMemo shader_data_upload;
+	UploadMemo srt_upload;
 	std::vector<TextureBinding>           images;
 	// Bindless table descriptors in binding and table-range order, with the T# and the root
 	// image each element was resolved for.
@@ -152,12 +162,16 @@ struct ProgramBufferMemo {
 	std::vector<PreparedBindings::BufferSource>   buffer_sources;
 	std::vector<PreparedBindings::BufferSlotKey>  buffer_keys;
 	std::vector<PreparedBindings::BufferSlotMemo> buffer_memos;
+	PreparedBindings::UploadMemo                  shader_data_upload;
+	PreparedBindings::UploadMemo                  srt_upload;
 	const void*                                   holder = nullptr;
 
 	void Swap(PreparedBindings& prepared) noexcept {
 		buffer_sources.swap(prepared.buffer_sources);
 		buffer_keys.swap(prepared.buffer_keys);
 		buffer_memos.swap(prepared.buffer_memos);
+		std::swap(shader_data_upload, prepared.shader_data_upload);
+		std::swap(srt_upload, prepared.srt_upload);
 	}
 };
 

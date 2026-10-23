@@ -1961,7 +1961,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		         .texel        = texel_read,
 		         .image_version = image_version};
 	}
-	if (is_written || is_texel_buffer) {
+	// A texel read changes the buffer only when an image was copied into it (known fills of its
+	// memory then no longer hold): dropping them for every texel bind took a lock and a scan of
+	// the fills (1.7% of the execution thread). AbPending7: for every texel bind.
+	if (is_written || (is_texel_buffer && (synced_from_image ||
+	                                       Common::Experiments::Enabled(Common::Experiments::AbPending7)))) {
 		DropGpuFills(vaddr, size);
 	}
 	if (is_written) {

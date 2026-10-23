@@ -1130,6 +1130,13 @@ Toward 120 fps (2026-10-23):
   full range (`KYTY_DBG_MOVREL=1` prints them, `NHL27MOVREL`). `6cb32e43`: 23 of 31 bounded (4 and
   10 registers), 247 VGPRs, no scratch. Paused A/B/A: 12.94 / 12.67 / 12.98 and 11.30 / 11.13 /
   11.24 ms per flip (-1.2 to -2.2%); frames captured in play unchanged.
+* Per draw: a program's shader data and flattened SRT are uploaded again only when their words
+  changed or a new command buffer began (`PreparedBindings::UploadMemo`; the copies were 2.4% of the
+  execution thread), a texel read drops the known GPU fills of its memory only when an image was
+  copied into the buffer (a lock and a scan per texel bind, 1.7%), and the program memos are found
+  through a direct-mapped cache (0.8%). In-boot A/B (AbPending7, bit 58: the old way): 3.68 vs 3.74
+  us per draw. NHL 27 issues no occlusion queries in play (a run with every query counting no
+  samples saw none).
 * Tried: `KYTY_FUSED_MAD` again with GPU time per flip: 12.32 / 12.18 / 12.32 ms (-1.1%); left off
   (it changes rounding).
 * Match-start device losses (a GPU hang: flips stop, then `ErrorDeviceLost`, no fault addresses):
