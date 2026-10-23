@@ -3800,9 +3800,6 @@ void CommandProcessor::ExecuteGlobalBarrier() {
 	}
 	FrameBreakdown::Add(FrameBreakdown::g_counters.port_guest_barriers);
 	++g_guest_barriers;
-	if (BarrierHazards::Enabled()) {
-		BarrierHazards::Barrier();
-	}
 	if (CurrentBuffer().IsRendering()) {
 		// Dropping these (keeping the render pass) measured no GPU gain: about 40 per frame.
 		++g_guest_barrier_breaks;
@@ -3826,11 +3823,16 @@ void CommandProcessor::ExecuteGlobalBarrier() {
 		barrier.dstAccessMask |= vk::AccessFlagBits2::eConditionalRenderingReadEXT;
 	}
 
+	// Experiment LazyGuestBarriers: owed until later work needs it (GuestBarriers::CheckWork).
+	if (GuestBarriers::Lazy() && GuestBarriers::Owe(CurrentBuffer(), barrier)) {
+		return;
+	}
 	vk::DependencyInfo dependency {};
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
 	GetScheduler().EndRendering();
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
+	GuestBarriers::Recorded();
 }
 
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {

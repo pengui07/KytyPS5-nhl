@@ -713,8 +713,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		BindSharedMemory(m_context, input_info, bindings);
 		RebindBuffers(bindings);
 	}
-	if (BarrierHazards::Enabled()) {
-		BarrierHazards::Work(true, std::span {&descriptor_stage, 1u}, {}, {}, indirect_writes);
+	// Experiment LazyGuestBarriers: an owed guest barrier is recorded here when the dispatch needs it.
+	GuestBarriers::CheckedScope guest_checked;
+	if (GuestBarriers::Active()) {
+		GuestBarriers::CheckWork(buffer, std::span {&descriptor_stage, 1u}, {}, {}, indirect_writes);
 	}
 
 	auto              vk_buffer        = buffer.Handle();
@@ -1035,9 +1037,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	RebindBuffers(bindings);
 	args_timer.Stop();
-	if (BarrierHazards::Enabled()) {
-		const BarrierHazards::Range args {args_addr, sizeof(vk::DispatchIndirectCommand)};
-		BarrierHazards::Work(true, std::span {&descriptor_stage, 1u}, std::span {&args, 1u}, {}, indirect_writes);
+	GuestBarriers::CheckedScope guest_checked;
+	if (GuestBarriers::Active()) {
+		const GuestBarriers::Range args {args_addr, sizeof(vk::DispatchIndirectCommand)};
+		GuestBarriers::CheckWork(buffer, std::span {&descriptor_stage, 1u}, std::span {&args, 1u}, {},
+		                         indirect_writes);
 	}
 	{
 		FrameBreakdown::Timer descriptors_timer(FrameBreakdown::g_counters.dc_descriptors_ns);

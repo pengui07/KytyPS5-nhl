@@ -89,6 +89,9 @@ enum Bit : uint64_t {
 	// KYTY_F16_LANE_VIEWS (default on; with NativeFp16): scalar f16 ops read and write their
 	// 16-bit lanes as halves of an f16vec2 instead of masking them out of U32s; part of shader keys.
 	F16LaneViews = uint64_t {1} << 51u,
+	// KYTY_LAZY_GUEST_BARRIERS (default off): a guest global barrier is recorded only before later
+	// work whose ranges overlap the work before it (GuestBarriers in pipeline/descriptors.h).
+	LazyGuestBarriers = uint64_t {1} << 52u,
 };
 
 namespace Detail {

@@ -183,6 +183,7 @@ void CommandRecorder::pushDescriptorSetKHR(vk::PipelineBindPoint bind_point,
 
 void CommandRecorder::updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
                                    const void* data) const {
+	GuestWork();
 	if (m_stream == nullptr) {
 		m_direct.updateBuffer(buffer, offset, size, data);
 		return;
@@ -207,6 +208,7 @@ void CommandRecorder::pushConstants(vk::PipelineLayout layout, vk::ShaderStageFl
 }
 
 void CommandRecorder::beginRendering(const vk::RenderingInfo& rendering) const {
+	GuestWork();
 	if (m_stream == nullptr) {
 		m_direct.beginRendering(rendering);
 		return;
@@ -246,6 +248,7 @@ void CommandRecorder::bindVertexBuffers2(uint32_t first, uint32_t count,
 
 void CommandRecorder::copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
                                  const vk::BufferCopy* regions) const {
+	GuestWork();
 	if (m_stream == nullptr) {
 		m_direct.copyBuffer(source, destination, count, regions);
 		return;
@@ -259,6 +262,7 @@ void CommandRecorder::copyBuffer(vk::Buffer source, vk::Buffer destination, uint
 void CommandRecorder::copyImage(vk::Image source, vk::ImageLayout source_layout,
                                 vk::Image destination, vk::ImageLayout destination_layout,
                                 uint32_t count, const vk::ImageCopy* regions) const {
+	GuestWork();
 	if (m_stream == nullptr) {
 		m_direct.copyImage(source, source_layout, destination, destination_layout, count,
 		                   regions);
@@ -274,6 +278,7 @@ void CommandRecorder::copyImage(vk::Image source, vk::ImageLayout source_layout,
 void CommandRecorder::resolveImage(vk::Image source, vk::ImageLayout source_layout,
                                    vk::Image destination, vk::ImageLayout destination_layout,
                                    uint32_t count, const vk::ImageResolve* regions) const {
+	GuestWork();
 	if (m_stream == nullptr) {
 		m_direct.resolveImage(source, source_layout, destination, destination_layout, count,
 		                      regions);
@@ -290,6 +295,7 @@ void CommandRecorder::blitImage(vk::Image source, vk::ImageLayout source_layout,
                                 vk::Image destination, vk::ImageLayout destination_layout,
                                 uint32_t count, const vk::ImageBlit* regions,
                                 vk::Filter filter) const {
+	GuestWork();
 	if (m_stream == nullptr) {
 		m_direct.blitImage(source, source_layout, destination, destination_layout, count, regions,
 		                   filter);
@@ -305,6 +311,7 @@ void CommandRecorder::blitImage(vk::Image source, vk::ImageLayout source_layout,
 void CommandRecorder::copyImageToBuffer(vk::Image source, vk::ImageLayout source_layout,
                                         vk::Buffer destination, uint32_t count,
                                         const vk::BufferImageCopy* regions) const {
+	GuestWork();
 	if (m_stream == nullptr) {
 		m_direct.copyImageToBuffer(source, source_layout, destination, count, regions);
 		return;
@@ -319,6 +326,7 @@ void CommandRecorder::copyImageToBuffer(vk::Image source, vk::ImageLayout source
 void CommandRecorder::copyBufferToImage(vk::Buffer source, vk::Image destination,
                                         vk::ImageLayout destination_layout, uint32_t count,
                                         const vk::BufferImageCopy* regions) const {
+	GuestWork();
 	if (m_stream == nullptr) {
 		m_direct.copyBufferToImage(source, destination, destination_layout, count, regions);
 		return;
@@ -333,6 +341,7 @@ void CommandRecorder::copyBufferToImage(vk::Buffer source, vk::Image destination
 void CommandRecorder::clearColorImage(vk::Image image, vk::ImageLayout layout,
                                       const vk::ClearColorValue* color, uint32_t range_count,
                                       const vk::ImageSubresourceRange* ranges) const {
+	GuestWork();
 	if (m_stream == nullptr) {
 		m_direct.clearColorImage(image, layout, color, range_count, ranges);
 		return;
@@ -366,6 +375,7 @@ void CommandRecorder::clearDepthStencilImage(vk::Image image, vk::ImageLayout la
                                              const vk::ClearDepthStencilValue* value,
                                              uint32_t                          range_count,
                                              const vk::ImageSubresourceRange*  ranges) const {
+	GuestWork();
 	if (m_stream == nullptr) {
 		m_direct.clearDepthStencilImage(image, layout, value, range_count, ranges);
 		return;

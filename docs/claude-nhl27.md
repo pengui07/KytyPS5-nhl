@@ -1011,6 +1011,15 @@ Toward 120 fps (2026-10-23):
   emulator's own passes and copies are not counted). In play 59% of the guest barriers (11.7k/s)
   would be kept: 23k read-after-write, 16k write-after-write, 7.5k write-after-read, 6k by-address
   in 5 s; 19% of the draws and dispatches use addresses.
+* Bit 52 `KYTY_LAZY_GUEST_BARRIERS` (default off): the guest barrier is owed to the recording target
+  and recorded before the first draw or dispatch whose ranges overlap the work before it (or that
+  uses addresses), and before any other command there that accesses memory (`CommandRecorder::GuestWork`:
+  copies, fills, clears, dispatches, render pass begins; draws only after a check). With it 18% of the
+  guest barriers went unrecorded (the other commands, mostly the emulator's own uploads, took 28k of
+  the 50k recorded in 5 s); images were normal. Paused GPU A/B/A without per-draw timestamps:
+  14.46 / 14.24 / 14.40 ms per flip (-1.4%), while draws cost 3.74 -> 4.09 us on the execution thread
+  (collecting the ranges): in play 61.5 vs 65.5 fps. Left off. The paused scene was 95% GPU-busy at
+  14.4 ms per flip: the GPU limits it to about 69 fps.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

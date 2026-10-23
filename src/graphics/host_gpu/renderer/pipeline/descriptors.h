@@ -170,18 +170,37 @@ void DrawBegin();
 void DrawEnd();
 } // namespace DrawRepeats
 
-struct PreparedBindings;
+class CommandBuffer;
 
-// KYTY_DBG_BARRIER_HAZARDS=1: how many guest global barriers order work whose bound ranges overlap
-// (NHL27HAZARDS every 5 s). A guest barrier stays pending until a later draw or dispatch reads or
-// writes a range written (or writes a range read) by work before it, or binds memory by address.
-namespace BarrierHazards {
-using Range = std::pair<uint64_t, uint64_t>;
-[[nodiscard]] bool Enabled();
-void               Barrier();
-void Work(bool compute, std::span<PreparedBindings* const> stages, std::span<const Range> reads,
-          std::span<const Range> writes, bool unknown);
-} // namespace BarrierHazards
+// Experiment LazyGuestBarriers (bit 52, KYTY_LAZY_GUEST_BARRIERS): a guest global barrier is owed to the
+// recording target instead of recorded, and recorded before the first later draw or dispatch that reads
+// a range written before it, writes a range read or written before it, or accesses memory by address,
+// and before any other work that accesses memory there (CommandRecorder::GuestWork). The ranges are the
+// bound buffers, the images (data, stencil, metadata), the attachments and the index, vertex and indirect
+// ranges. KYTY_DBG_BARRIER_HAZARDS=1 prints how the barriers went (NHL27HAZARDS every 5 s).
+namespace GuestBarriers {
+using Range = std::pair<uint64_t, uint64_t>; // address, size
+[[nodiscard]] bool Lazy();
+[[nodiscard]] bool StatsEnabled();
+// ExecuteGlobalBarrier with the experiment on: owes `barrier` to `buffer`'s recording target. False:
+// record it now (not all the work since the last recorded barrier was tracked, or too many ranges).
+[[nodiscard]] bool Owe(CommandBuffer& buffer, const vk::MemoryBarrier2& barrier);
+// ExecuteGlobalBarrier recorded the barrier: nothing is owed and tracking starts over.
+void Recorded();
+// A draw or dispatch is checked, or a barrier is owed: CheckWork has something to do.
+[[nodiscard]] bool Active();
+// Until it ends, the checked draw's or dispatch's commands do not record an owed barrier.
+struct CheckedScope {
+	CheckedScope() = default;
+	~CheckedScope();
+	CheckedScope(const CheckedScope&)            = delete;
+	CheckedScope& operator=(const CheckedScope&) = delete;
+};
+// A draw or dispatch about to record its commands, with its ranges besides its stages' bindings:
+// records an owed barrier first when the work overlaps the work before it.
+void CheckWork(CommandBuffer& buffer, std::span<PreparedBindings* const> stages, std::span<const Range> reads,
+               std::span<const Range> writes, bool unknown);
+} // namespace GuestBarriers
 
 } // namespace Libs::Graphics
 

@@ -1230,60 +1230,127 @@ void RepeatPrint() {
 
 namespace {
 
-// BarrierHazards: the ranges of the work since the last barrier that was kept (`before`, unordered
-// with the pending guest barrier) and since the last guest barrier (`since`).
-struct HazardSet {
-	std::vector<BarrierHazards::Range> reads, writes;
-	bool                               unknown = false;
-	void Clear() {
-		reads.clear();
-		writes.clear();
-		unknown = false;
-	}
-	void Add(const HazardSet& other) {
-		reads.insert(reads.end(), other.reads.begin(), other.reads.end());
-		writes.insert(writes.end(), other.writes.begin(), other.writes.end());
-		unknown |= other.unknown;
-	}
-};
-struct HazardCounters {
-	uint64_t barriers = 0, kept = 0, unknown = 0, raw = 0, war = 0, waw = 0, overflow = 0;
-	uint64_t work = 0, compute = 0, unknown_work = 0, after_barrier = 0;
-};
-HazardSet      g_hazard_before, g_hazard_since;
-bool           g_hazard_pending = false;
-HazardCounters g_hazard;
+// GuestBarriers: guest address intervals [begin, end); Normalize() sorts and merges them.
+struct Intervals {
+	std::vector<std::pair<uint64_t, uint64_t>> list;
+	bool                                       normalized = true;
 
-bool Overlaps(std::span<const BarrierHazards::Range> a, std::span<const BarrierHazards::Range> b) {
-	for (const auto [a_address, a_size]: a) {
-		for (const auto [b_address, b_size]: b) {
-			if (a_address < b_address + b_size && b_address < a_address + a_size) return true;
-		}
+	void Add(uint64_t address, uint64_t size) {
+		if (size == 0) return;
+		list.emplace_back(address, address + size);
+		normalized = false;
 	}
-	return false;
+	void Append(const Intervals& other) {
+		if (other.list.empty()) return;
+		list.insert(list.end(), other.list.begin(), other.list.end());
+		normalized = false;
+	}
+	void Clear() {
+		list.clear();
+		normalized = true;
+	}
+	void Normalize() {
+		if (normalized) return;
+		std::sort(list.begin(), list.end());
+		size_t out = 0;
+		for (const auto& interval: list) {
+			if (out != 0 && interval.first <= list[out - 1].second) {
+				list[out - 1].second = std::max(list[out - 1].second, interval.second);
+			} else {
+				list[out++] = interval;
+			}
+		}
+		list.resize(out);
+		normalized = true;
+	}
+	// Normalized intervals only.
+	[[nodiscard]] bool Overlaps(uint64_t begin, uint64_t end) const {
+		const auto found = std::partition_point(list.begin(), list.end(),
+		                                        [begin](const auto& interval) { return interval.second <= begin; });
+		return found != list.end() && found->first < end;
+	}
+	[[nodiscard]] bool OverlapsAny(const Intervals& unsorted) const {
+		for (const auto& [begin, end]: unsorted.list) {
+			if (Overlaps(begin, end)) return true;
+		}
+		return false;
+	}
+};
+
+struct GuestBarrierCounters {
+	uint64_t owed = 0, merged = 0, at_work = 0, unknown = 0, raw = 0, war = 0, waw = 0, other_work = 0;
+	uint64_t immediate = 0, unchecked_draws = 0, work = 0, checked = 0;
+};
+
+// The work since the last recorded barrier before the owed one (`before`), and since the last guest
+// barrier (`since`); `unknown`: some of it accessed memory by address. Execution thread only.
+struct GuestBarrierState {
+	Intervals            before_reads, before_writes, since_reads, since_writes;
+	bool                 before_unknown = false, since_unknown = false;
+	bool                 tracked        = false; // every draw and dispatch since the last recorded barrier was
+	vk::MemoryBarrier2   barrier {};
+	GuestBarrierCounters counters;
+	Intervals            work_reads, work_writes;
+
+	void ClearAll() {
+		before_reads.Clear();
+		before_writes.Clear();
+		since_reads.Clear();
+		since_writes.Clear();
+		before_unknown = since_unknown = false;
+	}
+};
+GuestBarrierState g_guest_barriers;
+
+constexpr size_t MaxGuestBarrierIntervals = 4096;
+
+void RecordGuestBarrier(const CommandRecorder& recorder) {
+	auto&              state = g_guest_barriers;
+	vk::DependencyInfo dependency {};
+	dependency.memoryBarrierCount = 1;
+	dependency.pMemoryBarriers    = &state.barrier;
+	recorder.pipelineBarrier2(dependency);
+	g_guest_barrier_owed.store(false, std::memory_order_relaxed);
+	state.ClearAll();
 }
 
-void HazardPrint() {
+void GuestBarrierPrint() {
+	if (!GuestBarriers::StatsEnabled()) return;
 	static auto last = std::chrono::steady_clock::now();
 	const auto  now  = std::chrono::steady_clock::now();
 	if (now - last < std::chrono::seconds(5)) return;
 	last          = now;
-	const auto& c = g_hazard;
-	std::printf("NHL27HAZARDS guest barriers=%llu kept=%llu (unknown=%llu raw=%llu war=%llu waw=%llu overflow=%llu) | "
-	            "work=%llu compute=%llu by-address=%llu after-a-pending-barrier=%llu\n",
-	            static_cast<unsigned long long>(c.barriers), static_cast<unsigned long long>(c.kept),
+	auto&       c = g_guest_barriers.counters;
+	std::printf("NHL27HAZARDS lazy=%d guest barriers owed=%llu (merged into an owed one %llu) recorded at work=%llu "
+	            "(by-address=%llu raw=%llu war=%llu waw=%llu) before other work=%llu immediately=%llu | unchecked draws=%llu "
+	            "work=%llu checked while owed=%llu\n",
+	            GuestBarriers::Lazy() ? 1 : 0, static_cast<unsigned long long>(c.owed),
+	            static_cast<unsigned long long>(c.merged), static_cast<unsigned long long>(c.at_work),
 	            static_cast<unsigned long long>(c.unknown), static_cast<unsigned long long>(c.raw),
 	            static_cast<unsigned long long>(c.war), static_cast<unsigned long long>(c.waw),
-	            static_cast<unsigned long long>(c.overflow), static_cast<unsigned long long>(c.work),
-	            static_cast<unsigned long long>(c.compute), static_cast<unsigned long long>(c.unknown_work),
-	            static_cast<unsigned long long>(c.after_barrier));
+	            static_cast<unsigned long long>(c.other_work), static_cast<unsigned long long>(c.immediate),
+	            static_cast<unsigned long long>(c.unchecked_draws), static_cast<unsigned long long>(c.work),
+	            static_cast<unsigned long long>(c.checked));
 	std::fflush(stdout);
-	g_hazard = {};
+	c = {};
 }
 
 } // namespace
 
-bool BarrierHazards::Enabled() {
+void RecordOwedGuestBarrier(const CommandRecorder& recorder) {
+	g_guest_barriers.counters.other_work++;
+	RecordGuestBarrier(recorder);
+}
+
+void NoteUncheckedGuestDraw() {
+	g_guest_barriers.counters.unchecked_draws++;
+}
+
+bool GuestBarriers::Lazy() {
+	return Common::Experiments::Enabled(Common::Experiments::LazyGuestBarriers);
+}
+
+bool GuestBarriers::StatsEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_DBG_BARRIER_HAZARDS");
 		return value != nullptr && value[0] == '1';
@@ -1291,64 +1358,130 @@ bool BarrierHazards::Enabled() {
 	return enabled;
 }
 
-void BarrierHazards::Barrier() {
-	g_hazard.barriers++;
-	g_hazard_pending = true;
-	g_hazard_before.Add(g_hazard_since);
-	g_hazard_since.Clear();
+bool GuestBarriers::Owe(CommandBuffer& buffer, const vk::MemoryBarrier2& barrier) {
+	auto& state = g_guest_barriers;
+	// Only a deferred recording keeps one target across command buffers (CommandRecorder::Key()).
+	if (!state.tracked || buffer.Handle().IsDirect()) {
+		return false;
+	}
+	state.counters.owed++;
+	if (g_guest_barrier_owed.load(std::memory_order_relaxed)) {
+		state.counters.merged++;
+	}
+	state.before_reads.Append(state.since_reads);
+	state.before_writes.Append(state.since_writes);
+	state.before_unknown |= state.since_unknown;
+	state.since_reads.Clear();
+	state.since_writes.Clear();
+	state.since_unknown = false;
+	state.before_reads.Normalize();
+	state.before_writes.Normalize();
+	if (state.before_reads.list.size() + state.before_writes.list.size() > MaxGuestBarrierIntervals) {
+		return false;
+	}
+	state.barrier = barrier;
+	g_guest_barrier_target.store(buffer.Handle().Key(), std::memory_order_relaxed);
+	g_guest_barrier_owed.store(true, std::memory_order_relaxed);
+	GuestBarrierPrint();
+	return true;
 }
 
-void BarrierHazards::Work(bool compute, std::span<PreparedBindings* const> stages, std::span<const Range> reads,
-                          std::span<const Range> writes, bool unknown) {
-	HazardSet work;
-	work.reads.assign(reads.begin(), reads.end());
-	work.writes.assign(writes.begin(), writes.end());
-	work.unknown = unknown;
+void GuestBarriers::Recorded() {
+	auto& state = g_guest_barriers;
+	state.counters.immediate++;
+	g_guest_barrier_owed.store(false, std::memory_order_relaxed);
+	state.ClearAll();
+	// Tracking starts over at a barrier recorded while the experiment is on.
+	state.tracked = Lazy();
+	GuestBarrierPrint();
+}
+
+GuestBarriers::CheckedScope::~CheckedScope() {
+	t_guest_work_checked = false;
+}
+
+bool GuestBarriers::Active() {
+	return g_guest_barriers.tracked || g_guest_barrier_owed.load(std::memory_order_relaxed);
+}
+
+void GuestBarriers::CheckWork(CommandBuffer& buffer, std::span<PreparedBindings* const> stages,
+                              std::span<const Range> reads, std::span<const Range> writes, bool unknown) {
+	auto& state = g_guest_barriers;
+	auto& c     = state.counters;
+	c.work++;
+	const bool owed = g_guest_barrier_owed.load(std::memory_order_relaxed);
+	if (!Lazy()) {
+		// Switched off: whatever is owed is recorded now, and nothing is tracked until a barrier is
+		// recorded with the experiment on.
+		if (owed) {
+			buffer.EndRendering();
+			RecordGuestBarrier(buffer.Handle());
+		}
+		state.tracked = false;
+		return;
+	}
+	auto& work_reads  = state.work_reads;
+	auto& work_writes = state.work_writes;
+	work_reads.Clear();
+	work_writes.Clear();
+	for (const auto [address, size]: reads) work_reads.Add(address, size);
+	for (const auto [address, size]: writes) work_writes.Add(address, size);
 	for (const auto* stage: stages) {
 		const auto& program = *stage->runtime->program;
-		work.unknown |= program.info.uses_dma || program.has_address_writes || stage->gds.buffer != nullptr;
+		unknown |= program.info.uses_dma || program.has_address_writes || stage->gds.buffer != nullptr;
 		for (const auto& resource: program.info.buffers) {
-			if (resource.descriptor_index == UINT32_MAX || resource.descriptor_index >= stage->buffer_sources.size()) continue;
+			if (resource.descriptor_index == UINT32_MAX || resource.descriptor_index >= stage->buffer_sources.size()) {
+				continue;
+			}
 			const auto& source = stage->buffer_sources[resource.descriptor_index];
-			if (source.size == 0) continue;
-			(resource.written ? work.writes : work.reads).emplace_back(source.address, source.size);
+			(resource.written ? work_writes : work_reads).Add(source.address, source.size);
 		}
-		for (uint32_t i = 0; i < program.info.images.size() && i < stage->images.size(); i++) {
-			const auto& data = stage->images[i].desc.info.data;
-			if (data.size == 0) continue;
-			(program.info.images[i].written ? work.writes : work.reads).emplace_back(data.address, data.size);
+		const auto image_count = std::min<size_t>(program.info.images.size(), stage->images.size());
+		for (size_t i = 0; i < image_count; i++) {
+			const auto& info  = stage->images[i].desc.info;
+			auto&       ranges = program.info.images[i].written ? work_writes : work_reads;
+			ranges.Add(info.data.address, info.data.size);
+			ranges.Add(info.stencil.address, info.stencil.size);
+			ranges.Add(info.metadata.range.address, info.metadata.range.size);
 		}
-		for (const auto& texture: stage->table_images) {
-			const auto& data = texture.desc.info.data;
-			if (data.size != 0) work.reads.emplace_back(data.address, data.size);
+		for (size_t k = 0; k < stage->table_images.size(); k++) {
+			const auto& info    = stage->table_images[k].desc.info;
+			const auto  root    = k < stage->table_roots.size() ? stage->table_roots[k] : 0u;
+			const bool  written = root < program.info.images.size() && program.info.images[root].written;
+			(written ? work_writes : work_reads).Add(info.data.address, info.data.size);
 		}
 	}
-	auto& c = g_hazard;
-	c.work++;
-	c.compute += compute ? 1u : 0u;
-	c.unknown_work += work.unknown ? 1u : 0u;
-	if (g_hazard_pending) {
-		c.after_barrier++;
-		const auto& before = g_hazard_before;
-		const bool  overflow = before.reads.size() + before.writes.size() > 8192;
-		const bool  raw      = Overlaps(work.reads, before.writes);
-		const bool  war      = Overlaps(work.writes, before.reads);
-		const bool  waw      = Overlaps(work.writes, before.writes);
-		const bool  unknown_conflict = work.unknown || before.unknown;
-		if (unknown_conflict || raw || war || waw || overflow) {
-			c.kept++;
-			c.unknown += unknown_conflict ? 1u : 0u;
+	t_guest_work_checked = true;
+	if (owed) {
+		c.checked++;
+		const bool by_address = unknown || state.before_unknown;
+		const bool raw        = !by_address && state.before_writes.OverlapsAny(work_reads);
+		const bool war        = !by_address && !raw && state.before_reads.OverlapsAny(work_writes);
+		const bool waw        = !by_address && !raw && !war && state.before_writes.OverlapsAny(work_writes);
+		if (by_address || raw || war || waw) {
+			c.at_work++;
+			c.unknown += by_address ? 1u : 0u;
 			c.raw += raw ? 1u : 0u;
 			c.war += war ? 1u : 0u;
 			c.waw += waw ? 1u : 0u;
-			c.overflow += overflow ? 1u : 0u;
-			g_hazard_pending = false;
-			g_hazard_before.Clear();
-			g_hazard_since.Clear();
+			buffer.EndRendering();
+			RecordGuestBarrier(buffer.Handle());
 		}
 	}
-	g_hazard_since.Add(work);
-	HazardPrint();
+	state.since_reads.Append(work_reads);
+	state.since_writes.Append(work_writes);
+	state.since_unknown |= unknown;
+	if (state.since_reads.list.size() + state.since_writes.list.size() > MaxGuestBarrierIntervals) {
+		state.since_reads.Normalize();
+		state.since_writes.Normalize();
+		if (state.since_reads.list.size() + state.since_writes.list.size() > MaxGuestBarrierIntervals) {
+			// Too many to compare: as if it accessed memory by address.
+			state.since_reads.Clear();
+			state.since_writes.Clear();
+			state.since_unknown = true;
+		}
+	}
+	GuestBarrierPrint();
 }
 
 bool DrawRepeats::Enabled() {
