@@ -3800,6 +3800,9 @@ void CommandProcessor::ExecuteGlobalBarrier() {
 	}
 	FrameBreakdown::Add(FrameBreakdown::g_counters.port_guest_barriers);
 	++g_guest_barriers;
+	if (BarrierHazards::Enabled()) {
+		BarrierHazards::Barrier();
+	}
 	if (CurrentBuffer().IsRendering()) {
 		// Dropping these (keeping the render pass) measured no GPU gain: about 40 per frame.
 		++g_guest_barrier_breaks;

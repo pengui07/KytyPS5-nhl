@@ -109,10 +109,24 @@ public:
 			m_free.push_back(frame.get());
 			m_frames.push_back(std::move(frame));
 		}
-		const auto compatible = std::ranges::find_if(m_free, [&](const auto* frame) {
+		const auto fits = [&](const auto* frame) {
 			return frame->image.extent.width == extent.width &&
 			       frame->image.extent.height == extent.height && frame->image.format == format;
+		};
+		// A frame whose last present the GPU finished, or one more frame: waiting for a present
+		// still in flight held up the execution thread at every guest flip (3% of it in play).
+		constexpr size_t MaxFrames = 8;
+		auto compatible = std::ranges::find_if(m_free, [&](const auto* frame) {
+			return fits(frame) && m_scheduler.IsFree(frame->present_tick);
 		});
+		if (compatible == m_free.end() && m_frames.size() < MaxFrames) {
+			auto frame = std::make_unique<Presenter::Frame>();
+			m_free.push_back(frame.get());
+			m_frames.push_back(std::move(frame));
+			compatible = m_free.end(); // the new frame, taken from the back below
+		} else if (compatible == m_free.end()) {
+			compatible = std::ranges::find_if(m_free, fits);
+		}
 		auto*      frame      = compatible == m_free.end() ? m_free.back() : *compatible;
 		if (compatible != m_free.end()) {
 			*compatible = m_free.back();

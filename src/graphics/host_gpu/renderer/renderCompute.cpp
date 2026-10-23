@@ -713,6 +713,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		BindSharedMemory(m_context, input_info, bindings);
 		RebindBuffers(bindings);
 	}
+	if (BarrierHazards::Enabled()) {
+		BarrierHazards::Work(true, std::span {&descriptor_stage, 1u}, {}, {}, indirect_writes);
+	}
 
 	auto              vk_buffer        = buffer.Handle();
 	{
@@ -1032,6 +1035,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	RebindBuffers(bindings);
 	args_timer.Stop();
+	if (BarrierHazards::Enabled()) {
+		const BarrierHazards::Range args {args_addr, sizeof(vk::DispatchIndirectCommand)};
+		BarrierHazards::Work(true, std::span {&descriptor_stage, 1u}, std::span {&args, 1u}, {}, indirect_writes);
+	}
 	{
 		FrameBreakdown::Timer descriptors_timer(FrameBreakdown::g_counters.dc_descriptors_ns);
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,

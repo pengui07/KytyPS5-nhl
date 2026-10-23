@@ -40,6 +40,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <fmt/format.h>
@@ -49,6 +50,7 @@
 #include <mutex>
 #include <span>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -1144,7 +1146,233 @@ bool DrawPrepDeltaVerifyEnabled() {
 	return enabled;
 }
 
+// DrawRepeats: per program, the resources of its last use.
+struct RepeatLast {
+	std::vector<ShaderRecompiler::IR::DescriptorValue> buffers, images, samplers;
+	std::vector<uint32_t>                              user_data, flattened_srt;
+};
+struct RepeatCounters {
+	uint64_t stages = 0, first = 0, images = 0, samplers = 0, buffers = 0, user = 0, srt = 0, all = 0;
+	uint64_t buffer_slots = 0, buffer_slots_changed = 0, image_slots = 0, image_slots_changed = 0;
+	uint64_t draws = 0, draws_all = 0, draws_but_buffers = 0, draws_but_buffers_user = 0;
+};
+std::unordered_map<const void*, RepeatLast> g_repeat_last;
+RepeatCounters                              g_repeat;
+uint32_t                                    g_repeat_draw_flags = 0;
+bool                                        g_repeat_in_draw    = false;
+
+// Bits: 1 images, 2 samplers, 4 buffers, 8 user data, 16 flattened SRT the same as last time.
+void RepeatStage(const void* program, const ShaderRecompiler::IR::ResourceSnapshot& snapshot) {
+	auto& c     = g_repeat;
+	auto  found = g_repeat_last.find(program);
+	c.stages++;
+	uint32_t flags = 0;
+	if (found == g_repeat_last.end()) {
+		c.first++;
+		found = g_repeat_last.emplace(program, RepeatLast {}).first;
+	} else {
+		const auto& last = found->second;
+		flags |= last.images == snapshot.images ? 1u : 0u;
+		flags |= last.samplers == snapshot.samplers ? 2u : 0u;
+		flags |= last.buffers == snapshot.buffers ? 4u : 0u;
+		flags |= last.user_data == snapshot.user_data ? 8u : 0u;
+		flags |= last.flattened_srt == snapshot.flattened_srt ? 16u : 0u;
+		c.images += flags & 1u;
+		c.samplers += (flags >> 1u) & 1u;
+		c.buffers += (flags >> 2u) & 1u;
+		c.user += (flags >> 3u) & 1u;
+		c.srt += (flags >> 4u) & 1u;
+		c.all += flags == 31u ? 1u : 0u;
+		if (last.buffers.size() == snapshot.buffers.size()) {
+			for (size_t i = 0; i < snapshot.buffers.size(); i++) {
+				c.buffer_slots++;
+				c.buffer_slots_changed += last.buffers[i] == snapshot.buffers[i] ? 0u : 1u;
+			}
+		}
+		if (last.images.size() == snapshot.images.size()) {
+			for (size_t i = 0; i < snapshot.images.size(); i++) {
+				c.image_slots++;
+				c.image_slots_changed += last.images[i] == snapshot.images[i] ? 0u : 1u;
+			}
+		}
+	}
+	if (g_repeat_in_draw) g_repeat_draw_flags &= flags;
+	auto& last         = found->second;
+	last.buffers       = snapshot.buffers;
+	last.images        = snapshot.images;
+	last.samplers      = snapshot.samplers;
+	last.user_data     = snapshot.user_data;
+	last.flattened_srt = snapshot.flattened_srt;
+}
+
+void RepeatPrint() {
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(5)) return;
+	last          = now;
+	const auto& c = g_repeat;
+	const auto  pct = [](uint64_t part, uint64_t whole) { return whole != 0 ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0; };
+	const auto  seen = c.stages - c.first;
+	std::printf("NHL27REPEATS stages=%llu first=%llu same: images=%.1f%% samplers=%.1f%% buffers=%.1f%% user=%.1f%% srt=%.1f%% "
+	            "all=%.1f%% | buffer slots changed %.1f%% of %llu, image slots changed %.1f%% of %llu | draws=%llu all-same=%.1f%% "
+	            "all-but-buffers=%.1f%% all-but-buffers-and-user=%.1f%%\n",
+	            static_cast<unsigned long long>(c.stages), static_cast<unsigned long long>(c.first), pct(c.images, seen),
+	            pct(c.samplers, seen), pct(c.buffers, seen), pct(c.user, seen), pct(c.srt, seen), pct(c.all, seen),
+	            pct(c.buffer_slots_changed, c.buffer_slots), static_cast<unsigned long long>(c.buffer_slots),
+	            pct(c.image_slots_changed, c.image_slots), static_cast<unsigned long long>(c.image_slots),
+	            static_cast<unsigned long long>(c.draws), pct(c.draws_all, c.draws), pct(c.draws_but_buffers, c.draws),
+	            pct(c.draws_but_buffers_user, c.draws));
+	std::fflush(stdout);
+	g_repeat = {};
+}
+
 } // namespace
+
+namespace {
+
+// BarrierHazards: the ranges of the work since the last barrier that was kept (`before`, unordered
+// with the pending guest barrier) and since the last guest barrier (`since`).
+struct HazardSet {
+	std::vector<BarrierHazards::Range> reads, writes;
+	bool                               unknown = false;
+	void Clear() {
+		reads.clear();
+		writes.clear();
+		unknown = false;
+	}
+	void Add(const HazardSet& other) {
+		reads.insert(reads.end(), other.reads.begin(), other.reads.end());
+		writes.insert(writes.end(), other.writes.begin(), other.writes.end());
+		unknown |= other.unknown;
+	}
+};
+struct HazardCounters {
+	uint64_t barriers = 0, kept = 0, unknown = 0, raw = 0, war = 0, waw = 0, overflow = 0;
+	uint64_t work = 0, compute = 0, unknown_work = 0, after_barrier = 0;
+};
+HazardSet      g_hazard_before, g_hazard_since;
+bool           g_hazard_pending = false;
+HazardCounters g_hazard;
+
+bool Overlaps(std::span<const BarrierHazards::Range> a, std::span<const BarrierHazards::Range> b) {
+	for (const auto [a_address, a_size]: a) {
+		for (const auto [b_address, b_size]: b) {
+			if (a_address < b_address + b_size && b_address < a_address + a_size) return true;
+		}
+	}
+	return false;
+}
+
+void HazardPrint() {
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(5)) return;
+	last          = now;
+	const auto& c = g_hazard;
+	std::printf("NHL27HAZARDS guest barriers=%llu kept=%llu (unknown=%llu raw=%llu war=%llu waw=%llu overflow=%llu) | "
+	            "work=%llu compute=%llu by-address=%llu after-a-pending-barrier=%llu\n",
+	            static_cast<unsigned long long>(c.barriers), static_cast<unsigned long long>(c.kept),
+	            static_cast<unsigned long long>(c.unknown), static_cast<unsigned long long>(c.raw),
+	            static_cast<unsigned long long>(c.war), static_cast<unsigned long long>(c.waw),
+	            static_cast<unsigned long long>(c.overflow), static_cast<unsigned long long>(c.work),
+	            static_cast<unsigned long long>(c.compute), static_cast<unsigned long long>(c.unknown_work),
+	            static_cast<unsigned long long>(c.after_barrier));
+	std::fflush(stdout);
+	g_hazard = {};
+}
+
+} // namespace
+
+bool BarrierHazards::Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_BARRIER_HAZARDS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void BarrierHazards::Barrier() {
+	g_hazard.barriers++;
+	g_hazard_pending = true;
+	g_hazard_before.Add(g_hazard_since);
+	g_hazard_since.Clear();
+}
+
+void BarrierHazards::Work(bool compute, std::span<PreparedBindings* const> stages, std::span<const Range> reads,
+                          std::span<const Range> writes, bool unknown) {
+	HazardSet work;
+	work.reads.assign(reads.begin(), reads.end());
+	work.writes.assign(writes.begin(), writes.end());
+	work.unknown = unknown;
+	for (const auto* stage: stages) {
+		const auto& program = *stage->runtime->program;
+		work.unknown |= program.info.uses_dma || program.has_address_writes || stage->gds.buffer != nullptr;
+		for (const auto& resource: program.info.buffers) {
+			if (resource.descriptor_index == UINT32_MAX || resource.descriptor_index >= stage->buffer_sources.size()) continue;
+			const auto& source = stage->buffer_sources[resource.descriptor_index];
+			if (source.size == 0) continue;
+			(resource.written ? work.writes : work.reads).emplace_back(source.address, source.size);
+		}
+		for (uint32_t i = 0; i < program.info.images.size() && i < stage->images.size(); i++) {
+			const auto& data = stage->images[i].desc.info.data;
+			if (data.size == 0) continue;
+			(program.info.images[i].written ? work.writes : work.reads).emplace_back(data.address, data.size);
+		}
+		for (const auto& texture: stage->table_images) {
+			const auto& data = texture.desc.info.data;
+			if (data.size != 0) work.reads.emplace_back(data.address, data.size);
+		}
+	}
+	auto& c = g_hazard;
+	c.work++;
+	c.compute += compute ? 1u : 0u;
+	c.unknown_work += work.unknown ? 1u : 0u;
+	if (g_hazard_pending) {
+		c.after_barrier++;
+		const auto& before = g_hazard_before;
+		const bool  overflow = before.reads.size() + before.writes.size() > 8192;
+		const bool  raw      = Overlaps(work.reads, before.writes);
+		const bool  war      = Overlaps(work.writes, before.reads);
+		const bool  waw      = Overlaps(work.writes, before.writes);
+		const bool  unknown_conflict = work.unknown || before.unknown;
+		if (unknown_conflict || raw || war || waw || overflow) {
+			c.kept++;
+			c.unknown += unknown_conflict ? 1u : 0u;
+			c.raw += raw ? 1u : 0u;
+			c.war += war ? 1u : 0u;
+			c.waw += waw ? 1u : 0u;
+			c.overflow += overflow ? 1u : 0u;
+			g_hazard_pending = false;
+			g_hazard_before.Clear();
+			g_hazard_since.Clear();
+		}
+	}
+	g_hazard_since.Add(work);
+	HazardPrint();
+}
+
+bool DrawRepeats::Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_DRAW_REPEATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void DrawRepeats::DrawBegin() {
+	g_repeat_in_draw    = true;
+	g_repeat_draw_flags = 31u;
+}
+
+void DrawRepeats::DrawEnd() {
+	g_repeat_in_draw = false;
+	auto& c          = g_repeat;
+	c.draws++;
+	c.draws_all += g_repeat_draw_flags == 31u ? 1u : 0u;
+	c.draws_but_buffers += (g_repeat_draw_flags | 4u) == 31u ? 1u : 0u;
+	c.draws_but_buffers_user += (g_repeat_draw_flags | 4u | 8u | 16u) == 31u ? 1u : 0u;
+	RepeatPrint();
+}
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
@@ -1152,6 +1380,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
+	if (DrawRepeats::Enabled()) {
+		RepeatStage(&program, snapshot);
+	}
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};

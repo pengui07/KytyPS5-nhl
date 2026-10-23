@@ -12,7 +12,9 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -159,6 +161,27 @@ template <typename T>
                                                    bool r128 = false);
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size);
+
+// KYTY_DBG_DRAW_REPEATS=1: how each draw's stage resources compare with the last use of the same
+// program (NHL27REPEATS every 5 s). Begin/End bracket the stages of one draw.
+namespace DrawRepeats {
+[[nodiscard]] bool Enabled();
+void DrawBegin();
+void DrawEnd();
+} // namespace DrawRepeats
+
+struct PreparedBindings;
+
+// KYTY_DBG_BARRIER_HAZARDS=1: how many guest global barriers order work whose bound ranges overlap
+// (NHL27HAZARDS every 5 s). A guest barrier stays pending until a later draw or dispatch reads or
+// writes a range written (or writes a range read) by work before it, or binds memory by address.
+namespace BarrierHazards {
+using Range = std::pair<uint64_t, uint64_t>;
+[[nodiscard]] bool Enabled();
+void               Barrier();
+void Work(bool compute, std::span<PreparedBindings* const> stages, std::span<const Range> reads,
+          std::span<const Range> writes, bool unknown);
+} // namespace BarrierHazards
 
 } // namespace Libs::Graphics
 

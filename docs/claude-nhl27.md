@@ -989,6 +989,29 @@ about 60 pixel shaders (2 to 36 groups each), not in the shadow vertex shaders i
 A paused GPU A/B (A/B/A, per-draw timestamps) had nearly every shader 8-10% slower with it,
 grouped or not, while A and A2 agreed within 1%: inconclusive, left off.
 
+Toward 120 fps (2026-10-23):
+* The emulated display now runs at 1000 Hz in play and menus by default (`KYTY_PLAY_VBLANK_HZ`,
+  `KYTY_MENU_VBLANK_HZ`), and the presenter's frame pool takes a frame whose last present finished,
+  or grows up to 8 frames, instead of waiting for a present still in flight (`FramePool::Acquire`
+  was 3.1% of the execution thread). In-boot A/B, 6 rounds: 240 Hz 64.3 fps (flip waits 7 ms/s),
+  1000 Hz 64.5 fps (3 ms/s). Two soak matches: 62.9 and 59.9 fps at 60 Hz, no errors.
+* Guest threads print `NHL27THREAD: <name> tid=<host id>`; `KytyPS5-tools\tcpu.sh` names the busiest
+  threads in 60 Hz play (`sampler\threadcpu.exe`). In play at ~65 fps the six GPU pipeline threads
+  each use 91-100% of a CPU (spinning included), the game's own threads 30-47% each.
+* Stage stats at ~70 fps: draws 195k/s at 3.57 us (2,716 a frame), dispatches 53k/s at 2.22 us,
+  callbacks 151k/s at 0.31 us; execution busy 940 ms/s; the resolve thread busy 593 ms/s and
+  waiting for room in the queue 389 ms/s. 120 fps needs the execution thread's work per frame
+  about 42% smaller; a paused scene takes 14.5 ms of GPU per flip, so the GPU needs about 43% too.
+* `KYTY_DBG_DRAW_REPEATS=1` (`NHL27REPEATS`): per stage, against the last use of its program, the
+  T#s were the same 84% of the time, the S#s 99.5%, all V#s 49% (40% of the buffer slots changed),
+  the user data 12%. 66% of the draws had every stage's T#s and S#s unchanged; 0.1% repeated all.
+* `KYTY_DBG_BARRIER_HAZARDS=1` (`NHL27HAZARDS`): a guest barrier stays pending until a later draw or
+  dispatch reads a range written before it, writes a range read or written before it, or accesses
+  memory by address (bound buffers, images, attachments, index, vertex and indirect ranges; the
+  emulator's own passes and copies are not counted). In play 59% of the guest barriers (11.7k/s)
+  would be kept: 23k read-after-write, 16k write-after-write, 7.5k write-after-read, 6k by-address
+  in 5 s; 19% of the draws and dispatches use addresses.
+
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
 Where both branches implemented the same feature, only one implementation is left and it is a

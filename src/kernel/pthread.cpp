@@ -20,6 +20,8 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cinttypes>
+#include <cstdio>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -3216,6 +3218,8 @@ static void* RunThread(void* arg) {
 	     reinterpret_cast<uint64_t>(thread->entry), reinterpret_cast<uint64_t>(thread->arg),
 	     reinterpret_cast<uint64_t>(thread->attr->stack_addr),
 	     static_cast<uint64_t>(thread->attr->stack_size));
+	// Guest thread names by host thread id, for per-thread CPU time (KytyPS5-tools threadcpu).
+	std::printf("NHL27THREAD: %s tid=%" PRIu64 "\n", thread->name.c_str(), os_thread_id);
 
 	// NOLINTNEXTLINE(cppcoreguidelines-pro-type-cstyle-cast)
 	pthread_cleanup_push(CleanupThread, thread);
