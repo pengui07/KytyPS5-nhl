@@ -1112,6 +1112,14 @@ Toward 120 fps (2026-10-23):
   only ones that synchronize, carries it and executes it first. In-boot A/B: operations -13.5%
   (269k vs 311k a second; barriers 18k vs 39k, BDA boundaries 1.3k vs 17k), execution 13.2 vs 13.7
   ms a frame (per draw within noise). Soak: 69.0 fps at 60 Hz over 132 s, no errors.
+* End-of-pipe and WRITE_DATA labels no longer make the execution thread wait for the host copy
+  thread (`HostCopyQueue::Drain`, 7% of it in play): a label of up to 16 bytes is written into guest
+  memory by the copy thread, after the copies queued before it (`BufferCache::TryWriteLabel` with a
+  queue; the label's GPU copy is still updated by the execution thread), and a submission does not
+  drain at all (the recording thread submits after the copies anyway). A direct interrupt
+  (`KYTY_DIRECT_EOP_INTERRUPTS`) or a label written on the execution thread drains first. In-boot
+  A/B (AbPending6, bit 57: the old waits): drain waits ~55 -> ~12 ms/s, execution 13.4 vs 14.3 ms a
+  frame, 71.0 vs 66.0 fps in the same match. Soak: 66.4 fps at 60 Hz, no errors.
 * Tried: `KYTY_FUSED_MAD` again with GPU time per flip: 12.32 / 12.18 / 12.32 ms (-1.1%); left off
   (it changes rounding).
 * Match-start device losses (a GPU hang: flips stop, then `ErrorDeviceLost`, no fault addresses):

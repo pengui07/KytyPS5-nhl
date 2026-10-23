@@ -1050,7 +1050,25 @@ void NoteLabel(LabelOutcome outcome, uint64_t vaddr) {
 }
 } // namespace
 
-bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size) {
+namespace {
+// Labels the host copy thread wrote (DeferredLabel slots are reused after it did).
+std::atomic<uint64_t> g_deferred_labels_written {0};
+
+void WriteDeferredLabel(void* argument) noexcept {
+	const auto& label = *static_cast<const BufferCache::DeferredLabel*>(argument);
+	if (!Libs::LibKernel::Memory::TryWriteBacking(label.vaddr, label.bytes.data(), label.size)) {
+		static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+		if (!reported.test_and_set(std::memory_order_relaxed)) {
+			std::printf("NHL27LABEL: deferred label write at 0x%016llx has no backing\n",
+			            static_cast<unsigned long long>(label.vaddr));
+			std::fflush(stdout);
+		}
+	}
+	g_deferred_labels_written.fetch_add(1, std::memory_order_release);
+}
+} // namespace
+
+bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size, HostCopyQueue* deferred) {
 	if (size == 0 || size > 256 || (size & 3u) != 0 || (vaddr & 3u) != 0 || data == nullptr ||
 	    !GuestRange {vaddr, size}.Valid()) {
 		NoteLabel(LabelBadSize, vaddr);
@@ -1058,6 +1076,11 @@ bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size)
 	}
 	Libs::LibKernel::Memory::NoteHostWrite(vaddr, size, Libs::LibKernel::Memory::HostWriteSource::Label,
 	                                       data);
+	// A label too long for a deferred slot is written now: the copies queued before it first.
+	if (deferred != nullptr && size > sizeof(DeferredLabel::bytes)) {
+		deferred->Drain();
+		deferred = nullptr;
+	}
 	// KYTY_LABEL_UNCACHED_DIRECT=1 (experiment, off by default): a label no buffer covers has no GPU copy
 	// to keep coherent, so write the backing directly. Its page can still be protected for other
 	// GPU-written bytes; preparing it would download those and wait for queued GPU work (about 19 ms per
@@ -1067,8 +1090,13 @@ bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size)
 		return value != nullptr && value[0] == '1';
 	}();
 	const auto write_uncached = [&] {
-		if (!uncached_direct || HasGpuDirtyBytes(vaddr, size) || m_texture_cache.HasImagesInRegion(vaddr, size) ||
-		    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		if (!uncached_direct || HasGpuDirtyBytes(vaddr, size) || m_texture_cache.HasImagesInRegion(vaddr, size)) {
+			return false;
+		}
+		if (deferred != nullptr) {
+			deferred->Drain();
+		}
+		if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 			return false;
 		}
 		DropGpuFills(vaddr, size);
@@ -1094,7 +1122,20 @@ bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size)
 		NoteLabel(written ? LabelUncached : LabelNotCovered, vaddr);
 		return written;
 	}
-	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+	if (deferred != nullptr) {
+		// A slot is reused once the copy thread wrote it (the queue holds fewer labels than slots
+		// before every submission drains it).
+		if (m_deferred_labels_queued - g_deferred_labels_written.load(std::memory_order_acquire) >=
+		    DeferredLabelSlots) {
+			deferred->Drain();
+		}
+		auto& label = m_deferred_labels[m_deferred_labels_queued++ % DeferredLabelSlots];
+		label.vaddr = vaddr;
+		label.size  = size;
+		std::memcpy(label.bytes.data(), data, size);
+		deferred->Call(&WriteDeferredLabel, &label);
+		(void)deferred->Flush();
+	} else if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 		NoteLabel(LabelBacking, vaddr);
 		return false;
 	}

@@ -236,6 +236,9 @@ private:
 	                      uint32_t interrupt_context_id, bool flush_if_batch_ready);
 	// Execution thread: submits when the current command buffer holds a batch of work.
 	void FlushIfBatchReady();
+	// Execution thread: the end-of-pipe operation executing did not wait for the host copy queue,
+	// so its label goes through that queue (see Execute()).
+	bool m_labels_deferred = false;
 	void ProcessPm4(Pm4Execution& execution);
 	const uint32_t* ShadowPm4Packet(const uint32_t* packet, uint32_t remaining_dw);
 	const uint32_t* ShadowProtectedPm4Packet(const uint32_t* packet, uint32_t remaining_dw);

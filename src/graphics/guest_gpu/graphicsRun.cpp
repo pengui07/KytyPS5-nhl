@@ -1413,10 +1413,21 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		// Neither have BDA boundaries, barriers and cache events (the occlusion dump is tagged
 		// Other): two thirds of the callbacks in play, and the waits before them were 4.5% of this
 		// thread.
+		// End-of-pipe labels reach guest memory through the copy queue, after its copies (see
+		// ExecuteWriteAtEndOfPipe): the waits before them were 7% of this thread (AbPending6: they wait).
+		// WRITE_DATA writes take that path too, and a submission does not wait here: the recording
+		// thread submits after the copies queued before it.
+		m_labels_deferred = operation.kind == GpuOperationKind::Callback &&
+		                    (operation.callback_tag == GpuCallbackTag::Eop ||
+		                     operation.callback_tag == GpuCallbackTag::WriteData) &&
+		                    !Common::Experiments::Enabled(Common::Experiments::AbPending6);
+		const bool submission = operation.kind == GpuOperationKind::Callback &&
+		                        operation.callback_tag == GpuCallbackTag::Flush &&
+		                        !Common::Experiments::Enabled(Common::Experiments::AbPending6);
 		const bool invisible =
 		    operation.kind == GpuOperationKind::Callback &&
 		    (operation.callback_tag == GpuCallbackTag::Bda || operation.callback_tag == GpuCallbackTag::Barrier ||
-		     operation.callback_tag == GpuCallbackTag::Event);
+		     operation.callback_tag == GpuCallbackTag::Event || m_labels_deferred || submission);
 		if (auto* copies = GetScheduler().HostCopies();
 		    copies != nullptr && !invisible &&
 		    (!dispatch || Common::Experiments::Enabled(Common::Experiments::CpuCopyForward))) {
@@ -1793,6 +1804,14 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		// (both copies updated, nothing downloaded), not PrepareGpuWrite, which downloads the
 		// page's GPU-written bytes and waited for their writer, 6-23 ms about once a second in
 		// play (AbPending4: always PrepareGpuWrite).
+		// Execute() did not wait for the host copy queue: the labels go through it, and a write made
+		// here waits for it first.
+		auto* const deferred = m_labels_deferred ? GetScheduler().HostCopies() : nullptr;
+		const auto  drain    = [deferred] {
+			if (deferred != nullptr) {
+				deferred->Drain();
+			}
+		};
 		if (Common::RuntimeFlags::Current().pm4_write_data_fast &&
 		    !Common::Experiments::Enabled(Common::Experiments::AbPending4)) {
 			auto& cache = m_renderer.GetBufferCache();
@@ -1800,7 +1819,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 				uint32_t written = 0;
 				while (written < dw_num) {
 					const uint32_t value = src[written];
-					if (!cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), &value, sizeof(value))) {
+					if (!cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), &value, sizeof(value), deferred)) {
 						break;
 					}
 					written++;
@@ -1808,6 +1827,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 				if (written == dw_num) {
 					return;
 				}
+				drain();
 				m_renderer.PrepareGpuWrite(dst, sizeof(uint32_t));
 				for (uint32_t i = written; i < dw_num; i++) {
 					dst[0] = src[i];
@@ -1818,11 +1838,12 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 				std::array<uint32_t, 64> values {};
 				std::memcpy(values.data(), src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
 				if (cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), values.data(),
-				                        static_cast<uint64_t>(dw_num) * sizeof(uint32_t))) {
+				                        static_cast<uint64_t>(dw_num) * sizeof(uint32_t), deferred)) {
 					return;
 				}
 			}
 		}
+		drain();
 		m_renderer.PrepareGpuWrite(dst, uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t));
 		if (write_one_address) {
 			for (uint32_t i = 0; i < dw_num; i++) {
@@ -3625,14 +3646,28 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 		const char* setting = std::getenv("KYTY_EOP_DIRECT_LABELS");
 		return setting != nullptr && setting[0] == '1';
 	}();
+	// Execute() did not wait for the host copy queue (m_labels_deferred): the label is written after
+	// its copies, by the copy thread, unless the guest learns of it now (a direct interrupt).
+	auto* const copies = GetScheduler().HostCopies();
+	if (m_labels_deferred && copies != nullptr &&
+	    (!direct_labels || (with_interrupt && Common::RuntimeFlags::Current().direct_eop_interrupts))) {
+		// The label must be in guest memory before a direct interrupt (or is written by the
+		// execution thread itself): earlier copies first.
+		copies->Drain();
+		m_labels_deferred = false;
+	}
 	auto write_label = [&](void* destination, const void* data, uint64_t bytes) {
 		Common::EventTrace::Record(Common::EventTrace::LABEL_WRITE,
 		                           reinterpret_cast<uint64_t>(destination) & 0xffffffffu,
 		                           m_renderer.GetCommandScheduler().CurrentTick());
+		auto* const deferred = m_labels_deferred ? copies : nullptr;
 		// The exact-range label write goes first: preparing the page for a host store downloads
 		// and unprotects it, waiting for all queued GPU work.
 		if (!direct_labels || !m_renderer.GetBufferCache().TryWriteLabel(
-		        reinterpret_cast<uint64_t>(destination), data, bytes)) {
+		        reinterpret_cast<uint64_t>(destination), data, bytes, deferred)) {
+			if (deferred != nullptr) {
+				deferred->Drain();
+			}
 			// A store into a watched page would fault: download its GPU-written bytes first. A
 			// direct label write goes through the backing and the label's GPU copy instead, so the
 			// other GPU-written bytes of the page stay where they are and nothing waits for the
@@ -3891,6 +3926,11 @@ void CommandProcessor::DeferEopInterrupt(uint32_t interrupt_context_id) {
 	// label instead of after host completion. CPU reads of GPU-written memory still wait for the
 	// host GPU through the page tracking.
 	if (Common::RuntimeFlags::Current().direct_eop_interrupts) {
+		// The guest learns of the end of pipe now: the copies of earlier work complete first (the
+		// operation did not wait for them, see Execute()).
+		if (auto* copies = GetScheduler().HostCopies(); m_labels_deferred && copies != nullptr) {
+			copies->Drain();
+		}
 		FrameBreakdown::Add(FrameBreakdown::g_counters.port_eop_direct);
 		Common::EventTrace::Record(Common::EventTrace::EOP_TRIGGER,
 		                           static_cast<uint64_t>(m_interrupt_event_id),
