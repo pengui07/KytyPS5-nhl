@@ -1077,6 +1077,28 @@ Toward 120 fps (2026-10-23):
 * Tried: a per-1 MiB-chunk last-write sequence so `StillValid` skips page lookups in unwritten
   chunks (3.71 vs 3.76 us per draw without it, noise), and `KYTY_PROTECT_SHARED_LOCK` again
   (3.71 us, noise); both dropped/left off.
+* The GPU limits play too: `KYTY_IDLE_TRACE_NO_CMDS` captures in play read 12-22 ms of GPU work
+  per flip at 80-97% busy (heavier scenes, e.g. 44 fps at 97%). Top shaders in play (per-draw
+  timestamps): compute `c556aaf3` 1.4-1.6 ms a frame (one indirect dispatch), pixel `33037c60`
+  0.8-1.2, compute `a36f0b4f` ~1.0, compute `6cb32e43` ~0.9 (4-5 indirect dispatches, 256 VGPRs
+  and 192 bytes of scratch for the guest's 128), compute `9380d724` 0.6. `KYTY_DBG_DUMP_SHADERS`
+  prints their guest code (`_Shaders/*_ir_*.txt`) and `KYTY_DBG_PIPELINE_STATS` the host ISA.
+* Bit 52 `KYTY_UNDEF_VGPRS` (default on; key bit 131072): a VGPR the hardware does not initialize,
+  read before any write on some path, was 0 there, so a value written in one branch and read after
+  it merged with that 0 (a phi: zeroing moves and a longer live register). It is now `UndefU32`
+  (`OpUndef`), as on the hardware (`c556aaf3`: 264 -> 202 moves). Paused A/B/A without per-draw
+  timestamps: 13.56 / 13.37 / 13.55 ms per flip (-1.4%).
+* Bit 54 `KYTY_FTZ32` (default on; key bit 262144; needs `shaderDenormFlushToZeroFloat32` and
+  32-bit denormal independence): the guest's MODE (0xc0) flushes FP32 denormals; shaders now declare
+  `DenormFlushToZero` for 32 bits (LLPC already ran them so, `denormal_fpenv(float: preservesign)`),
+  and the inputs of RCP, RSQ, SQRT, EXP and LOG are no longer flushed by hand (an and, a compare and
+  a select each). Paused A/B/A: 26.85 / 26.05 / 26.78 ms per flip (-2.8%). Frames captured in play
+  with both: normal.
+* Tried: declaring the host-written tables (BDA page table, shader data, flattened SRT) NonWritable
+  so the page lookups could be shared: 11.22 / 11.32 / 11.28 ms per flip; dropped.
+* Execution-thread waits in play (`NHL27EXECIDLE`, now split): ~30 ms/s for the second draw
+  resolver's slots, ~27 ms/s for the resolve thread, 11-30 ms/s of them in the first 256 operations
+  after a flip. Fault windows of 4 pages instead of 16 (bit 15 off): 3.38 us per draw either way.
 * Match-start device losses (a GPU hang: flips stop, then `ErrorDeviceLost`, no fault addresses):
   2 in 13 boots with bits 42 and 53 on, 0 in 8 with `KYTY_DBG_BREADCRUMBS=1`, 0 in 3 with bit 53 off.
   Too rare to bisect by boots; bit 53 stays on.

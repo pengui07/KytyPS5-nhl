@@ -149,6 +149,22 @@ inline std::atomic<bool> g_shader_early_late_tests {false};
 	return g_shader_early_late_tests.load(std::memory_order_relaxed) &&
 	       Common::Experiments::Enabled(Common::Experiments::EarlyLateFragmentTests);
 }
+// Codegen option: experiment UndefVgprs (key bit 131072). A VGPR the hardware leaves uninitialized
+// read before any write on some path was 0 there: a value written in one branch and read after it
+// merged with that 0 (a phi, often a move per path and a register longer live). It is undefined
+// instead, as on the hardware.
+[[nodiscard]] inline bool ShaderUndefVgprs() {
+	return Common::Experiments::Enabled(Common::Experiments::UndefVgprs);
+}
+// The device can flush 32-bit denormals while 16-bit ones are preserved (vulkanWindow sets it).
+inline std::atomic<bool> g_shader_ftz32 {false};
+// Codegen option: experiment Ftz32 (key bit 262144). The guest's MODE (0xc0) flushes FP32
+// denormals; the shaders declare DenormFlushToZero for 32-bit floats, so the inputs of RCP, RSQ,
+// SQRT, EXP and LOG need no flush of their own (an and, a compare and a select each).
+[[nodiscard]] inline bool ShaderFtz32() {
+	return g_shader_ftz32.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::Ftz32);
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
@@ -158,7 +174,8 @@ inline std::atomic<bool> g_shader_early_late_tests {false};
 	       (ShaderRobustSpillLoads() ? 512u : 0u) | (ShaderBranchlessFormattedLoads() ? 1024u : 0u) |
 	       (ShaderExecBranches() ? 2048u : 0u) | (ShaderExecBranchMemory() ? 4096u : 0u) |
 	       (ShaderBdaLoadGroups() ? 8192u : 0u) | (ShaderExecBranchContinue() ? 16384u : 0u) |
-	       (ShaderF16LaneViews() ? 32768u : 0u) | (ShaderEarlyLateFragmentTests() ? 65536u : 0u);
+	       (ShaderF16LaneViews() ? 32768u : 0u) | (ShaderEarlyLateFragmentTests() ? 65536u : 0u) |
+	       (ShaderUndefVgprs() ? 131072u : 0u) | (ShaderFtz32() ? 262144u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

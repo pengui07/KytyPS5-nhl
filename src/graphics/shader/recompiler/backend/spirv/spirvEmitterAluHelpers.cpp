@@ -195,6 +195,9 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {
+	if (ShaderFtz32()) {
+		return value; // the shader's DenormFlushToZero mode flushes it
+	}
 	const auto bits      = state.builder.AllocateId();
 	const auto abs_bits  = state.builder.AllocateId();
 	const auto sign_bits = state.builder.AllocateId();

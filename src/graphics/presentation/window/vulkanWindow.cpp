@@ -739,6 +739,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.vertexPipelineStoresAndAtomics       = VK_TRUE;
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
+	g_shader_ftz32.store(float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE &&
+	                         float_controls.denormBehaviorIndependence !=
+	                             vk::ShaderFloatControlsIndependence::eNone,
+	                     std::memory_order_relaxed);
+	std::printf("NHL27CODEGEN ftz32=%d (flush32 %d independence %d)\n", g_shader_ftz32.load() ? 1 : 0,
+	            float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE ? 1 : 0,
+	            static_cast<int>(float_controls.denormBehaviorIndependence));
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
 	    float_controls.shaderSignedZeroInfNanPreserveFloat64;

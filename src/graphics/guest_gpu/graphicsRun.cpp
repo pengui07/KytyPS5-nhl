@@ -674,10 +674,12 @@ static void PrintStageStats() {
 	            items != 0 ? (busy - ms[StageStats::ExecProgramLock]) * 1e3 * seconds / static_cast<double>(items) : 0.0,
 	            ms[StageStats::ResolveProgramLock], ms[StageStats::ResolveQueueFull], ms[StageStats::ResolveIdle],
 	            1000.0 - ms[StageStats::ResolveQueueFull] - ms[StageStats::ResolveIdle]);
-	std::printf("NHL27EXECIDLE ms/s: resolve=%.1f cp-busy=%.1f no-submission=%.1f blocked=%.1f "
-	            "cp-decision-wait=%.1f cp-other-wait=%.1f | bda syncs/s=%.0f flushes/s=%.0f (callbacks %.0f batch %.0f guest-reads %.0f flips %.0f)"
+	std::printf("NHL27EXECIDLE ms/s: resolve=%.1f draw-slot=%.1f dispatch-slot=%.1f (after flips %.1f) cp-busy=%.1f "
+	            "no-submission=%.1f blocked=%.1f cp-decision-wait=%.1f cp-other-wait=%.1f | bda syncs/s=%.0f flushes/s=%.0f (callbacks %.0f batch %.0f guest-reads %.0f flips %.0f)"
 	            " | asked by other %.0f submission %.0f interrupt %.0f suspend %.0f split %.0f\n",
-	            ms[StageStats::ExecIdleResolve], ms[StageStats::ExecIdleCp], ms[StageStats::ExecIdleNoWork],
+	            ms[StageStats::ExecIdleResolve], ms[StageStats::ExecIdleDrawSlot],
+	            ms[StageStats::ExecIdleDispatchSlot], ms[StageStats::ExecIdleEarly], ms[StageStats::ExecIdleCp],
+	            ms[StageStats::ExecIdleNoWork],
 	            ms[StageStats::ExecIdleBlocked], ms[StageStats::ExecIdleDecision], ms[StageStats::ExecIdleOther],
 	            static_cast<double>(StageStats::g_bda_syncs.exchange(0, std::memory_order_relaxed)) / seconds,
 	            static_cast<double>(g_scheduler_flushes.exchange(0, std::memory_order_relaxed)) / seconds,
@@ -878,6 +880,7 @@ void GuestGpu::ExecutionThread() {
 	constexpr uint32_t NotifyInterval = 16;
 	uint32_t           unnotified     = 0;
 	auto&              operations     = m_resolving ? m_resolved : m_operations;
+	uint32_t           since_flip     = 0; // operations since the last flip (stats only)
 	for (;;) {
 		if (m_urgent_pending.load(std::memory_order_relaxed) != 0) {
 			RunUrgentCommands();
@@ -893,6 +896,7 @@ void GuestGpu::ExecutionThread() {
 				operation        = operations.Pop();
 				StageStats::Add(StageStats::ExecIdle, start);
 				StageStats::Add(cause, start);
+				if (since_flip < 256) StageStats::Add(StageStats::ExecIdleEarly, start);
 				PrintStageStats();
 			} else {
 				operation = operations.Pop();
@@ -922,7 +926,8 @@ void GuestGpu::ExecutionThread() {
 				}
 				if (StageStats::Enabled()) {
 					StageStats::Add(StageStats::ExecIdle, start);
-					StageStats::Add(StageStats::ExecIdleResolve, start);
+					StageStats::Add(StageStats::ExecIdleDispatchSlot, start);
+					if (since_flip < 256) StageStats::Add(StageStats::ExecIdleEarly, start);
 				}
 			}
 			operation->resolved_dispatch = slot->result;
@@ -940,7 +945,8 @@ void GuestGpu::ExecutionThread() {
 				}
 				if (StageStats::Enabled()) {
 					StageStats::Add(StageStats::ExecIdle, start);
-					StageStats::Add(StageStats::ExecIdleResolve, start);
+					StageStats::Add(StageStats::ExecIdleDrawSlot, start);
+					if (since_flip < 256) StageStats::Add(StageStats::ExecIdleEarly, start);
 				}
 			}
 			operation->resolved = slot->result;
@@ -982,6 +988,9 @@ void GuestGpu::ExecutionThread() {
 			}
 		}
 		const auto sequence = operation->sequence;
+		since_flip = operation->kind == GpuOperationKind::Callback && operation->callback_tag == GpuCallbackTag::Flip
+		                 ? 0
+		                 : since_flip + 1;
 		// Destroy the callback before the command processor may reuse what it references.
 		operation.reset();
 		m_executed.Publish(sequence);

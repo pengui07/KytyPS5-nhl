@@ -89,7 +89,12 @@ enum Bit : uint64_t {
 	// KYTY_F16_LANE_VIEWS (default on; with NativeFp16): scalar f16 ops read and write their
 	// 16-bit lanes as halves of an f16vec2 instead of masking them out of U32s; part of shader keys.
 	F16LaneViews = uint64_t {1} << 51u,
-	// Bit 52 was LazyGuestBarriers (guest barriers recorded only before overlapping work; dropped).
+	// KYTY_UNDEF_VGPRS (default on): VGPRs the hardware does not initialize read as undefined instead
+	// of 0 before their first write; part of shader keys. Bit 52 was LazyGuestBarriers (dropped).
+	UndefVgprs = uint64_t {1} << 52u,
+	// KYTY_FTZ32 (default on): shaders declare DenormFlushToZero for 32-bit floats (the guest's MODE
+	// flushes them) and transcendental inputs are no longer flushed by hand; part of shader keys.
+	Ftz32 = uint64_t {1} << 54u,
 	// KYTY_EARLY_LATE_FRAGMENT_TESTS (default on): pixel shaders whose only side effects are the emulator's
 	// address fault records keep early depth tests (EarlyAndLateFragmentTestsAMD); shader key bit.
 	EarlyLateFragmentTests = uint64_t {1} << 53u,
