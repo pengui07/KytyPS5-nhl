@@ -734,7 +734,8 @@ the range's CPU state are unchanged): one boot with three variants, draw cost 4.
 paired rounds 378 / 370. Reusing identical flattened-SRT and shader-data uploads within a lap of
 the stream buffer: draw cost -2% but 378 / 407 fps in the same boot, dropped.
 
-Readback waits of the execution thread (`NHL27RBWAIT`; `KytyPS5-toolsbwait-by-mask.py`) were
+Readback waits of the execution thread (`NHL27RBWAIT`; `KytyPS5-tools
+bwait-by-mask.py`) were
 65-92 ms/s in play with bit 4 off, nearly all synchronous downloads for command-processor read
 faults on bytes the GPU never wrote (pages NHL 27 shares between command buffers and the 16
 bytes a compute shader writes). Bit 34 `KYTY_FALSE_SHARE_ANY_THREAD` is now on by default: such a
@@ -1055,6 +1056,30 @@ Toward 120 fps (2026-10-23):
   memo, so a slot compares with the program's last draw rather than the stage's (10.3k bindings sent).
   In-boot A/B, 6 rounds: 66.3 fps and 906 ms/s of execution with both, 64.3 / 944 with the old syncs,
   65.6 / 938 with the old slot memos.
+* The game's own threads (`KytyPS5-tools\prof-guest.sh` samples them by name): NHL 27's job threads
+  (Job0-Job12) spent 20-34% of their time blocked in `AudioOut2PortGetState` on the AudioOut2 state
+  mutex, which the audio thread held across `AudioOutOutputs`, a blocking push that waits up to a
+  grain (~10 ms) for SDL's queue. The context's PCM and gains are now copied under the state mutex
+  and pushed without it; a separate output mutex keeps the audio handles open meanwhile (closing one
+  takes it). The job threads no longer block there (Job0 53% busy, the rest 25-47%).
+* PGO profile v13, recorded after the binding changes: soak 66.7 and 70.3 fps at 60 Hz.
+* Guest write faults (`NHL27FAULTCOST`, ~330 a frame) took 140-190 us each, 45-60 ms of guest thread
+  time a frame: 12 ms in protection calls, most of the rest spinning on the tracking region locks,
+  which faulting threads held across those calls (the fault's window release in `MarkCpuDirtyAhead`,
+  the faulting page in `InvalidateRegion`). Every watcher change now only marks its pages stale
+  under the `PageManager` region spin lock; the protection is applied after that lock (and, for a
+  guest thread's write fault, after the whole handler: `PageManager::ReleaseScope`) by
+  `ApplyStaleNow`, which holds a per-region mutex across its protection calls so the last apply of a
+  page sees its latest watchers. A fault on a page whose release is still pending applies it
+  (`ApplyPending`, first thing in `HandleFault`), so no thread waits for another's handler. Two
+  in-boot A/Bs: execution 3.76 vs 3.95 us per draw (the guest faults contended with its
+  synchronizations); fps 69.7 and 62.9 vs 65.2 and 67.2 (scene noise).
+* Tried: a per-1 MiB-chunk last-write sequence so `StillValid` skips page lookups in unwritten
+  chunks (3.71 vs 3.76 us per draw without it, noise), and `KYTY_PROTECT_SHARED_LOCK` again
+  (3.71 us, noise); both dropped/left off.
+* Match-start device losses (a GPU hang: flips stop, then `ErrorDeviceLost`, no fault addresses):
+  2 in 13 boots with bits 42 and 53 on, 0 in 8 with `KYTY_DBG_BREADCRUMBS=1`, 0 in 3 with bit 53 off.
+  Too rare to bisect by boots; bit 53 stays on.
 * Tried: skipping the region lock in the BDA dirty-span drain when the span had no CPU-dirty page
   (`ForEachCpuDirtySpanBefore`, where the profile showed 2.8% spinning on that lock): 63.2 vs 64.3 fps,
   draw 3.80 vs 3.82 us; dropped.

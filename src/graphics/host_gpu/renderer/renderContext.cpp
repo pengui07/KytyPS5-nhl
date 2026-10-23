@@ -81,6 +81,10 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
+	// A page another thread's fault released but has not protected yet (PageManager::ReleaseScope).
+	if (m_page_manager.ApplyPending(fault_vaddr)) {
+		return true;
+	}
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		// Cache tracking may still protect a page whose range left the GPU-mapped set; that
 		// fault is ours to resolve, not a guest access violation.
@@ -127,6 +131,11 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		FrameBreakdown::g_in_fault = true;
 	}
 	if (access == PageFaultAccess::Write) {
+		// A guest thread's releases are protected when this ends, not under the tracking locks
+		// (in-boot A/B: execution 3.76 vs 3.95 us per draw, the guest threads' faults contend
+		// with its synchronizations). The GPU threads' faults can download into released pages.
+		const PageManager::ReleaseScope release_scope(!GuestGpu::IsGpuThread() &&
+		                                              !GuestGpu::IsCommandProcessorThread());
 		if (FrameBreakdown::Enabled()) {
 			FrameBreakdown::SpecNoteFault(fault_vaddr);
 		}

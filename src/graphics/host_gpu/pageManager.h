@@ -30,7 +30,7 @@ public:
 	// pages that gain watchers are protected by the host copy thread, in queue order before the
 	// copies queued after it, instead of by the calling thread (each protection call took about
 	// 7.5 us, 8% of the execution thread). Writes before the protection are in those copies,
-	// writes after it fault as before. Losing watchers (fault handling) stays immediate.
+	// writes after it fault as before. Losing watchers never waits for the copy thread.
 	class DeferredProtectionScope {
 	public:
 		explicit DeferredProtectionScope(HostCopyQueue* queue) noexcept;
@@ -43,6 +43,22 @@ public:
 	// Whether the calling thread defers protection (its guest-data copies must then go through
 	// the host copy queue, or wait for it).
 	[[nodiscard]] static bool DeferringProtection() noexcept;
+	// A guest thread's write fault: pages it releases (watchers removed) are protected when the
+	// scope ends, after the handler's tracking locks are released, instead of under those locks
+	// (guest threads spent 70% of their fault time spinning on them). Another thread that faults
+	// on such a page meanwhile applies it itself (ApplyPending). Nested scopes join the outer one.
+	class ReleaseScope {
+	public:
+		explicit ReleaseScope(bool enable) noexcept;
+		~ReleaseScope();
+		KYTY_CLASS_NO_COPY(ReleaseScope);
+
+	private:
+		bool m_owner;
+	};
+	// Applies the pending protection of the region holding vaddr if its page has one (see
+	// ReleaseScope); whether it had.
+	bool ApplyPending(uint64_t vaddr);
 
 	PageManager();
 	// The owner must stop all PageManager callers before destruction.
