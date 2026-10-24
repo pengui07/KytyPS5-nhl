@@ -186,6 +186,17 @@ inline std::atomic<bool> g_shader_ftz32 {false};
 [[nodiscard]] inline bool ShaderExecRunTransparent() {
 	return ShaderExecBranches() && Common::Experiments::Enabled(Common::Experiments::ExecRunTransparent);
 }
+// Codegen option: experiment AlignedBufferOffsets (key bit 8388608). A buffer binding starts at the
+// guest base aligned down to the device's storage offset alignment, and the shader adds the rest
+// (the binding prefix, from the shader data). Scalar buffer reads align the base and the offset
+// independently, so with an alignment of at most 4 bytes (AMD) their prefix is always zero dwords;
+// adding it per read kept the compiler from folding and merging the constant loads.
+// vulkanWindow sets g_shader_storage_align4 at device creation.
+inline std::atomic<bool> g_shader_storage_align4 {false};
+[[nodiscard]] inline bool ShaderAlignedBufferOffsets() {
+	return g_shader_storage_align4.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::AlignedBufferOffsets);
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
@@ -198,7 +209,8 @@ inline std::atomic<bool> g_shader_ftz32 {false};
 	       (ShaderF16LaneViews() ? 32768u : 0u) | (ShaderEarlyLateFragmentTests() ? 65536u : 0u) |
 	       (ShaderUndefVgprs() ? 131072u : 0u) | (ShaderFtz32() ? 262144u : 0u) |
 	       (ShaderMovRelBounds() ? 524288u : 0u) | (ShaderF16Converts() ? 1048576u : 0u) |
-	       (ShaderF16ImagePack() ? 2097152u : 0u) | (ShaderExecRunTransparent() ? 4194304u : 0u);
+	       (ShaderF16ImagePack() ? 2097152u : 0u) | (ShaderExecRunTransparent() ? 4194304u : 0u) |
+	       (ShaderAlignedBufferOffsets() ? 8388608u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

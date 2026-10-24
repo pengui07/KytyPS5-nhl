@@ -2041,11 +2041,39 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         return;
     }
     const auto start = std::chrono::steady_clock::now();
+    // KYTY_WARMUP_ONLY=<hex hash>[,...]: warm up only the pipelines using those shaders (with
+    // KYTY_DBG_PIPELINE_STATS and KYTY_EXIT_AFTER_WARMUP=1 a quick look at their host ISA).
+    std::vector<bool> wanted;
+    if (const char* only = std::getenv("KYTY_WARMUP_ONLY"); only != nullptr) {
+        std::unordered_set<uint64_t> hashes;
+        for (const char* cursor = only; *cursor != 0;) {
+            char* end = nullptr;
+            const auto hash = std::strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            hashes.insert(hash);
+            cursor = *end == ',' ? end + 1 : end;
+        }
+        wanted.assign(records.programs.size(), false);
+        const auto listed = [&](uint32_t program) {
+            return program < records.programs.size() && hashes.contains(records.programs[program].hash);
+        };
+        for (const auto& record: records.graphics) {
+            const bool ps = record.pixel_program != PipelineRecord::NoProgram;
+            if (listed(record.vertex_program) || (ps && listed(record.pixel_program))) {
+                wanted[record.vertex_program] = true;
+                if (ps) wanted[record.pixel_program] = true;
+            }
+        }
+        for (const auto& record: records.compute) {
+            if (listed(record.program)) wanted[record.program] = true;
+        }
+    }
     // Shared ProgramCache/compiler state is serialized; do not race translation or insertion.
     std::vector<ShaderProgram> handles(records.programs.size());
     std::vector<ShaderRecompiler::IR::ResourceSnapshot> snapshots(records.programs.size());
     for (size_t index = 0; index < records.programs.size(); ++index) {
         auto& source = records.programs[index];
+        if (!wanted.empty() && !wanted[index]) continue;
         if (source.user_data.size() > ShaderParams{}.user_data.size()) continue;
         if (source.stage == ShaderType::Vertex && source.vertex.native_draw.Enabled() &&
             !m_graphics.native_draw_parameters_enabled) continue;
@@ -2123,13 +2151,20 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         CreatePipelineInternal(m_graphics, *pipeline, record.compute, program.module, m_driver_cache);
         m_compute_pipelines.emplace(program.id, std::move(pipeline)); ++compute_count;
     }
-    if (m_driver_cache != nullptr) {
+    // A partial warm-up leaves the driver cache as it was.
+    if (m_driver_cache != nullptr && wanted.empty()) {
         WriteDriverCache();
     }
     PipelineCacheLog("Shader warm-up: {} programs, {} graphics and {} compute pipelines in {:.1f}s",
         std::ranges::count_if(handles, [](const auto& handle) { return bool(handle); }),
         graphics_count, compute_count,
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+    if (const char* exit_flag = std::getenv("KYTY_EXIT_AFTER_WARMUP"); exit_flag != nullptr && exit_flag[0] == '1') {
+        std::printf("NHL27WARMUP_DONE\n");
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::_Exit(0);
+    }
 }
 
 void PipelineCache::RecordGraphicsPipeline(const GraphicsPipelineKey&             key,

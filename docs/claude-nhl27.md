@@ -1136,7 +1136,26 @@ Toward 120 fps (2026-10-23):
   copied into the buffer (a lock and a scan per texel bind, 1.7%), and the program memos are found
   through a direct-mapped cache (0.8%). In-boot A/B (AbPending7, bit 58: the old way): 3.68 vs 3.74
   us per draw. NHL 27 issues no occlusion queries in play (a run with every query counting no
-  samples saw none).
+  samples saw none). The upload memo was dropped again: counted in play it hit 5% of the uploads
+  (1.2M hits, 24.7M misses of ~84 words), so the compare and the copy into the memo cost more than
+  the hits saved.
+* Bit 62 `KYTY_ALIGNED_BUFFER_OFFSETS` (default on; key bit 8388608; only where
+  `minStorageBufferOffsetAlignment` is at most 4, as on AMD): a buffer binding starts at the guest
+  base aligned down to that alignment and the shader adds the rest from the shader data (the
+  binding prefix). Scalar buffer reads align the base and the offset independently, so their prefix
+  in dwords is always zero there; adding it per read kept the compiler from using immediate offsets
+  and merging constant loads. Compute `c556aaf3`: `s_buffer_load_b32` 189 -> 143 (now b64/b256 for
+  the constant ones), `s_add_co_i32` 207 -> 115, SGPRs 94 -> 86. In play 0.35% of the bindings have
+  a prefix (2-byte aligned texel buffers), so vector accesses keep it. Paused A/B/A: 17.32 / 17.50 /
+  17.42 ms per flip (-0.7%).
+* Host ISA without playing: `KYTY_WARMUP_ONLY=<hex hash>[,...]` warms up only the recorded
+  pipelines that use those shaders (the driver cache is left as it was) and `KYTY_EXIT_AFTER_WARMUP=1`
+  exits after the warm-up; with `KYTY_DBG_PIPELINE_STATS` that is the shaders' VGPRs, SGPRs and ISA
+  in a few seconds (`KytyPS5-tools/isa-bench.ps1 -Hashes ... [-Mask ...]`, `isa-masks.sh`,
+  `isa-stat.py`). Only compute pipelines and the graphics pipelines in the record (97) are there.
+  Host vs guest VGPRs of the heavy compute shaders: `ea94f09b` 60 -> 160, `6cb32e43` 128 -> 245,
+  `7324a60f` 128 -> 252, `0b71107d` 36 -> 72, `c556aaf3` 96 -> 135 (wave32), `62ece4db` 60 -> 96
+  plus 272 bytes of scratch (workgroups of 1024), `a36f0b4f` 48 -> 52.
 * GPU time in play by pass (per-draw timestamps): compute 55% (dispatches 28%, indirect 26%, async
   2%), the 2348x1320 HDR draws 26%, the 3520x1980 ones 6%, depth-only 5%.
 * Bit 59 `KYTY_F16_CONVERTS` (default on with native f16; key bit 1048576): the f32 emulation of a

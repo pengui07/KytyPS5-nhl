@@ -743,6 +743,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                         float_controls.denormBehaviorIndependence !=
 	                             vk::ShaderFloatControlsIndependence::eNone,
 	                     std::memory_order_relaxed);
+	g_shader_storage_align4.store(properties2.properties.limits.minStorageBufferOffsetAlignment <= 4u,
+	                              std::memory_order_relaxed);
+	std::printf("NHL27CODEGEN storage_offset_align=%llu\n",
+	            static_cast<unsigned long long>(
+	                properties2.properties.limits.minStorageBufferOffsetAlignment));
 	std::printf("NHL27CODEGEN ftz32=%d (flush32 %d independence %d)\n", g_shader_ftz32.load() ? 1 : 0,
 	            float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE ? 1 : 0,
 	            static_cast<int>(float_controls.denormBehaviorIndependence));

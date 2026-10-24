@@ -87,6 +87,10 @@ enum Bit : uint64_t {
 	// KYTY_EXEC_RUN_TRANSPARENT (default on; with ExecBranches): resource handles, lane ids and
 	// references no longer end an ExecBranches run; part of shader keys.
 	ExecRunTransparent = uint64_t {1} << 61u,
+	// KYTY_ALIGNED_BUFFER_OFFSETS (default on; on devices binding storage buffers at any dword):
+	// scalar buffer reads leave out the binding prefix, which is below one dword there; part of
+	// shader keys.
+	AlignedBufferOffsets = uint64_t {1} << 62u,
 	// KYTY_GUEST_OFF_STAGE_CORES (default on): threads without a CPU of their own (guest, driver
 	// and helper threads) keep off both logical CPUs of the execution and resolve threads' cores.
 	GuestOffStageCores = uint64_t {1} << 46u,

@@ -1799,9 +1799,12 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	}
 	const auto access    = PrepareMemoryResourceAccess(state, mem);
 	// Scalar buffer addressing aligns the base and each offset independently.
-	const auto element = Binary(
-	    state, spv::OpIAdd, TypeU32(state), index,
-	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset, ConstantU32(state, 2)));
+	const auto element =
+	    ShaderAlignedBufferOffsets()
+	        ? index
+	        : Binary(state, spv::OpIAdd, TypeU32(state), index,
+	                 Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.byte_offset,
+	                        ConstantU32(state, 2)));
 	if ((RobustLoad(state, mem.kind) && ShaderRobustConstReads()) || ShaderSkipBoundsChecks()) {
 		// As LoadWordPrepared: out of range reads zero on the device. A branch per constant kept
 		// each scalar load in a block of its own, so the compiler could neither batch nor hoist them
