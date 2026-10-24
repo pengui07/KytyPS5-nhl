@@ -1585,28 +1585,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	lookup_timer.Stop();
 	FrameBreakdown::Timer upload_timer(FrameBreakdown::g_counters.dp_rebind_upload_ns);
-	// The program's last upload of the same words in this command buffer is still in place: the
-	// stream buffer keeps a lap's data, and reusing it in a later command buffer would outlive the
-	// stream buffer's watch on it (the copies were 2.4% of the execution thread).
-	const auto upload = [&](PreparedBindings::UploadMemo& memo, std::span<const uint32_t> data) {
-		auto&      stream = cache.GetUtilityBuffer(MemoryUsage::Stream);
-		const auto tick   = m_context.GetCommandScheduler().CurrentTick();
-		if (memo.tick == tick && memo.lap == stream.Lap() && memo.info.buffer == stream.Handle() &&
-		    !Common::Experiments::Enabled(Common::Experiments::AbPending7) &&
-		    memo.data.size() == data.size() && std::equal(data.begin(), data.end(), memo.data.begin())) {
-			return memo.info;
-		}
-		memo.info = NativeUpload(m_context, data);
-		memo.tick = tick;
-		memo.lap  = stream.Lap();
-		memo.data.assign(data.begin(), data.end());
-		return memo.info;
-	};
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
-		prepared.flattened_srt = upload(prepared.srt_upload, snapshot.flattened_srt);
+		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
-		prepared.shader_data_buffer = upload(prepared.shader_data_upload, prepared.shader_data);
+		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
 	}
 }
 
