@@ -2424,10 +2424,10 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 		auto event_source = 2u;
 
 		// A label-only release keeps batching; long batches still start the GPU early. The label
-		// write's operation checks the batch itself (AbPending2: one more operation does, as
-		// before: 40,000 a second in play).
+		// write's operation checks the batch itself (one more operation did: 40,000 a second in
+		// play).
 		const bool interrupt = interrupt_selector == 0x01 || interrupt_selector == 0x02;
-		const bool fold      = !interrupt && !Common::Experiments::Enabled(Common::Experiments::AbPending2);
+		const bool fold      = !interrupt;
 		cp.WriteAtEndOfPipe32(cache_policy, event_write_dest, eop_event_type, cache_action,
 		                      event_index, event_source, dst_gpu_addr, static_cast<uint32_t>(value),
 		                      interrupt_selector, interrupt_context_id, fold);

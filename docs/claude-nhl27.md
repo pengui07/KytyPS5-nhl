@@ -1189,6 +1189,22 @@ Toward 120 fps (2026-10-23):
   the array in registers and uses `v_movrels_b32`/`v_movreld_b32`. `6cb32e43`: 6444 -> 5284
   instructions, 245 -> 203 VGPRs; `7324a60f` 6382 -> 5188, 252 -> 208. Paused A/B/A against no
   bounds at all: `6cb32e43` 259 -> 64-67 us per dispatch; in-match frames look the same.
+* Bit 44 `KYTY_BDA_TWO_LOOKUPS` (default on; key bit 134217728; was AbPending2, whose old alternate
+  and those of AbPending3/4 are gone): a scalar BDA load group (`S_LOAD_DWORDX2..X16` through a
+  pointer, e.g. NHL 27's per-light records at `s[2:3] + index * 64`) that crosses a caching page looks
+  up its first and last pages only (`LoadCrossingScalarGroup`) instead of each DWORD's. 9eaaf80c:
+  23834 -> 21201 instructions, SGPR spills (`v_readlane`) 644 -> 313; 33037c60 18728 -> 17310.
+  Paused A/B/A: those pixel shaders 1-10% faster (drift ~3%). A first version kept a 64-bit value in
+  a 32-bit OpPhi (`EmitValuesIfElse` now takes the phi type): the AMD driver crashed compiling it,
+  and warm-up does not validate SPIR-V unless `--shader-validation true` is given; codegen changes are
+  now checked with a validated full warm-up (`isa-bench.ps1 -Hashes all -Extra
+  @('--shader-validation','true')`). `KYTY_DBG_WARMUP_TRACE=1` prints each warm-up pipeline's shaders.
+* Pixel shaders of mesh pipelines are not in the pipeline record, so the warm-up bench cannot build
+  them; `KytyPS5-tools/spvisa` compiles a dumped pixel shader with a stub vertex shader (`stubvs.py`,
+  `psbench.sh`; dump with `KYTY_DBG_DUMP_SHADERS` in a play run). The heavy material shaders are
+  3.3-3.7x their guest size (9eaaf80c 6406 -> 23834 instructions, 212 VGPRs): mostly the BDA loads of
+  `S_LOAD ... s[2:3], vcc_lo` (dynamic offsets into resource tables, 35 groups) with 64-bit scalar
+  address math, fault records and SGPR spills.
 * Host ISA without playing: `KYTY_WARMUP_ONLY=<hex hash>[,...]` warms up only the recorded
   pipelines that use those shaders (the driver cache is left as it was) and `KYTY_EXIT_AFTER_WARMUP=1`
   exits after the warm-up; with `KYTY_DBG_PIPELINE_STATS` that is the shaders' VGPRs, SGPRs and ISA

@@ -1810,8 +1810,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 				deferred->Drain();
 			}
 		};
-		if (Common::RuntimeFlags::Current().pm4_write_data_fast &&
-		    !Common::Experiments::Enabled(Common::Experiments::AbPending4)) {
+		if (Common::RuntimeFlags::Current().pm4_write_data_fast) {
 			auto& cache = m_renderer.GetBufferCache();
 			if (write_one_address) {
 				uint32_t written = 0;

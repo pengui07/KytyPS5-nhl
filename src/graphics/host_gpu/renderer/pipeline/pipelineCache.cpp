@@ -2085,6 +2085,11 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         for (const auto& record: records.compute) {
             if (listed(record.program)) wanted[record.program] = true;
         }
+        // Listed programs without a recorded pipeline (pixel shaders of mesh pipelines) are
+        // translated too: their SPIR-V for KYTY_DBG_DUMP_SHADERS.
+        for (uint32_t program = 0; program < records.programs.size(); program++) {
+            if (listed(program)) wanted[program] = true;
+        }
     }
     // Shared ProgramCache/compiler state is serialized; do not race translation or insertion.
     std::vector<ShaderProgram> handles(records.programs.size());
@@ -2154,6 +2159,14 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         record.vertex.stage = compiled.at(vertex.id);
         if (ps_active) record.pixel.stage = compiled.at(pixel.id);
         auto pipeline = std::make_unique<Pipeline>();
+        // KYTY_DBG_WARMUP_TRACE=1: the shaders of each warm-up pipeline before it is created (to find
+        // one the driver fails on).
+        if (static const bool trace = std::getenv("KYTY_DBG_WARMUP_TRACE") != nullptr; trace) {
+            std::printf("NHL27WARMUP: graphics vs=%016llx ps=%016llx\n",
+                        static_cast<unsigned long long>(records.programs[record.vertex_program].hash),
+                        static_cast<unsigned long long>(ps_active ? records.programs[record.pixel_program].hash : 0));
+            std::fflush(stdout);
+        }
         CreatePipelineInternal(m_graphics, *pipeline, key.rendering, key.vertex_input,
             std::span<const ShaderVertexInputInfo>(&record.vertex, 1),
             ps_active ? &record.pixel : nullptr, programs, key.static_params, m_driver_cache);
@@ -2166,6 +2179,11 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         record.compute.host_subgroup_size = records.programs[record.program].compute.host_subgroup_size;
         record.compute.lds_storage = records.programs[record.program].compute.lds_storage;
         auto pipeline = std::make_unique<Pipeline>();
+        if (static const bool trace = std::getenv("KYTY_DBG_WARMUP_TRACE") != nullptr; trace) {
+            std::printf("NHL27WARMUP: compute cs=%016llx\n",
+                        static_cast<unsigned long long>(records.programs[record.program].hash));
+            std::fflush(stdout);
+        }
         CreatePipelineInternal(m_graphics, *pipeline, record.compute, program.module, m_driver_cache);
         m_compute_pipelines.emplace(program.id, std::move(pipeline)); ++compute_count;
     }

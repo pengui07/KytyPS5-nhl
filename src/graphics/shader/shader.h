@@ -214,6 +214,10 @@ inline std::atomic<bool> g_shader_storage_align4 {false};
 [[nodiscard]] inline bool ShaderMovRelArrays() {
 	return ShaderMovRelBounds() && Common::Experiments::Enabled(Common::Experiments::MovRelArrays);
 }
+// Codegen option: experiment BdaTwoLookups (key bit 134217728), with BdaLoadGroups.
+[[nodiscard]] inline bool ShaderBdaTwoLookups() {
+	return ShaderBdaLoadGroups() && Common::Experiments::Enabled(Common::Experiments::BdaTwoLookups);
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
@@ -228,7 +232,8 @@ inline std::atomic<bool> g_shader_storage_align4 {false};
 	       (ShaderMovRelBounds() ? 524288u : 0u) | (ShaderF16Converts() ? 1048576u : 0u) |
 	       (ShaderF16ImagePack() ? 2097152u : 0u) | (ShaderExecRunTransparent() ? 4194304u : 0u) |
 	       (ShaderAlignedBufferOffsets() ? 8388608u : 0u) | (ShaderNativeFract() ? 16777216u : 0u) |
-	       (ShaderNativeF16Ops() ? 33554432u : 0u) | (ShaderMovRelArrays() ? 67108864u : 0u);
+	       (ShaderNativeF16Ops() ? 33554432u : 0u) | (ShaderMovRelArrays() ? 67108864u : 0u) |
+	       (ShaderBdaTwoLookups() ? 134217728u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

@@ -1475,7 +1475,6 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 				}
 			}
 			if (!lazy && !on_gpu && attempt < 4 && buffer.last_write_tick != 0 &&
-			    !Common::Experiments::Enabled(Common::Experiments::AbPending3) &&
 			    !m_scheduler.IsFree(buffer.last_write_tick) &&
 			    m_gpu_modified_ranges.Intersects(download_vaddr, download_size)) {
 				if (buffer.last_write_tick >= m_scheduler.CurrentTick()) {

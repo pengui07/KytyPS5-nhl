@@ -394,7 +394,7 @@ uint32_t LoadPhysicalDword(EmitterState& state, uint32_t address) {
 // `otherwise` the values are 0 where the condition is false.
 template <typename Then, typename Otherwise>
 std::vector<uint32_t> EmitValuesIfElse(EmitterState& state, uint32_t condition, size_t count,
-                                       Then&& then_values, Otherwise&& otherwise_values) {
+                                       Then&& then_values, Otherwise&& otherwise_values, uint32_t type = 0) {
 	const auto then_label  = state.builder.AllocateId();
 	const auto else_label  = state.builder.AllocateId();
 	const auto merge_label = state.builder.AllocateId();
@@ -412,7 +412,7 @@ std::vector<uint32_t> EmitValuesIfElse(EmitterState& state, uint32_t condition, 
 	std::vector<uint32_t> result(count);
 	for (size_t index = 0; index < count; index++) {
 		result[index] = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpPhi, TypeU32(state), result[index], then_result[index],
+		state.builder.AddFunction(spv::OpPhi, type != 0 ? type : TypeU32(state), result[index], then_result[index],
 		                          then_exit, else_result[index], else_exit);
 	}
 	return result;
@@ -424,6 +424,44 @@ std::vector<uint32_t> EmitValuesOrZerosIfCondition(EmitterState& state, uint32_t
 	return EmitValuesIfElse(state, condition, count, std::forward<Then>(then_values), [&]() {
 		return std::vector<uint32_t>(count, ConstantU32(state, 0));
 	});
+}
+
+// Experiment BdaTwoLookups: a scalar load group (S_LOAD_DWORDX2..X16 through a pointer) that crosses
+// into the next caching page looks up its first and its last page, and each DWORD reads at the host
+// address of its own page (a missing page's DWORDs read 0; its fault is recorded). Looking up each
+// DWORD by itself made the crossing branch of every group the larger one: most of the page lookups of
+// NHL 27's heavy pixel shaders (268 lookups for 35 groups in 9eaaf80c).
+std::vector<uint32_t> LoadCrossingScalarGroup(EmitterState& state, uint32_t address, uint32_t count) {
+	const auto u64     = TypeU64(state);
+	const auto u32     = TypeU32(state);
+	const auto boolean = TypeBool(state);
+	const auto bits    = ConstantU64(state, BufferCache::CACHING_PAGEBITS);
+	// DWORDs before the next page.
+	const auto next_page = Binary(state, spv::OpShiftLeftLogical, u64,
+	                              Binary(state, spv::OpIAdd, u64, Binary(state, spv::OpShiftRightLogical, u64, address, bits),
+	                                     ConstantU64(state, 1)),
+	                              bits);
+	const auto split = Unary(state, spv::OpUConvert, u32,
+	                         Binary(state, spv::OpShiftRightLogical, u64, Binary(state, spv::OpISub, u64, next_page, address),
+	                                ConstantU64(state, 2)));
+	const auto last        = Binary(state, spv::OpIAdd, u64, address, ConstantU64(state, 4u * (count - 1u)));
+	const auto first_bda   = GetBdaPointer(state, address);
+	const auto last_bda    = GetBdaPointer(state, last);
+	const auto first_found = Binary(state, spv::OpINotEqual, boolean, first_bda, ConstantU64(state, 0));
+	const auto last_found  = Binary(state, spv::OpINotEqual, boolean, last_bda, ConstantU64(state, 0));
+	std::vector<uint32_t> values;
+	for (uint32_t index = 0; index < count; index++) {
+		const auto on_first = Binary(state, spv::OpULessThan, boolean, ConstantU32(state, index), split);
+		const auto host     = Select(state, u64, on_first,
+		                             Binary(state, spv::OpIAdd, u64, first_bda, ConstantU64(state, 4u * index)),
+		                             Binary(state, spv::OpISub, u64, last_bda, ConstantU64(state, 4u * (count - 1u - index))));
+		// Not an OpSelect on booleans.
+		const auto found = Binary(state, spv::OpLogicalOr, boolean, Binary(state, spv::OpLogicalAnd, boolean, on_first, first_found),
+		                          Binary(state, spv::OpLogicalAnd, boolean, Unary(state, spv::OpLogicalNot, boolean, on_first),
+		                                 last_found));
+		values.push_back(EmitValueOrZeroIfCondition(state, found, [&]() { return LoadPhysicalDword(state, host); }));
+	}
+	return values;
 }
 
 std::vector<uint32_t> LoadBdaGroup(ValueEmitContext& ctx, const std::vector<const IR::Inst*>& group) {
@@ -483,6 +521,9 @@ std::vector<uint32_t> LoadBdaGroup(ValueEmitContext& ctx, const std::vector<cons
 			    });
 		    },
 		    [&]() {
+			    if (scalar && ShaderBdaTwoLookups()) {
+				    return LoadCrossingScalarGroup(state, address, count);
+			    }
 			    std::vector<uint32_t> values;
 			    for (uint32_t index = 0; index < count; index++) {
 				    const auto component = offset(address, 4u * index);

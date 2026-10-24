@@ -70,11 +70,13 @@ enum Bit : uint64_t {
 	// A/B only, like AbLegacy, for the changes made after it was taken (AbLegacy also turns off
 	// the earlier changes it still selects).
 	AbPending = uint64_t {1} << 38u,
-	// More A/B-only bits, so that one boot can compare several pending changes (KytyPS5-toolsbmulti.sh).
-	AbPending2 = uint64_t {1} << 44u,
+	// KYTY_BDA_TWO_LOOKUPS (default on): a scalar BDA load group that crosses a page looks up the
+	// group's first and last pages only, instead of each DWORD's; part of shader keys. Was AbPending2.
+	BdaTwoLookups = uint64_t {1} << 44u,
+	// A/B only and read by nothing else (KytyPS5-tools/abmulti.sh), so that one boot can compare
+	// pending changes.
 	AbPending3 = uint64_t {1} << 45u,
 	AbPending4 = uint64_t {1} << 49u,
-	// A/B only and read by nothing else: a pending change's A/B changes nothing more.
 	// KYTY_MOVREL_ARRAYS (default on): a V_MOVRELS/D_B32 with a bounded register array (see
 	// MovRelBounds) reads or writes a function-local array of those registers (RegArrayLoad /
 	// RegArrayStore) instead of selecting over each of them; part of shader keys. Was AbPending5.
