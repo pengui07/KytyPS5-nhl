@@ -1969,9 +1969,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	// A texel read changes the buffer only when an image was copied into it (known fills of its
 	// memory then no longer hold): dropping them for every texel bind took a lock and a scan of
-	// the fills (1.7% of the execution thread). AbPending7: for every texel bind.
-	if (is_written || (is_texel_buffer && (synced_from_image ||
-	                                       Common::Experiments::Enabled(Common::Experiments::AbPending7)))) {
+	// the fills (1.7% of the execution thread).
+	if (is_written || (is_texel_buffer && synced_from_image)) {
 		DropGpuFills(vaddr, size);
 	}
 	if (is_written) {
@@ -2232,7 +2231,22 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	// A pending guest read makes only the bytes it carries dirty: the execution thread's resource
 	// checks on the other bytes of its pages read the backing instead of faulting and waiting for
 	// that download (2.7% of the thread in a match).
-	if (m_gpu_modified_ranges.Intersects(vaddr, size)) {
+	// The same ranges are asked about again and again (read logs, color clears) while the set
+	// stays the same: the map lookup per question was 1.9% of the execution thread. Only the
+	// execution thread changes the set.
+	struct Answer {
+		uint64_t vaddr   = ~uint64_t {0};
+		uint64_t size    = 0;
+		uint64_t version = 0;
+		bool     dirty   = false;
+	};
+	static thread_local std::array<Answer, 64> answers {};
+	auto&      answer  = answers[((vaddr >> 12u) ^ (vaddr >> 4u) ^ size) & 63u];
+	const auto version = m_gpu_modified_ranges.Version();
+	if (answer.vaddr != vaddr || answer.size != size || answer.version != version) {
+		answer = {vaddr, size, version, m_gpu_modified_ranges.Intersects(vaddr, size)};
+	}
+	if (answer.dirty) {
 		return true;
 	}
 	if (m_pending_guest_reads.empty()) {

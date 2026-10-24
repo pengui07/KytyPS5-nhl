@@ -2112,9 +2112,17 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;
 			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
+			// On the recording thread, before the bind (vkUpdateDescriptorSets was 2.9% of the
+			// execution thread in play). AbPending5: here.
+			if (Common::Experiments::Enabled(Common::Experiments::AbPending5)) {
+				m_context.GetGraphics().device.updateDescriptorSets(
+				    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
+				    nullptr);
+			} else {
+				vk_buffer.updateDescriptorSets(m_context.GetGraphics().device,
+				                               static_cast<uint32_t>(m_descriptor_writes.size()),
+				                               m_descriptor_writes.data());
+			}
 			InvalidateRedundantBinds();
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);

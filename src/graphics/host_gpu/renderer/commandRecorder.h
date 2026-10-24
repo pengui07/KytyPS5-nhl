@@ -254,6 +254,10 @@ public:
 	                          uint32_t set, vk::ArrayProxy<const vk::WriteDescriptorSet> const& writes) const {
 		pushDescriptorSetKHR(bind_point, layout, set, writes.size(), writes.data());
 	}
+	// Not a command: vkUpdateDescriptorSets on a set no recorded command used yet, done at its place
+	// in the stream (on the recording thread) instead of by the thread that records.
+	void updateDescriptorSets(vk::Device device, uint32_t write_count,
+	                          const vk::WriteDescriptorSet* writes) const;
 	void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t offset,
 	                   uint32_t size, const void* values) const;
 

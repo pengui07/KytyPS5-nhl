@@ -1369,8 +1369,8 @@ void CommandProcessor::BdaBoundary(RenderContext::BdaBoundary kind) {
 	}
 	g_bda_work_emitted = g_work_emitted;
 	// Only the next draw or dispatch synchronizes (PrepareBda): it executes the boundary first
-	// (20k boundary operations a second). AbPending5: an operation of its own.
-	if (!FrameBreakdown::Enabled() && !Common::Experiments::Enabled(Common::Experiments::AbPending5)) {
+	// (20k boundary operations a second).
+	if (!FrameBreakdown::Enabled()) {
 		g_bda_boundary_pending = true;
 		return;
 	}
@@ -1414,16 +1414,14 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		// Other): two thirds of the callbacks in play, and the waits before them were 4.5% of this
 		// thread.
 		// End-of-pipe labels reach guest memory through the copy queue, after its copies (see
-		// ExecuteWriteAtEndOfPipe): the waits before them were 7% of this thread (AbPending6: they wait).
+		// ExecuteWriteAtEndOfPipe): the waits before them were 7% of this thread.
 		// WRITE_DATA writes take that path too, and a submission does not wait here: the recording
 		// thread submits after the copies queued before it.
 		m_labels_deferred = operation.kind == GpuOperationKind::Callback &&
 		                    (operation.callback_tag == GpuCallbackTag::Eop ||
-		                     operation.callback_tag == GpuCallbackTag::WriteData) &&
-		                    !Common::Experiments::Enabled(Common::Experiments::AbPending6);
+		                     operation.callback_tag == GpuCallbackTag::WriteData);
 		const bool submission = operation.kind == GpuOperationKind::Callback &&
-		                        operation.callback_tag == GpuCallbackTag::Flush &&
-		                        !Common::Experiments::Enabled(Common::Experiments::AbPending6);
+		                        operation.callback_tag == GpuCallbackTag::Flush;
 		const bool invisible =
 		    operation.kind == GpuOperationKind::Callback &&
 		    (operation.callback_tag == GpuCallbackTag::Bda || operation.callback_tag == GpuCallbackTag::Barrier ||
@@ -3843,18 +3841,11 @@ void CommandProcessor::EmitGlobalBarrier() {
 	// more: the execution thread skipped it (KYTY_GUEST_BARRIER_DEDUP: no draw, dispatch or helper
 	// pass since), after its trip through the pipeline (in play 118k barrier and flush-event operations a
 	// second for 13k recorded barriers; skipping just back-to-back ones, in-boot A/B: operations
-	// -12%, execution 3.52 vs 3.65 us per draw). AbPending5: only back-to-back ones.
+	// -12%, execution 3.52 vs 3.65 us per draw).
 	if (m_pipeline != nullptr && Common::RuntimeFlags::Current().guest_barrier_dedup) {
-		static uint64_t last_sequence = 0;
-		const auto      sequence      = m_pipeline->NextSequence();
-		const bool      redundant     = Common::Experiments::Enabled(Common::Experiments::AbPending5)
-		                                    ? last_sequence != 0 && sequence == last_sequence + 1
-		                                    : !g_work_since_barrier;
-		if (redundant) {
+		if (!g_work_since_barrier) {
 			return;
 		}
-		last_sequence        = sequence;
-		g_work_since_barrier = false;
 	}
 	EmitCallback([this] { ExecuteGlobalBarrier(); }, GpuCallbackTag::Barrier);
 	g_work_since_barrier = false;

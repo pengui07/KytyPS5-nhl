@@ -723,6 +723,24 @@ struct PipelineCache::ProgramCache {
 		FrameBreakdown::Add(FrameBreakdown::g_counters.compile_count);
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		// KYTY_DBG_SPIRV_OVERRIDE=<hex hash>=<file.spv>: compile that SPIR-V for the shader instead
+		// (a hand-edited or spirv-opt'ed dump of it, to try code-gen changes with isa-bench.ps1).
+		if (const char* override_spec = std::getenv("KYTY_DBG_SPIRV_OVERRIDE"); override_spec != nullptr) {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(override_spec, &end, 16);
+			if (end != override_spec && *end == '=' && hash == options.shader_hash) {
+				std::ifstream file(end + 1, std::ios::binary | std::ios::ate);
+				const auto    bytes = file ? static_cast<size_t>(file.tellg()) : size_t {0};
+				file.seekg(0);
+				std::vector<uint32_t> words(bytes / 4u, 0u);
+				file.read(reinterpret_cast<char*>(words.data()), static_cast<std::streamsize>(words.size() * 4u));
+				if (!words.empty()) {
+					std::printf("NHL27SPIRVOVERRIDE hash=%016llx words=%zu\n",
+					            static_cast<unsigned long long>(hash), words.size());
+					result.spirv = std::move(words);
+				}
+			}
+		}
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,

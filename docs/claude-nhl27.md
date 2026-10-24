@@ -1148,6 +1148,14 @@ Toward 120 fps (2026-10-23):
   the constant ones), `s_add_co_i32` 207 -> 115, SGPRs 94 -> 86. In play 0.35% of the bindings have
   a prefix (2-byte aligned texel buffers), so vector accesses keep it. Paused A/B/A: 17.32 / 17.50 /
   17.42 ms per flip (-0.7%).
+* Execution thread: descriptor sets of pipelines without push descriptors are written by the
+  recording thread at their place in the command stream (`CommandRecorder::updateDescriptorSets`;
+  `vkUpdateDescriptorSets` in the driver was ~3% of the execution thread, the recording thread is
+  ~78% idle; in-boot A/B with AbPending5 = the old way: draw 3.74 vs 3.92 us, fps within noise),
+  profiler zones test an inline flag instead of calling `tracy::ProfilerAvailable()` (0.6%), and
+  `BufferCache::HasGpuDirtyBytes` remembers its answers per range while the GPU-written set is
+  unchanged (`RangeSet::Intersects` 1.9 -> 0.8%). The old alternates of AbPending5/6/7 (bits 56-58)
+  are gone, so those bits are free for new A/Bs.
 * Host ISA without playing: `KYTY_WARMUP_ONLY=<hex hash>[,...]` warms up only the recorded
   pipelines that use those shaders (the driver cache is left as it was) and `KYTY_EXIT_AFTER_WARMUP=1`
   exits after the warm-up; with `KYTY_DBG_PIPELINE_STATS` that is the shaders' VGPRs, SGPRs and ISA

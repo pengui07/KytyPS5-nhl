@@ -139,14 +139,9 @@ void CommandRecorder::bindDescriptorSets(vk::PipelineBindPoint bind_point,
 	});
 }
 
-void CommandRecorder::pushDescriptorSetKHR(vk::PipelineBindPoint bind_point,
-                                           vk::PipelineLayout layout, uint32_t set,
-                                           uint32_t                      write_count,
-                                           const vk::WriteDescriptorSet* writes) const {
-	if (m_stream == nullptr) {
-		m_direct.pushDescriptorSetKHR(bind_point, layout, set, write_count, writes);
-		return;
-	}
+// Descriptor writes and the arrays they point to, copied into the stream (one chunk).
+static const vk::WriteDescriptorSet* CopyWrites(CommandStream* stream, uint32_t write_count,
+                                                const vk::WriteDescriptorSet* writes) {
 	size_t bytes = CommandStream::RoundUp(sizeof(vk::WriteDescriptorSet) * write_count) + 128;
 	for (uint32_t i = 0; i < write_count; i++) {
 		const auto& write = writes[i];
@@ -161,23 +156,46 @@ void CommandRecorder::pushDescriptorSetKHR(vk::PipelineBindPoint bind_point,
 			bytes += CommandStream::RoundUp(sizeof(vk::BufferView) * write.descriptorCount);
 		}
 	}
-	m_stream->Reserve(bytes);
-	auto* copy = m_stream->Copy(writes, write_count);
+	stream->Reserve(bytes);
+	auto* copy = stream->Copy(writes, write_count);
 	for (uint32_t i = 0; i < write_count; i++) {
 		auto& write = copy[i];
 		if (write.pBufferInfo != nullptr) {
-			write.pBufferInfo = m_stream->Copy(write.pBufferInfo, write.descriptorCount);
+			write.pBufferInfo = stream->Copy(write.pBufferInfo, write.descriptorCount);
 		}
 		if (write.pImageInfo != nullptr) {
-			write.pImageInfo = m_stream->Copy(write.pImageInfo, write.descriptorCount);
+			write.pImageInfo = stream->Copy(write.pImageInfo, write.descriptorCount);
 		}
 		if (write.pTexelBufferView != nullptr) {
-			write.pTexelBufferView = m_stream->Copy(write.pTexelBufferView, write.descriptorCount);
+			write.pTexelBufferView = stream->Copy(write.pTexelBufferView, write.descriptorCount);
 		}
 	}
-	const vk::WriteDescriptorSet* writes_copy = copy;
+	return copy;
+}
+
+void CommandRecorder::pushDescriptorSetKHR(vk::PipelineBindPoint bind_point,
+                                           vk::PipelineLayout layout, uint32_t set,
+                                           uint32_t                      write_count,
+                                           const vk::WriteDescriptorSet* writes) const {
+	if (m_stream == nullptr) {
+		m_direct.pushDescriptorSetKHR(bind_point, layout, set, write_count, writes);
+		return;
+	}
+	const auto* writes_copy = CopyWrites(m_stream, write_count, writes);
 	m_stream->Record([=](vk::CommandBuffer c) {
 		c.pushDescriptorSetKHR(bind_point, layout, set, write_count, writes_copy);
+	});
+}
+
+void CommandRecorder::updateDescriptorSets(vk::Device device, uint32_t write_count,
+                                           const vk::WriteDescriptorSet* writes) const {
+	if (m_stream == nullptr) {
+		device.updateDescriptorSets(write_count, writes, 0, nullptr);
+		return;
+	}
+	const auto* writes_copy = CopyWrites(m_stream, write_count, writes);
+	m_stream->Record([=](vk::CommandBuffer /*c*/) {
+		device.updateDescriptorSets(write_count, writes_copy, 0, nullptr);
 	});
 }
 
