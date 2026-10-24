@@ -874,6 +874,11 @@ std::unordered_map<uint32_t, uint32_t> MovRelExtents(const Decoder::Program& dec
 	struct Sym {
 		int32_t  var  = -1; // the SGPR holding the index
 		uint32_t mult = 0;
+		// The index's largest value when it was masked by a constant (S_AND_B32 with 3: an index
+		// of 0..3), else UINT32_MAX; such an index bounds its MOVRELs by itself.
+		uint32_t max = UINT32_MAX;
+
+		bool operator==(const Sym&) const = default;
 	};
 	struct MovRel {
 		uint32_t pc   = 0;
@@ -898,14 +903,29 @@ std::unordered_map<uint32_t, uint32_t> MovRelExtents(const Decoder::Program& dec
 		return false;
 	};
 	std::vector<MovRel> movrels;
-	// A block with one predecessor starts with what that one ended with.
+	// A block starts with what all its predecessors agree on at their ends (predecessors not
+	// visited yet are skipped; the pass repeats until the block ends stop changing, so loop
+	// back edges are met too).
 	std::unordered_map<uint32_t, std::unordered_map<int32_t, Sym>> block_end;
+	bool stable = false;
+	for (uint32_t pass = 0; pass < 8 && !stable; pass++) {
+	stable = true;
+	movrels.clear();
 	for (const auto& cfg_block: cfg.blocks) {
 		std::unordered_map<int32_t, Sym> sym;
-		if (cfg_block.predecessors.size() == 1) {
-			if (const auto found = block_end.find(cfg_block.predecessors.front()); found != block_end.end()) {
-				sym = found->second;
+		bool first = true;
+		for (const auto predecessor: cfg_block.predecessors) {
+			const auto found = block_end.find(predecessor);
+			if (found == block_end.end()) continue;
+			if (first) {
+				sym   = found->second;
+				first = false;
+				continue;
 			}
+			std::erase_if(sym, [&](const auto& entry) {
+				const auto other = found->second.find(entry.first);
+				return other == found->second.end() || !(other->second == entry.second);
+			});
 		}
 		const auto forget = [&](const Decoder::Operand& operand) {
 			const auto key = key_of(operand);
@@ -932,7 +952,7 @@ std::unordered_map<uint32_t, uint32_t> MovRelExtents(const Decoder::Program& dec
 				const auto src = key_of(inst.src0);
 				if (const auto found = sym.find(src); src >= 0 && found != sym.end()) {
 					sym[dst] = found->second;
-				} else if (inst.src0.kind == Decoder::OperandKind::Sgpr) {
+				} else if (src >= 0 && src != 1002) {
 					sym[dst] = {src, 1};
 				} else {
 					sym.erase(dst);
@@ -941,18 +961,26 @@ std::unordered_map<uint32_t, uint32_t> MovRelExtents(const Decoder::Program& dec
 			}
 			if (inst.opcode == Decoder::Opcode::S_MUL_I32 && dst >= 0) {
 				const Decoder::Operand* reg = nullptr;
-				if (constant_of(inst.src1, k) && inst.src0.kind == Decoder::OperandKind::Sgpr) {
+				if (constant_of(inst.src1, k) && key_of(inst.src0) >= 0 && key_of(inst.src0) != 1002) {
 					reg = &inst.src0;
-				} else if (constant_of(inst.src0, k) && inst.src1.kind == Decoder::OperandKind::Sgpr) {
+				} else if (constant_of(inst.src0, k) && key_of(inst.src1) >= 0 && key_of(inst.src1) != 1002) {
 					reg = &inst.src1;
 				}
 				const auto src = reg != nullptr ? key_of(*reg) : -1;
 				const auto found = sym.find(src);
 				if (reg != nullptr && k != 0 && k <= 64) {
-					sym[dst] = found != sym.end() ? Sym {found->second.var, found->second.mult * k} : Sym {src, k};
+					sym[dst] = found != sym.end()
+					               ? Sym {found->second.var, found->second.mult * k, found->second.max}
+					               : Sym {src, k};
 				} else {
 					sym.erase(dst);
 				}
+				continue;
+			}
+			// An index masked by a small constant.
+			if (inst.opcode == Decoder::Opcode::S_AND_B32 && dst >= 0 && dst != 1002 &&
+			    (constant_of(inst.src1, k) || constant_of(inst.src0, k)) && k < 256) {
+				sym[dst] = {dst, 1, k};
 				continue;
 			}
 			forget(inst.dst);
@@ -968,7 +996,15 @@ std::unordered_map<uint32_t, uint32_t> MovRelExtents(const Decoder::Program& dec
 				sym.clear();
 			}
 		}
-		block_end.emplace(cfg_block.id, std::move(sym));
+		auto& end = block_end[cfg_block.id];
+		if (!(end == sym)) {
+			end    = std::move(sym);
+			stable = false;
+		}
+	}
+	}
+	if (!stable) {
+		return {};
 	}
 	// Per index SGPR: its bases, and the fewest elements an array before another one has.
 	std::unordered_map<int32_t, std::vector<const MovRel*>> by_var;
@@ -978,6 +1014,13 @@ std::unordered_map<uint32_t, uint32_t> MovRelExtents(const Decoder::Program& dec
 		}
 	}
 	std::unordered_map<uint32_t, uint32_t> extents;
+	// Masked indexes bound their MOVRELs exactly.
+	for (const auto& movrel: movrels) {
+		if (movrel.index.var >= 0 && movrel.index.mult != 0 && movrel.index.max != UINT32_MAX) {
+			extents[movrel.pc] = std::min(movrel.index.max * movrel.index.mult + 1u,
+			                              vector_limit > movrel.base ? vector_limit - movrel.base : 1u);
+		}
+	}
 	for (const auto& [var, list]: by_var) {
 		uint32_t count = UINT32_MAX;
 		for (const auto* movrel: list) {
@@ -1011,6 +1054,7 @@ std::unordered_map<uint32_t, uint32_t> MovRelExtents(const Decoder::Program& dec
 		}
 		if (count == UINT32_MAX) continue;
 		for (const auto* movrel: list) {
+			if (extents.contains(movrel->pc)) continue;
 			const auto extent = (count - 1u) * movrel->index.mult + 1u;
 			extents[movrel->pc] = std::min(extent, vector_limit > movrel->base ? vector_limit - movrel->base : 1u);
 		}

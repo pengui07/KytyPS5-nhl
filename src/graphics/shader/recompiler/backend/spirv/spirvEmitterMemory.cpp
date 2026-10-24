@@ -521,6 +521,19 @@ uint32_t LoadGroupedBda(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return values.front();
 }
 
+// Experiment MovRelArrays: an element of a register array's function-local variable.
+uint32_t RegArrayElement(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state     = ctx.state;
+	const auto array     = inst.Arg(0).Resolve();
+	EXIT_IF(!array.IsImmediate());
+	const auto found     = state.reg_array_variables.find(array.U32());
+	EXIT_IF(found == state.reg_array_variables.end());
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeU32ElementPointer(state, spv::StorageClassFunction),
+	                          pointer, found->second[state.lane_half], ctx.Def(inst.Arg(1)));
+	return pointer;
+}
+
 uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem) {
 	if (mem.kind == IR::ResourceKind::Buffer) {
 		const auto resource = ctx.state.program.info.buffers.at(mem.resource).descriptor_index;
@@ -1960,6 +1973,14 @@ uint32_t EmitBpermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                           EmitSubgroupLocalInvocationId(state), ConstantU32(state, ~31u));
 	const auto target = Binary(state, spv::OpBitwiseOr, TypeU32(state), base, index);
 	return EmitDsMaskedLaneRead(state, source, target, ctx.Arg(inst, 2));
+}
+
+uint32_t EmitRegArrayLoad(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitNative<spv::OpLoad, IR::Type::U32>(ctx.state, RegArrayElement(ctx, inst));
+}
+
+void EmitRegArrayStore(ValueEmitContext& ctx, const IR::Inst& inst) {
+	ctx.state.builder.AddFunction(spv::OpStore, RegArrayElement(ctx, inst), ctx.Def(inst.Arg(2)));
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

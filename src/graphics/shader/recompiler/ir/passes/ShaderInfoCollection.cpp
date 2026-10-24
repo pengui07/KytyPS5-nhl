@@ -293,6 +293,12 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 	const auto address_access = AddressOpcodeInfoOf(op).access;
 	const auto shared_access = SharedAccessOf(op);
 	info.float64 |= inst.GetType() == Type::F64;
+	if (op == ValueOpcode::RegArrayLoad || op == ValueOpcode::RegArrayStore) {
+		const auto array = inst.Arg(0).Resolve().U32();
+		if (std::find(info.reg_arrays.begin(), info.reg_arrays.end(), array) == info.reg_arrays.end()) {
+			info.reg_arrays.push_back(array);
+		}
+	}
 	info.float16 |= op == ValueOpcode::FPAdd16x2 || op == ValueOpcode::FPMul16x2 ||
 	                op == ValueOpcode::FPFma16x2 || op == ValueOpcode::FPClamp16x2 ||
 	                op == ValueOpcode::F16LaneInsert || op == ValueOpcode::FPAdd16Low ||
@@ -573,6 +579,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.inputs.clear();
 	info.outputs.clear();
 	info.user_data_registers.clear();
+	info.reg_arrays.clear();
 	info.live_buffers = 0;
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
 	    info.uses_dispatch_threads = info.uses_swizzle = false;

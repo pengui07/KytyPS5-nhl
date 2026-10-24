@@ -75,7 +75,10 @@ enum Bit : uint64_t {
 	AbPending3 = uint64_t {1} << 45u,
 	AbPending4 = uint64_t {1} << 49u,
 	// A/B only and read by nothing else: a pending change's A/B changes nothing more.
-	AbPending5 = uint64_t {1} << 56u,
+	// KYTY_MOVREL_ARRAYS (default on): a V_MOVRELS/D_B32 with a bounded register array (see
+	// MovRelBounds) reads or writes a function-local array of those registers (RegArrayLoad /
+	// RegArrayStore) instead of selecting over each of them; part of shader keys. Was AbPending5.
+	MovRelArrays = uint64_t {1} << 56u,
 	// KYTY_NATIVE_FRACT (default on; AMD devices): V_FRACT_F32 is GLSL Fract alone, which the AMD
 	// compiler emits as the same v_fract_f32 (clamped below one), without the clamp that
 	// x - floor(x) needs elsewhere; part of shader keys. Was AbPending6.

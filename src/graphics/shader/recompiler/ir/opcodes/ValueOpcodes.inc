@@ -374,3 +374,8 @@ VALUE_OPCODE(F16x2Swizzle, U32, U32, U32, U32)
 VALUE_OPCODE(FPUnary16Low, U32, U32, U32)
 VALUE_OPCODE(FPMinMax16Low, U32, U32, U32, U32)
 VALUE_OPCODE(FPMinMax16x2, U32, U32, U32, U32)
+// Experiment MovRelArrays: RegArrayLoad(array, index) and RegArrayStore(array, index, value) on a
+// function-local array of a V_MOVRELS/D_B32's registers; array is an immediate (id << 16 | element
+// count), index an element number (immediate or not).
+VALUE_OPCODE(RegArrayLoad, U32, U32, U32)
+VALUE_OPCODE(RegArrayStore, Void, U32, U32, U32)

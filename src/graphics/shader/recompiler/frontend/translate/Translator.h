@@ -296,6 +296,9 @@ private:
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
 	const std::unordered_map<uint32_t, uint32_t>* movrel_extents = nullptr;
+	uint32_t        next_reg_array = 0; // experiment MovRelArrays
+	// Experiment MovRelArrays: the registers [base, end) stored into a new register array.
+	[[nodiscard]] IR::U32 StoreRegArray(uint32_t base, uint32_t end);
 	[[nodiscard]] uint32_t MovRelEnd(const Decoder::Instruction& inst, uint32_t base) const {
 		if (movrel_extents != nullptr) {
 			if (const auto found = movrel_extents->find(inst.pc); found != movrel_extents->end()) {

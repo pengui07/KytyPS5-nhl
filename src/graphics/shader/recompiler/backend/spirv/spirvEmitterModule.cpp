@@ -756,6 +756,12 @@ void DefineModule(EmitterState& state) {
 			state.scratch_variable[half] = state.builder.AllocateId();
 		}
 	}
+	for (const auto array: state.program.info.reg_arrays) {
+		auto& variables = state.reg_array_variables[array];
+		for (uint32_t half = 0; half < state.lane_count; half++) {
+			variables[half] = state.builder.AllocateId();
+		}
+	}
 	state.main_func = state.builder.AllocateId();
 	if (state.program.stage == ShaderType::Mesh) {
 		state.mesh_guest_func = state.builder.AllocateId();

@@ -1180,6 +1180,15 @@ Toward 120 fps (2026-10-23):
   the GPU stage threads spin at ~99% on their CPUs (2 ms spin budget), four of which share cores
   with guest threads; guest write faults cost ~8 ms of CPU per frame across threads
   (`KYTY_PERF_STATS=1`, NHL27FRAME `faults=`).
+* MOVREL bounds, second step: `MovRelExtents` meets the traced M0 over all predecessors of a block
+  (repeated until the block ends are stable, so loop back edges count) and an index masked by a
+  constant (`S_AND_B32 vcc_hi, vcc_lo, 3`, in VCC too) bounds its MOVRELs exactly
+  (`max * stride + 1`): `6cb32e43` 23 -> 31 of 31 bounded. Bit 56 `KYTY_MOVREL_ARRAYS` (default on;
+  key bit 67108864): a bounded `V_MOVRELS/D_B32` of up to 32 registers stores them into a
+  function-local array and loads or stores the element (`RegArrayLoad/Store`); the AMD compiler keeps
+  the array in registers and uses `v_movrels_b32`/`v_movreld_b32`. `6cb32e43`: 6444 -> 5284
+  instructions, 245 -> 203 VGPRs; `7324a60f` 6382 -> 5188, 252 -> 208. Paused A/B/A against no
+  bounds at all: `6cb32e43` 259 -> 64-67 us per dispatch; in-match frames look the same.
 * Host ISA without playing: `KYTY_WARMUP_ONLY=<hex hash>[,...]` warms up only the recorded
   pipelines that use those shaders (the driver cache is left as it was) and `KYTY_EXIT_AFTER_WARMUP=1`
   exits after the warm-up; with `KYTY_DBG_PIPELINE_STATS` that is the shaders' VGPRs, SGPRs and ISA

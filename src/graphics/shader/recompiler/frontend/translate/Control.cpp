@@ -401,6 +401,15 @@ void Translator::S_WQM(const Decoder::Instruction& inst, bool wide) {
 	ir.SetScc(IR::U1(ir.Emit(IR::ValueOpcode::INotEqual64, {result, IR::Value(uint64_t {0})})));
 }
 
+IR::U32 Translator::StoreRegArray(uint32_t base, uint32_t end) {
+	const auto array = IR::U32(IR::Value((next_reg_array++ << 16u) | (end - base)));
+	for (uint32_t index = base; index < end; index++) {
+		ir.Emit(IR::ValueOpcode::RegArrayStore,
+		        {array, IR::Value(index - base), ir.GetVectorReg(static_cast<IR::VectorReg>(index))});
+	}
+	return array;
+}
+
 void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	if (inst.dst.kind != Decoder::OperandKind::Vgpr ||
 	    inst.src0.kind != Decoder::OperandKind::Vgpr) {
@@ -414,6 +423,14 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	const auto base     = inst.src0.reg;
 	const auto m0       = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
 	                                    IR::U32(IR::Value(0xffu)));
+	if (const auto end = MovRelEnd(inst, base); ShaderMovRelArrays() && end - base >= 2u && end - base <= 32u) {
+		// An index past the array reads its first register, as the selects below.
+		const auto array = StoreRegArray(base, end);
+		const auto count = IR::U32(IR::Value(end - base));
+		const auto index = ir.Select(ir.ULessThan(m0, count), m0, IR::U32(IR::Value(0u)));
+		WriteOperand(DestinationOperand(inst), IR::U32(ir.Emit(IR::ValueOpcode::RegArrayLoad, {array, index})));
+		return;
+	}
 	auto       selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
 	for (uint32_t index = base + 1u, end = MovRelEnd(inst, base); index < end; index++) {
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
@@ -435,6 +452,21 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	const auto value = ReadU32(inst.src0);
 	const auto m0    = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
 	                                 IR::U32(IR::Value(0xffu)));
+	if (const auto end = MovRelEnd(inst, base); ShaderMovRelArrays() && end - base >= 2u && end - base <= 32u) {
+		// An index past the array writes nothing, as the selects below.
+		const auto array    = StoreRegArray(base, end);
+		const auto count    = IR::U32(IR::Value(end - base));
+		const auto in_range = ir.ULessThan(m0, count);
+		const auto index    = ir.Select(in_range, m0, IR::U32(IR::Value(0u)));
+		const auto old      = IR::U32(ir.Emit(IR::ValueOpcode::RegArrayLoad, {array, index}));
+		ir.Emit(IR::ValueOpcode::RegArrayStore,
+		        {array, index, ir.Select(ir.LogicalAnd(ir.GetExec(), in_range), value, old)});
+		for (uint32_t element = base; element < end; element++) {
+			ir.SetVectorReg(static_cast<IR::VectorReg>(element),
+			                IR::U32(ir.Emit(IR::ValueOpcode::RegArrayLoad, {array, IR::Value(element - base)})));
+		}
+		return;
+	}
 	for (uint32_t index = base, end = MovRelEnd(inst, base); index < end; index++) {
 		const auto reg   = static_cast<IR::VectorReg>(index);
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));

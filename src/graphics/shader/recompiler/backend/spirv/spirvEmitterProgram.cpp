@@ -1189,6 +1189,13 @@ void EmitProgram(EmitterState& state) {
 			    state.scratch_variable[half], spv::StorageClassFunction);
 		}
 	}
+	for (const auto& [array, variables]: state.reg_array_variables) {
+		for (uint32_t half = 0; half < state.lane_count; half++) {
+			state.builder.AddFunction(spv::OpVariable,
+			                          TypeU32ArrayPointer(state, spv::StorageClassFunction, array & 0xffffu),
+			                          variables[half], spv::StorageClassFunction);
+		}
+	}
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
