@@ -906,6 +906,42 @@ void GuestGpu::ExecutionThread() {
 				break;
 			}
 		}
+		// The resolutions of the next operations into this core's cache: the resolvers wrote them on
+		// other cores, and their first reads here missed (in-boot A/Bs: draws -2.7 to -3.6%).
+		{
+			const auto resolution = [](const GpuOperation* next) -> const RenderExecutor::ResolvedDraw* {
+				if (next == nullptr) return nullptr;
+				if (next->kind != GpuOperationKind::DrawIndex && next->kind != GpuOperationKind::DrawAuto) return nullptr;
+				if (next->resolved != nullptr) return next->resolved;
+				if (next->draw_slot != nullptr && next->draw_slot->state.load(std::memory_order_acquire) == 2) {
+					return next->draw_slot->result;
+				}
+				return nullptr;
+			};
+			const auto dispatch_resolution = [](const GpuOperation* next) -> const RenderExecutor::ResolvedDispatch* {
+				if (next == nullptr) return nullptr;
+				if (next->kind != GpuOperationKind::DispatchDirect && next->kind != GpuOperationKind::DispatchIndirect) {
+					return nullptr;
+				}
+				if (next->resolved_dispatch != nullptr) return next->resolved_dispatch;
+				if (next->dispatch_slot != nullptr && next->dispatch_slot->state.load(std::memory_order_acquire) == 2) {
+					return next->dispatch_slot->result;
+				}
+				return nullptr;
+			};
+			const auto* soon = operations.Peek(1);
+			const auto* next = operations.Peek(0);
+			if (const auto* draw = resolution(soon)) {
+				RenderExecutor::PrefetchResolvedDraw(draw, 0);
+			} else if (const auto* dispatch = dispatch_resolution(soon)) {
+				RenderExecutor::PrefetchResolvedDispatch(dispatch, 0);
+			}
+			if (const auto* draw = resolution(next)) {
+				RenderExecutor::PrefetchResolvedDraw(draw, 1);
+			} else if (const auto* dispatch = dispatch_resolution(next)) {
+				RenderExecutor::PrefetchResolvedDispatch(dispatch, 1);
+			}
+		}
 		// KYTY_IDLE_TRACE: operations taking 20 us or more, recorded when they end
 		// (a = GpuOperationKind | GpuOperation::trace_op << 8, b = microseconds).
 		const bool traced   = Common::EventTrace::g_capturing.load(std::memory_order_relaxed);

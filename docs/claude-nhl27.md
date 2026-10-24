@@ -1290,6 +1290,25 @@ Toward 120 fps (2026-10-23):
   seen at most the completion of an earlier operation. Now dispatches skip 10.4 of 14.8 reads, draws
   34.7 of 35.4; `KYTY_DBG_VERIFY_SKIPS=1` (compares every skipped read) reported no changed read. In-boot
   A/B (8 rounds, the old raise as an alternate table): draws 4.07 -> 3.60 us, dispatches 2.68 -> 2.35 us.
+* PGO v15 (profile after these changes). Soak: 75.2 / 71.4 / 69.1 fps in 60 Hz play, 49-53 in the
+  game's 30 Hz scenes (were 39-48), no errors.
+* The execution thread now waits on the resolvers more often (in play ~35 ms/s for the resolve thread
+  and ~40 for the draw resolver's slots). A third draw resolver (on the dispatch resolver's CPU,
+  draws split in three) cut the slot waits 40 -> 7 ms/s but raised per-draw cost (3.58 -> 3.64 us) and
+  left the fps the same; the dispatch resolver (bit 41) moved the waits to its own slots: both left
+  off. Memo statistics: 95% of texture slots reuse their lookup; most buffer-slot misses are texel
+  (formatted) reads whose range changed since the slot's last draw (per-object vertex buffers); a
+  shared memo by range for them: draws -2%, dispatches +3.6%, dropped.
+* Upcoming resolutions are prefetched: before each operation the execution thread issues prefetches
+  for the next operation's snapshot arrays and read log (`ProgramResolution::Prefetch` step 1) and
+  for the one after it the resolution's headers and the draw state it reads first (step 0), so the
+  first reads of data the resolvers wrote on other cores no longer miss. In-boot A/Bs, 8 rounds each:
+  draws -2.7%, -3.5%, -3.6%; dispatches -1 to -2.6%.
+* Per-shader GPU time over a whole match (`KYTY_PERF_GPU_TIMING=2`): in the heaviest quarter of the
+  5 s windows (the game's 30 Hz cinematic scenes) the indirect compute `d7cfa519` (256 VGPRs + 64 bytes
+  of scratch for the guest's 152, wave32) takes 18% of the GPU time and `d46af19f` (a wave64 horizon
+  ambient occlusion: two nested loops whose exit test costs ~14 scalar instructions an iteration and
+  ~20 VGPR copies, two depth samples per step) 15%, about 2 and 3 ms per dispatch.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

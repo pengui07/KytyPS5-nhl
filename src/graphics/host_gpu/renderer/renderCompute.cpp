@@ -392,6 +392,10 @@ struct RenderExecutor::ResolvedDispatch {
 	std::atomic_bool       busy {false};
 };
 
+void RenderExecutor::PrefetchResolvedDispatch(const ResolvedDispatch* resolved, int step) {
+	resolved->programs.Prefetch(step);
+}
+
 // As for draws: more resolutions than operations can wait between the two threads.
 struct RenderExecutor::ResolvedDispatchRing {
 	static constexpr size_t Size = 320;

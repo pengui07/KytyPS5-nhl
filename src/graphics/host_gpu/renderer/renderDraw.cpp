@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/depthAliasLog.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
+#include <xmmintrin.h>
 #include <chrono>
 #include <fmt/format.h>
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -504,6 +505,26 @@ struct RenderExecutor::ResolvedDrawRing {
 	std::array<ResolvedDraw, Size> draws;
 	size_t                         next = 0;
 };
+
+void RenderExecutor::PrefetchResolvedDraw(const ResolvedDraw* resolved, int step) {
+	resolved->programs.Prefetch(step);
+	if (step != 0) {
+		return;
+	}
+	// The parts of the draw state the execution thread reads first (the state is 36 KB).
+	const auto lines = [](const void* data, size_t bytes) {
+		const auto* p = static_cast<const char*>(data);
+		for (size_t at = 0; at < bytes; at += 64) {
+			_mm_prefetch(p + at, _MM_HINT_T0);
+		}
+	};
+	const auto& state = resolved->storage.state;
+	lines(&state.programs, sizeof(state.programs));
+	lines(&state.depth_info, sizeof(state.depth_info));
+	lines(&state.color_info[0], std::min(sizeof(state.color_info), size_t {1024}));
+	lines(&state.vertex_info[0], std::min(sizeof(state.vertex_info[0]), size_t {1024}));
+	lines(&state.ps_input_info, std::min(sizeof(state.ps_input_info), size_t {512}));
+}
 
 void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {
 	resolved->busy.store(false, std::memory_order_release);

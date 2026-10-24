@@ -54,6 +54,8 @@ public:
 	// without_faults: bytes the GPU may have written since fail the check instead of being read back
 	// (a plain load of their page would fault and wait for all queued GPU work).
 	[[nodiscard]] bool StillValid(bool without_faults = false) const;
+	// Execution thread, before the operation that checks it: pulls its arrays into the cache.
+	void Prefetch() const;
 
 private:
 	static constexpr uint64_t StrictCheckBytes = 64;
@@ -103,6 +105,9 @@ struct ProgramResolution {
 		reads.Clear();
 		stages = 0;
 	}
+	// Execution thread, before the operation that uses it: step 0 pulls this structure (the
+	// snapshot and log headers) into the cache, step 1 the arrays they point to.
+	void Prefetch(int step) const;
 };
 
 struct GraphicContext;

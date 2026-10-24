@@ -30,6 +30,7 @@
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
+#include <xmmintrin.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -353,6 +354,42 @@ static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t 
 			        (load(guest, 24, uint64_t {}) ^ load(recorded, 24, uint64_t {}))) == 0;
 		default: return std::memcmp(guest, recorded, size) == 0;
 	}
+}
+
+void GuestReadLog::Prefetch() const {
+	const auto lines = [](const void* data, size_t bytes) {
+		const auto* p = static_cast<const char*>(data);
+		for (size_t at = 0; at < bytes && at < 4096; at += 64) {
+			_mm_prefetch(p + at, _MM_HINT_T0);
+		}
+	};
+	lines(m_entries.data(), m_entries.size() * sizeof(Entry));
+	lines(m_bytes.data(), m_bytes.size());
+}
+
+void ProgramResolution::Prefetch(int step) const {
+	if (step == 0) {
+		const auto* p = reinterpret_cast<const char*>(this);
+		for (size_t at = 0; at < sizeof(ProgramResolution); at += 64) {
+			_mm_prefetch(p + at, _MM_HINT_T0);
+		}
+		return;
+	}
+	const auto lines = [](const void* data, size_t bytes) {
+		const auto* p = static_cast<const char*>(data);
+		for (size_t at = 0; at < bytes && at < 2048; at += 64) {
+			_mm_prefetch(p + at, _MM_HINT_T0);
+		}
+	};
+	for (uint32_t i = 0; i < stages && i < MaxStages; i++) {
+		const auto& snapshot = resources[i];
+		lines(snapshot.buffers.data(), snapshot.buffers.size() * sizeof(snapshot.buffers[0]));
+		lines(snapshot.images.data(), snapshot.images.size() * sizeof(snapshot.images[0]));
+		lines(snapshot.samplers.data(), snapshot.samplers.size() * sizeof(snapshot.samplers[0]));
+		lines(snapshot.user_data.data(), snapshot.user_data.size() * sizeof(uint32_t));
+		lines(snapshot.flattened_srt.data(), snapshot.flattened_srt.size() * sizeof(uint32_t));
+	}
+	reads.Prefetch();
 }
 
 bool GuestReadLog::StillValid(bool without_faults) const {

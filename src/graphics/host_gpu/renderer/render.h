@@ -291,6 +291,11 @@ public:
 	// compiled yet, guest memory that cannot be read ahead). Waits while every resolution is in
 	// use: the execution thread releases them in order. Each resolving thread has its own ring
 	// (ring 1: experiment DrawResolver).
+	// The execution thread pulls an upcoming resolution into its cache, in two steps: step 0 the
+	// snapshot and log headers and the draw state it reads first (two operations ahead), step 1 the
+	// arrays they point to (one ahead), so neither step waits for a miss.
+	static void PrefetchResolvedDraw(const ResolvedDraw* resolved, int step);
+	static void PrefetchResolvedDispatch(const ResolvedDispatch* resolved, int step);
 	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context&    context,
 	                                             const HW::UserConfig& user_config,
 	                                             const HW::Shader& shaders, uint32_t ring_index = 0);
