@@ -69,6 +69,7 @@ uint64_t EnvironmentMask() {
 	set("KYTY_F16_CONVERTS", F16Converts, true);
 	set("KYTY_F16_IMAGE_PACK", F16ImagePack, true);
 	set("KYTY_EXEC_RUN_TRANSPARENT", ExecRunTransparent, true);
+	set("KYTY_EXEC_RUN_CONST_READS", ExecRunConstReads, true);
 	set("KYTY_ALIGNED_BUFFER_OFFSETS", AlignedBufferOffsets, true);
 	set("KYTY_NATIVE_FRACT", NativeFract, true);
 	set("KYTY_NATIVE_F16_OPS", NativeF16Ops, true);

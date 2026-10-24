@@ -853,7 +853,14 @@ set(KYTY_PGO "" CACHE STRING "Profile-guided optimization (clang-cl): generate o
 set(KYTY_PGO_PROFILE "${CMAKE_CURRENT_SOURCE_DIR}/tools/pgo/nhl27.profdata" CACHE FILEPATH
 	"Merged .profdata for KYTY_PGO=use")
 set(KYTY_PGO_PROFILE_COMPILER "22.1.8" CACHE STRING "clang version that recorded KYTY_PGO_PROFILE")
-option(KYTY_THIN_LTO "ThinLTO for the emulator and common (clang-cl)" OFF)
+# ThinLTO is on by default where clang-cl links with lld-link (its objects need lld): with the
+# NHL 27 profile it took the execution thread's draws from 3.14 to 2.75 us (paused match, two
+# boots of each build).
+set(KYTY_THIN_LTO_DEFAULT OFF)
+if (KYTY_CLANG_CL AND CMAKE_LINKER MATCHES "lld-link")
+	set(KYTY_THIN_LTO_DEFAULT ON)
+endif()
+option(KYTY_THIN_LTO "ThinLTO for the emulator and common (clang-cl with lld-link)" ${KYTY_THIN_LTO_DEFAULT})
 if (KYTY_CLANG_CL AND KYTY_PGO STREQUAL "generate")
 	execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-resource-dir
 		OUTPUT_VARIABLE KYTY_CLANG_RESOURCE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)

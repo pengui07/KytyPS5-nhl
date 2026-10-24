@@ -1309,6 +1309,29 @@ Toward 120 fps (2026-10-23):
   of scratch for the guest's 152, wave32) takes 18% of the GPU time and `d46af19f` (a wave64 horizon
   ambient occlusion: two nested loops whose exit test costs ~14 scalar instructions an iteration and
   ~20 VGPR copies, two depth samples per step) 15%, about 2 and 3 ms per dispatch.
+* ThinLTO is now on by default where clang-cl links with lld-link (`KYTY_THIN_LTO`, the main build
+  is reconfigured with it): with the PGO profile, a paused cross-build A/B (`exe-ab.sh`, two boots of
+  each) took draws from 3.14 to 2.75 us (boots 3.11 / 3.17 against 2.63 / 2.86) and dispatches 2.04 to
+  2.00 us. A clean build takes about 14 minutes; later builds re-run the link's code generation for the
+  changed modules (`lto.cache` in the build directory).
+* Bit 45 `KYTY_EXEC_RUN_CONST_READS` (default on; key bit 268435456): `KYTY_DBG_EXEC_BRANCH=2` showed
+  that ExecBranches runs still ended mostly at scalar constant reads (`ReadConstBuffer`: 52 in
+  `c556aaf3`, 61 in `d7cfa519`) and image address operands (`MakeImageAddress`, no code: 19 and 33),
+  which do not depend on EXEC either. They no longer end a run. `c556aaf3` 2765 -> 2705 instructions,
+  `d7cfa519` 7039 -> 6955. Paused GPU A/B (4 rounds, the first one recompiling): +0.3, -1.9, -1.9%;
+  the whole warm-up (22,736 programs, 752 pipelines) validates with `--shader-validation true`.
+* Tried: the constant compares of the execution thread's lookups (36- to 64-byte T#, V#, image view and
+  render target keys) inline with SSE2 instead of the C runtime's `memcmp`, which clang calls for more
+  than two loads without AVX (the profile put ~6% of the thread in it): paired in-boot windows were the
+  same, the cost is the first touch of the data. Dropped. Prefetching the programs' memos ahead (as the
+  resolutions) was neutral too.
+* The recording thread spins about 77% of its time (in play the driver's command building takes about
+  16% of it). The heavy material pixel shaders and `d7cfa519` keep loop-carried values in two VGPR sets
+  (each inner light-loop iteration copies ~50 values one way at the header and back at the latch):
+  in `33037c60` 113 of the 203 VGPRs live at the peak are such copies. Broadcasting the scalar loads
+  through addresses from the first lane (`OpGroupNonUniformBroadcastFirst`, moving them to SGPRs) took
+  it from 217 to 211 VGPRs only; `NonWritable` on their pointee changed nothing, `spirv-opt -O` neither.
+  `KYTY_DBG_LOOP_CAP` changes about 1% of the instructions and no VGPR counts.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

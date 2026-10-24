@@ -514,9 +514,13 @@ std::vector<ExecRun> FindExecRuns(const IR::Block& block) {
 		return memory_ops && IR::IsExecPredicatedMemoryOp(inst) && !IR::ReadsNeighborLanesOpcode(inst.GetOpcode());
 	};
 	const bool transparent_ops = ShaderExecRunTransparent();
-	const auto transparent     = [transparent_ops](IR::ValueOpcode op) {
+	const bool const_reads     = ShaderExecRunConstReads();
+	const auto transparent     = [transparent_ops, const_reads](IR::ValueOpcode op) {
 		if (!transparent_ops) return false;
 		switch (op) {
+			case IR::ValueOpcode::ReadConstBuffer:
+			case IR::ValueOpcode::ReadConst:
+			case IR::ValueOpcode::MakeImageAddress: return const_reads;
 			case IR::ValueOpcode::Reference:
 			case IR::ValueOpcode::ReferenceU32:
 			case IR::ValueOpcode::GetSrtResource:

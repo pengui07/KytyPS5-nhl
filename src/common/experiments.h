@@ -75,8 +75,11 @@ enum Bit : uint64_t {
 	BdaTwoLookups = uint64_t {1} << 44u,
 	// A/B only and read by nothing else (KytyPS5-tools/abmulti.sh), so that one boot can compare
 	// pending changes.
-	AbPending3 = uint64_t {1} << 45u,
 	AbPending4 = uint64_t {1} << 49u,
+	// KYTY_EXEC_RUN_CONST_READS (default on; with ExecRunTransparent): scalar constant reads
+	// (ReadConstBuffer, ReadConst) and image address operands (MakeImageAddress, no code of its own)
+	// no longer end an ExecBranches run; part of shader keys. Was AbPending3.
+	ExecRunConstReads = uint64_t {1} << 45u,
 	// KYTY_MOVREL_ARRAYS (default on): a V_MOVRELS/D_B32 with a bounded register array (see
 	// MovRelBounds) reads or writes a function-local array of those registers (RegArrayLoad /
 	// RegArrayStore) instead of selecting over each of them; part of shader keys. Was AbPending5.
