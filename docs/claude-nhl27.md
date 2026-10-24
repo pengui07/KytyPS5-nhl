@@ -1338,6 +1338,8 @@ Toward 120 fps (2026-10-23):
   third of the draws: two in-boot A/Bs (AbPending4 = the old halves) 82.3 vs 78.6 and 77.3 vs 73.1 fps
   in the 60 Hz windows, waits on the resolvers 34 vs 46 and 27 vs 39 ms/s, while a draw costs the
   execution thread 3-5% more (3.30 vs 3.15 us). A 3-minute match afterwards: 77.9 fps at 60 Hz.
+* PGO profile v16 (recorded with these changes; the build uses ThinLTO). Soak: 77.5 / 81.0 / 77.0 fps
+  in 60 Hz play, 45-48 in the game's 30 Hz scenes, no errors.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
