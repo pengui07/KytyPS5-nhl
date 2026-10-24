@@ -204,7 +204,7 @@ uint32_t ParseGpuPipelineStages(const char* value) {
 	return parsed == 1 ? GPU_PIPELINE_ALL : static_cast<uint32_t>(parsed) & GPU_PIPELINE_ALL;
 }
 
-static const std::array<int, 7>& GpuStageCpus();
+static const std::array<int, 8>& GpuStageCpus();
 
 int GpuStageCpu(GpuStageThread stage) {
 	return GpuStageCpus()[static_cast<uint32_t>(stage)];
@@ -223,25 +223,25 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 	// For profilers that sample one thread (KytyPS5-tools/prof-stage.sh): which OS thread runs
 	// which stage.
 	static constexpr const char* Names[] = {"command-processor", "execution", "recording", "resolve",
-	                                        "host-copy", "dispatch-resolve", "draw-resolve"};
+	                                        "host-copy", "dispatch-resolve", "draw-resolve", "draw-resolve-2"};
 	std::printf("NHL27STAGE: %s tid=%s cpu=%d\n", Names[static_cast<uint32_t>(stage)],
 	            Common::Thread::GetThreadId().c_str(), cpus[static_cast<uint32_t>(stage)]);
 	std::fflush(stdout);
 }
 
-static const std::array<int, 7>& GpuStageCpus() {
+static const std::array<int, 8>& GpuStageCpus() {
 	// Five physical cores of the first CCD of a Ryzen 9 5900X (SMT siblings are adjacent), away
 	// from core 0: the stages share its L3.
 	// The dispatch resolver (experiment DispatchResolver) on a sixth core, the second draw resolver
-	// (experiment DrawResolver) on a seventh.
-	static const std::array<int, 7> cpus = [] {
-		std::array<int, 7> result {4, 6, 8, 10, 2, 12, 14};
+	// (experiment DrawResolver) on a seventh, the third (KYTY_DRAW_RESOLVERS) on the sixth.
+	static const std::array<int, 8> cpus = [] {
+		std::array<int, 8> result {4, 6, 8, 10, 2, 12, 14, 12};
 		const char*        value = std::getenv("KYTY_GPU_THREAD_CPUS");
 		if (value == nullptr) {
 			return result;
 		}
 		if (std::string_view(value) == "off") {
-			return std::array<int, 7> {-1, -1, -1, -1, -1, -1, -1};
+			return std::array<int, 8> {-1, -1, -1, -1, -1, -1, -1, -1};
 		}
 		// Stages without a listed CPU keep their default.
 		for (auto& cpu: result) {

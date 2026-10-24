@@ -147,8 +147,9 @@ private:
 	// Experiment DispatchResolver (resolve thread): hands the dispatch to the dispatch resolver.
 	void              QueueDispatchResolution(GpuOperation& operation, bool indirect);
 	// Experiment DrawResolver: the second draw resolver, and the resolve thread handing it a draw.
-	void              DrawResolveThread();
-	void              QueueDrawResolution(GpuOperation& operation);
+	void              DrawResolveThread(uint32_t which);
+	void              QueueDrawResolution(GpuOperation& operation, uint32_t which);
+	static uint32_t   DrawResolverCount();
 	// The experiment is on, or the dispatch resolver still has queued dispatches.
 	[[nodiscard]] bool DispatchResolverActive() const {
 		return Common::Experiments::Enabled(Common::Experiments::DispatchResolver) ||
@@ -266,10 +267,14 @@ private:
 		const HW::Shader*     shaders     = nullptr;
 	};
 	static constexpr size_t        DrawSlotCount = 1024;
-	std::unique_ptr<GpuDrawSlot[]> m_draw_slots;
-	size_t                         m_draw_slot_next = 0;
-	Common::SpscQueue<DrawJob>     m_draw_jobs;
-	std::jthread                   m_draw_resolver;
+	// Per draw resolver: [0] the second (experiment DrawResolver), [1] a third (DrawResolverCount).
+	struct DrawResolver {
+		std::unique_ptr<GpuDrawSlot[]> slots;
+		size_t                         slot_next = 0;
+		Common::SpscQueue<DrawJob>     jobs {DrawSlotCount};
+		std::jthread                   thread;
+	};
+	DrawResolver                   m_draw_resolvers[2];
 
 	std::jthread m_thread;
 

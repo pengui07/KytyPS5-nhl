@@ -155,7 +155,6 @@ GuestGpu::GuestGpu(RenderContext& renderer)
       m_pipelined((Config::GpuPipelineStages() & Config::GPU_PIPELINE_COMMAND_PROCESSOR) != 0),
       m_resolving(m_pipelined && (Config::GpuPipelineStages() & Config::GPU_PIPELINE_RESOLVE) != 0),
       m_operations(OperationQueueSize), m_resolved(ResolvedQueueSize), m_dispatch_jobs(DispatchSlotCount),
-      m_draw_jobs(DrawSlotCount),
       m_neutral_state {&m_neutral_context, &m_neutral_user_config, &m_neutral_shaders} {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -168,8 +167,10 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 		if (m_resolving) {
 			m_dispatch_slots    = std::make_unique<GpuDispatchSlot[]>(DispatchSlotCount);
 			m_dispatch_resolver = std::jthread([this] { DispatchResolveThread(); });
-			m_draw_slots        = std::make_unique<GpuDrawSlot[]>(DrawSlotCount);
-			m_draw_resolver     = std::jthread([this] { DrawResolveThread(); });
+			for (uint32_t which = 0; which < DrawResolverCount(); which++) {
+				m_draw_resolvers[which].slots  = std::make_unique<GpuDrawSlot[]>(DrawSlotCount);
+				m_draw_resolvers[which].thread = std::jthread([this, which] { DrawResolveThread(which); });
+			}
 			m_resolver          = std::jthread([this] { ResolveThread(); });
 		}
 	}
@@ -1071,8 +1072,13 @@ void GuestGpu::ResolveThread() {
 			const auto& shaders = *operation->state.shaders;
 			const auto  key     = shaders.GetPs().ps_regs.data_addr ^ shaders.GetVs().gs_regs.data_addr ^
 			                 shaders.GetVs().es_regs.data_addr;
-			if (((key >> 8u) * 0x9e3779b97f4a7c15ull) >> 63u) {
-				QueueDrawResolution(*operation);
+			// With a third resolver, a third of the draws each (AbPending4: halves, as before it).
+			const uint64_t hash = (key >> 8u) * 0x9e3779b97f4a7c15ull;
+			const uint32_t part = DrawResolverCount() == 2 && !Common::Experiments::Enabled(Common::Experiments::AbPending4)
+			                          ? (hash < 0x5555555555555555ull ? 0u : hash < 0xaaaaaaaaaaaaaaaaull ? 1u : 2u)
+			                          : static_cast<uint32_t>(hash >> 63u);
+			if (part != 0) {
+				QueueDrawResolution(*operation, part - 1);
 			} else {
 				operation->resolved =
 				    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
@@ -1150,9 +1156,25 @@ void GuestGpu::QueueDispatchResolution(GpuOperation& operation, bool indirect) {
 	operation.dispatch_slot = &slot;
 }
 
-void GuestGpu::QueueDrawResolution(GpuOperation& operation) {
-	auto& slot       = m_draw_slots[m_draw_slot_next];
-	m_draw_slot_next = (m_draw_slot_next + 1) % DrawSlotCount;
+// Draw resolvers besides the resolve thread (experiment DrawResolver): KYTY_DRAW_RESOLVERS (1 or 2),
+// by default 2 on 16 logical CPUs or more. Once the execution thread's draws got cheaper (ThinLTO)
+// it waited ~110 ms/s on the resolvers in 60 Hz play; a third resolver (on the dispatch resolver's
+// CPU) took it to 77.3 / 82.3 fps from 73.1 / 78.6 in two in-boot A/Bs, while a draw cost the
+// execution thread 3-5% more.
+uint32_t GuestGpu::DrawResolverCount() {
+	static const uint32_t count = [] {
+		if (const char* value = std::getenv("KYTY_DRAW_RESOLVERS"); value != nullptr) {
+			return std::strtoul(value, nullptr, 10) >= 2 ? 2u : 1u;
+		}
+		return std::thread::hardware_concurrency() >= 16 ? 2u : 1u;
+	}();
+	return count;
+}
+
+void GuestGpu::QueueDrawResolution(GpuOperation& operation, uint32_t which) {
+	auto& resolver     = m_draw_resolvers[which];
+	auto& slot         = resolver.slots[resolver.slot_next];
+	resolver.slot_next = (resolver.slot_next + 1) % DrawSlotCount;
 	// The execution thread frees the slots in order.
 	for (Common::SpinWait wait; slot.state.load(std::memory_order_acquire) != 0;) {
 		if (!wait.Spin()) {
@@ -1161,7 +1183,7 @@ void GuestGpu::QueueDrawResolution(GpuOperation& operation) {
 	}
 	slot.result = nullptr;
 	slot.state.store(1, std::memory_order_relaxed);
-	m_draw_jobs.Push(DrawJob {.slot        = &slot,
+	resolver.jobs.Push(DrawJob {.slot        = &slot,
 	                          .context     = operation.state.context,
 	                          .user_config = operation.state.user_config,
 	                          .shaders     = operation.state.shaders});
@@ -1170,17 +1192,19 @@ void GuestGpu::QueueDrawResolution(GpuOperation& operation) {
 
 // Experiment DrawResolver: resolves the draws the resolve thread passes on, in order, into a
 // resolution ring of its own.
-void GuestGpu::DrawResolveThread() {
+void GuestGpu::DrawResolveThread(uint32_t which) {
 	KYTY_PROFILER_THREAD("Thread_GpuResolveDraw");
-	Config::ConfigureGpuStageThread(Config::GpuStageThread::DrawResolve);
+	Config::ConfigureGpuStageThread(which == 0 ? Config::GpuStageThread::DrawResolve
+	                                           : Config::GpuStageThread::DrawResolve2);
 	auto& executor = m_renderer.GetRenderExecutor();
+	auto& jobs     = m_draw_resolvers[which].jobs;
 	for (;;) {
-		auto job = m_draw_jobs.Pop();
+		auto job = jobs.Pop();
 		if (!job) {
 			break;
 		}
 		GuestReadLog::SetResolveBase(m_executed.Load());
-		job->slot->result = executor.ResolveDrawAhead(*job->context, *job->user_config, *job->shaders, 1);
+		job->slot->result = executor.ResolveDrawAhead(*job->context, *job->user_config, *job->shaders, which + 1);
 		job->slot->state.store(2, std::memory_order_release);
 	}
 }
@@ -1219,9 +1243,11 @@ void GuestGpu::StopExecution() {
 	if (m_dispatch_resolver.joinable()) {
 		m_dispatch_resolver.join();
 	}
-	m_draw_jobs.Stop();
-	if (m_draw_resolver.joinable()) {
-		m_draw_resolver.join();
+	for (auto& resolver: m_draw_resolvers) {
+		resolver.jobs.Stop();
+		if (resolver.thread.joinable()) {
+			resolver.thread.join();
+		}
 	}
 	if (m_executor.joinable()) {
 		m_executor.join();

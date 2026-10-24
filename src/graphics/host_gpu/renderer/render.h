@@ -575,6 +575,8 @@ private:
 	                                                                                nullptr};
 	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring_second {nullptr,
 	                                                                                       nullptr};
+	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring_third {nullptr,
+	                                                                                      nullptr};
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
 	std::unique_ptr<ResolvedDispatchRing, void (*)(ResolvedDispatchRing*)> m_resolved_dispatch_ring {nullptr,
 	                                                                                                nullptr};

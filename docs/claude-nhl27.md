@@ -1332,6 +1332,12 @@ Toward 120 fps (2026-10-23):
   through addresses from the first lane (`OpGroupNonUniformBroadcastFirst`, moving them to SGPRs) took
   it from 217 to 211 VGPRs only; `NonWritable` on their pointee changed nothing, `spirv-opt -O` neither.
   `KYTY_DBG_LOOP_CAP` changes about 1% of the instructions and no VGPR counts.
+* With the cheaper draws, the execution thread waited ~110 ms/s in 60 Hz play on the resolvers (the
+  resolve thread and the draw resolver's slots) and was ~85% busy. A third draw resolver
+  (`KYTY_DRAW_RESOLVERS=2`, the default on 16 logical CPUs; on CPU 12, the dispatch resolver's) takes a
+  third of the draws: two in-boot A/Bs (AbPending4 = the old halves) 82.3 vs 78.6 and 77.3 vs 73.1 fps
+  in the 60 Hz windows, waits on the resolvers 34 vs 46 and 27 vs 39 ms/s, while a draw costs the
+  execution thread 3-5% more (3.30 vs 3.15 us). A 3-minute match afterwards: 77.9 fps at 60 Hz.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

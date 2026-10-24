@@ -1516,7 +1516,9 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 	if (user_config.GetPrimType() == Prospero::PrimitiveType::kPatch) {
 		return nullptr;
 	}
-	auto& ring_storage = ring_index == 0 ? m_resolved_ring : m_resolved_ring_second;
+	auto& ring_storage = ring_index == 0   ? m_resolved_ring
+	                     : ring_index == 1 ? m_resolved_ring_second
+	                                       : m_resolved_ring_third;
 	if (ring_storage == nullptr) {
 		ring_storage = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
 	}
