@@ -1163,6 +1163,15 @@ Toward 120 fps (2026-10-23):
   of failing on out-of-range values. Bit 57 `KYTY_NATIVE_FRACT` (default on, AMD only; key bit
   16777216): `V_FRACT_F32` is GLSL `Fract` without the clamp below one, as the AMD compiler emits
   `v_fract_f32`, which clamps itself (`c556aaf3` -19 instructions).
+* Bit 58 `KYTY_NATIVE_F16_OPS` (default on; AMD with native f16 and native min/max; key bit
+  33554432): `V_RCP/SQRT/RSQ/LOG/EXP/FLOOR/CEIL/TRUNC/RNDNE/FRACT_F16`, `V_MIN/MAX_F16`,
+  `V_MIN3/MAX3_F16` and `V_PK_MIN/MAX_F16` run as host f16 instructions on register halves
+  (`FPUnary16Low`, `FPMinMax16Low`, `FPMinMax16x2`) instead of through f32 with NaN fix-ups (the
+  packed min/max quieted signalling NaNs by hand: ~15 instructions each). `9380d724`: 2301 -> 1460
+  instructions (24 `v_rcp_f16` for 24 `V_RCP_F16`), `a36f0b4f` 1763 -> 1446, `40d1ee8b` 1173 ->
+  1065. Paused per-draw A/B/A: `9380d724` 587 -> 385 us, `a36f0b4f` 1088 -> 896, PS `1ca26bbe`
+  474 -> 388, `40d1ee8b` 405 -> 374 (unchanged shaders drifted 4-5% between captures); in-match
+  frames look the same. PGO v13 (profile of the current code): draws 3.31 us, dispatches 2.30 us.
 * Host ISA without playing: `KYTY_WARMUP_ONLY=<hex hash>[,...]` warms up only the recorded
   pipelines that use those shaders (the driver cache is left as it was) and `KYTY_EXIT_AFTER_WARMUP=1`
   exits after the warm-up; with `KYTY_DBG_PIPELINE_STATS` that is the shaders' VGPRs, SGPRs and ISA

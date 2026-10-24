@@ -233,6 +233,49 @@ uint32_t EmitFPFma16Low(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                                {HalfOf(ctx, inst.Arg(0)), HalfOf(ctx, inst.Arg(1)), HalfOf(ctx, inst.Arg(2))}));
 }
 
+uint32_t EmitFPUnary16Low(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
+	const auto op    = inst.Arg(1).Resolve();
+	EXIT_IF(!op.IsImmediate());
+	const auto x = HalfOf(ctx, inst.Arg(0));
+	uint32_t   result;
+	const auto glsl = [&](GLSLstd450 function) { return EmitExt(state, TypeF16(state), function, {x}); };
+	switch (static_cast<IR::F16UnaryOp>(op.U32())) {
+		case IR::F16UnaryOp::Recip:
+			result = Binary(state, spv::OpFDiv, TypeF16(state),
+			                state.builder.Constant(spv::OpConstant, TypeF16(state), 0x3c00u), x);
+			break;
+		case IR::F16UnaryOp::Sqrt: result = glsl(GLSLstd450Sqrt); break;
+		case IR::F16UnaryOp::RecipSqrt: result = glsl(GLSLstd450InverseSqrt); break;
+		case IR::F16UnaryOp::Log2: result = glsl(GLSLstd450Log2); break;
+		case IR::F16UnaryOp::Exp2: result = glsl(GLSLstd450Exp2); break;
+		case IR::F16UnaryOp::Floor: result = glsl(GLSLstd450Floor); break;
+		case IR::F16UnaryOp::Ceil: result = glsl(GLSLstd450Ceil); break;
+		case IR::F16UnaryOp::Trunc: result = glsl(GLSLstd450Trunc); break;
+		case IR::F16UnaryOp::RoundEven: result = glsl(GLSLstd450RoundEven); break;
+		case IR::F16UnaryOp::Fract: result = glsl(GLSLstd450Fract); break;
+		default: EXIT("unknown f16 unary op %u\n", op.U32());
+	}
+	return HalfToLow(state, result);
+}
+
+uint32_t EmitFPMinMax16Low(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
+	const auto max   = inst.Arg(2).Resolve();
+	EXIT_IF(!max.IsImmediate());
+	return HalfToLow(state, EmitExt(state, TypeF16(state), max.U32() != 0u ? GLSLstd450NMax : GLSLstd450NMin,
+	                                {HalfOf(ctx, inst.Arg(0)), HalfOf(ctx, inst.Arg(1))}));
+}
+
+uint32_t EmitFPMinMax16x2(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state = ctx.state;
+	const auto max   = inst.Arg(2).Resolve();
+	EXIT_IF(!max.IsImmediate());
+	return BitcastF16x2ToU32(
+	    state, EmitExt(state, TypeF16Vector2(state), max.U32() != 0u ? GLSLstd450NMax : GLSLstd450NMin,
+	                   {BitcastToF16x2(state, ctx.Def(inst.Arg(0))), BitcastToF16x2(state, ctx.Def(inst.Arg(1)))}));
+}
+
 uint32_t EmitF16x2Swizzle(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state = ctx.state;
 	const auto bits  = ctx.Def(inst.Arg(0));

@@ -297,7 +297,9 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 	                op == ValueOpcode::FPFma16x2 || op == ValueOpcode::FPClamp16x2 ||
 	                op == ValueOpcode::F16LaneInsert || op == ValueOpcode::FPAdd16Low ||
 	                op == ValueOpcode::FPSub16Low || op == ValueOpcode::FPMul16Low ||
-	                op == ValueOpcode::FPFma16Low || op == ValueOpcode::F16x2Swizzle;
+	                op == ValueOpcode::FPFma16Low || op == ValueOpcode::F16x2Swizzle ||
+	                op == ValueOpcode::FPUnary16Low || op == ValueOpcode::FPMinMax16Low ||
+	                op == ValueOpcode::FPMinMax16x2;
 	info.buffer_int64_atomics |= buffer_access == BufferAccess::Atomic &&
 	                             inst.GetType() == Type::U64;
 	if (buffer_access != BufferAccess::None || address_access != AddressAccess::None ||

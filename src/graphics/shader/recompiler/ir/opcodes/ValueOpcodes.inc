@@ -368,3 +368,9 @@ VALUE_OPCODE(FPFma16Low, U32, U32, U32, U32)
 // F16x2Swizzle(bits, lo, hi): the U32 whose low half is lane `lo` of bits and high half lane `hi`
 // (packed f16 sources with op_sel/op_sel_hi), emitted as an f16vec2 shuffle.
 VALUE_OPCODE(F16x2Swizzle, U32, U32, U32, U32)
+// Experiment NativeF16Ops: FPUnary16Low(bits, op) is the F16UnaryOp `op` on the low half (high
+// half 0); FPMinMax16Low(a, b, max) and FPMinMax16x2(a, b, max) are NMin (max 0) or NMax (max 1)
+// of the low halves and of both halves.
+VALUE_OPCODE(FPUnary16Low, U32, U32, U32)
+VALUE_OPCODE(FPMinMax16Low, U32, U32, U32, U32)
+VALUE_OPCODE(FPMinMax16x2, U32, U32, U32, U32)

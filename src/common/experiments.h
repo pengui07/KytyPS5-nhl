@@ -80,7 +80,11 @@ enum Bit : uint64_t {
 	// compiler emits as the same v_fract_f32 (clamped below one), without the clamp that
 	// x - floor(x) needs elsewhere; part of shader keys. Was AbPending6.
 	NativeFract = uint64_t {1} << 57u,
-	AbPending7 = uint64_t {1} << 58u,
+	// KYTY_NATIVE_F16_OPS (default on; AMD devices with NativeFp16 and NativeMinMax): f16
+	// reciprocal, square root, its reciprocal, log2, exp2, floor, ceil, trunc, round-even, fract and
+	// min/max (scalar and packed) as host f16 ops instead of f32 emulation; part of shader keys.
+	// Was AbPending7.
+	NativeF16Ops = uint64_t {1} << 58u,
 	// KYTY_F16_CONVERTS (default on; with NativeFp16): f32 <-> f16 conversions as OpFConvert on f16
 	// instead of PackHalf2x16 / UnpackHalf2x16; part of shader keys.
 	F16Converts = uint64_t {1} << 59u,

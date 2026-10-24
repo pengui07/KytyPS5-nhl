@@ -4,6 +4,7 @@
 
 #include <array>
 #include <bit>
+#include <optional>
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
@@ -104,25 +105,18 @@ bool Translator::NativeScalarF16(const Decoder::Instruction& inst, IR::ValueOpco
 // Experiment F16LaneViews: NativeScalarF16 with the source lanes as F16LaneExtract (plain register
 // halves; other sources as Read16LaneBits makes them), the FP*16Low form of the op, and the result
 // written into the destination half with F16LaneInsert when the other half is kept.
-void Translator::NativeScalarF16Lanes(const Decoder::Instruction& inst, IR::ValueOpcode native, bool subtract,
-                                      bool three, const Decoder::Operand* const* srcs) {
-	const auto lane = [&](const Decoder::Operand& op) {
-		if ((op.kind == Decoder::OperandKind::Vgpr || op.kind == Decoder::OperandKind::Sgpr) && !op.absolute &&
-		    !op.negate && !op.dpp && !op.dpp8 && (op.sdwa_sel == 4u || op.sdwa_sel == 5u || op.sdwa_sel == 6u)) {
-			const uint32_t index = op.sdwa_sel == 5u ? 1u : op.sdwa_sel == 4u ? 0u : op.op_sel ? 1u : 0u;
-			return IR::U32(ir.Emit(IR::ValueOpcode::F16LaneExtract, {ReadRawU32(op), IR::Value(index)}));
-		}
-		return Read16LaneBits(op, false);
-	};
-	IR::ValueOpcode opcode = IR::ValueOpcode::FPFma16Low;
-	switch (native) {
-		case IR::ValueOpcode::FPAdd16x2: opcode = subtract ? IR::ValueOpcode::FPSub16Low : IR::ValueOpcode::FPAdd16Low; break;
-		case IR::ValueOpcode::FPMul16x2: opcode = IR::ValueOpcode::FPMul16Low; break;
-		default: break;
+IR::U32 Translator::NativeF16Lane(const Decoder::Operand& op) {
+	if ((op.kind == Decoder::OperandKind::Vgpr || op.kind == Decoder::OperandKind::Sgpr) && !op.absolute &&
+	    !op.negate && !op.dpp && !op.dpp8 && (op.sdwa_sel == 4u || op.sdwa_sel == 5u || op.sdwa_sel == 6u)) {
+		const uint32_t index = op.sdwa_sel == 5u ? 1u : op.sdwa_sel == 4u ? 0u : op.op_sel ? 1u : 0u;
+		return IR::U32(ir.Emit(IR::ValueOpcode::F16LaneExtract, {ReadRawU32(op), IR::Value(index)}));
 	}
-	const auto a = lane(*srcs[0]);
-	const auto b = lane(*srcs[1]);
-	auto       result = three ? IR::U32(ir.Emit(opcode, {a, b, lane(*srcs[2])})) : IR::U32(ir.Emit(opcode, {a, b}));
+	return Read16LaneBits(op, false);
+}
+
+// The low half of `result` into the instruction's destination half (the other half kept when the
+// destination says so), clamped first with the clamp modifier.
+void Translator::WriteNativeF16Lane(const Decoder::Instruction& inst, IR::U32 result) {
 	if (inst.dst.clamp) {
 		result = IR::U32(ir.Emit(IR::ValueOpcode::FPClamp16x2, {result}));
 	}
@@ -143,8 +137,72 @@ void Translator::NativeScalarF16Lanes(const Decoder::Instruction& inst, IR::Valu
 	Write16Bits(DestinationOperand(inst), result);
 }
 
+// Experiment NativeF16Ops: a scalar f16 unary op as the host's f16 instruction.
+bool Translator::NativeF16Unary(const Decoder::Instruction& inst, IR::F16UnaryOp op) {
+	if (!ShaderNativeF16Ops() || !ShaderF16LaneViews() || inst.dst.omod != 0u || !NativeScalarF16Source(inst.src0)) {
+		return false;
+	}
+	WriteNativeF16Lane(inst, IR::U32(ir.Emit(IR::ValueOpcode::FPUnary16Low,
+	                                         {NativeF16Lane(inst.src0), IR::Value(static_cast<uint32_t>(op))})));
+	fp16_native = true;
+	return true;
+}
+
+// Experiment NativeF16Ops: V_MIN/MAX_F16 and V_PK_MIN/MAX_F16 as NMin/NMax on f16 (the host's
+// v_min_f16 / v_pk_max_f16; as with NativeMinMax for f32, only signalling NaNs and the sign of
+// equal zeros may differ).
+bool Translator::NativeF16MinMax(const Decoder::Instruction& inst, bool max, bool packed) {
+	if (!ShaderNativeF16Ops() || !ShaderF16LaneViews() || inst.dst.omod != 0u || inst.src_count != 2u) {
+		return false;
+	}
+	if (packed) {
+		if (!NativeF16Eligible(inst.src0) || !NativeF16Eligible(inst.src1)) {
+			return false;
+		}
+		auto result = IR::U32(ir.Emit(IR::ValueOpcode::FPMinMax16x2,
+		                              {NativePackedF16Source(inst.src0), NativePackedF16Source(inst.src1),
+		                               IR::Value(max ? 1u : 0u)}));
+		if (inst.dst.clamp) {
+			result = IR::U32(ir.Emit(IR::ValueOpcode::FPClamp16x2, {result}));
+		}
+		auto raw  = DestinationOperand(inst);
+		raw.omod  = 0u;
+		raw.clamp = false;
+		WriteOperand(raw, result);
+		fp16_native = true;
+		return true;
+	}
+	if (!NativeScalarF16Source(inst.src0) || !NativeScalarF16Source(inst.src1)) {
+		return false;
+	}
+	WriteNativeF16Lane(inst, IR::U32(ir.Emit(IR::ValueOpcode::FPMinMax16Low,
+	                                         {NativeF16Lane(inst.src0), NativeF16Lane(inst.src1),
+	                                          IR::Value(max ? 1u : 0u)})));
+	fp16_native = true;
+	return true;
+}
+
+void Translator::NativeScalarF16Lanes(const Decoder::Instruction& inst, IR::ValueOpcode native, bool subtract,
+                                      bool three, const Decoder::Operand* const* srcs) {
+	const auto lane = [&](const Decoder::Operand& op) { return NativeF16Lane(op); };
+	IR::ValueOpcode opcode = IR::ValueOpcode::FPFma16Low;
+	switch (native) {
+		case IR::ValueOpcode::FPAdd16x2: opcode = subtract ? IR::ValueOpcode::FPSub16Low : IR::ValueOpcode::FPAdd16Low; break;
+		case IR::ValueOpcode::FPMul16x2: opcode = IR::ValueOpcode::FPMul16Low; break;
+		default: break;
+	}
+	const auto a = lane(*srcs[0]);
+	const auto b = lane(*srcs[1]);
+	const auto result = three ? IR::U32(ir.Emit(opcode, {a, b, lane(*srcs[2])})) : IR::U32(ir.Emit(opcode, {a, b}));
+	WriteNativeF16Lane(inst, result);
+}
+
 void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool accumulator, bool quiet_snan) {
+	if ((opcode == IR::ValueOpcode::FPMin32 || opcode == IR::ValueOpcode::FPMax32) && !accumulator &&
+	    NativeF16MinMax(inst, opcode == IR::ValueOpcode::FPMax32, true)) {
+		return;
+	}
 	if (ShaderNativeFp16() && !quiet_snan) {
 		// Native packed f16. Sources are packed into one u32 holding both halves exactly as the
 		// fallback reads them (op_sel/op_sel_hi, neg/neg_hi, abs, inline constants); omod falls back.
@@ -220,6 +278,24 @@ void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode
 
 void Translator::Float16Unary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                               bool invalid_negative) {
+	{
+		std::optional<IR::F16UnaryOp> native;
+		switch (opcode) {
+			case IR::ValueOpcode::FPRecip32: native = IR::F16UnaryOp::Recip; break;
+			case IR::ValueOpcode::FPSqrt: native = IR::F16UnaryOp::Sqrt; break;
+			case IR::ValueOpcode::FPRecipSqrt32: native = IR::F16UnaryOp::RecipSqrt; break;
+			case IR::ValueOpcode::FPLog2: native = IR::F16UnaryOp::Log2; break;
+			case IR::ValueOpcode::FPExp2: native = IR::F16UnaryOp::Exp2; break;
+			case IR::ValueOpcode::FPFloor32: native = IR::F16UnaryOp::Floor; break;
+			case IR::ValueOpcode::FPCeil32: native = IR::F16UnaryOp::Ceil; break;
+			case IR::ValueOpcode::FPTrunc32: native = IR::F16UnaryOp::Trunc; break;
+			case IR::ValueOpcode::FPRoundEven32: native = IR::F16UnaryOp::RoundEven; break;
+			default: break;
+		}
+		if (native && NativeF16Unary(inst, *native)) {
+			return;
+		}
+	}
 	const auto argument = ReadF16AsF32(inst.src0);
 	auto       result   = IR::F32(ir.Emit(opcode, {argument}));
 	if (!invalid_negative) {
@@ -271,6 +347,10 @@ void Translator::Float16Trig(const Decoder::Instruction& inst, IR::ValueOpcode o
 
 void Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                bool reverse) {
+	if ((opcode == IR::ValueOpcode::FPMin32 || opcode == IR::ValueOpcode::FPMax32) && !reverse &&
+	    NativeF16MinMax(inst, opcode == IR::ValueOpcode::FPMax32, false)) {
+		return;
+	}
 	if (NativeScalarF16(inst, opcode, reverse, false)) {
 		return;
 	}
@@ -281,6 +361,18 @@ void Translator::Float16Binary(const Decoder::Instruction& inst, IR::ValueOpcode
 
 void Translator::Float16Ternary(const Decoder::Instruction& inst, IR::ValueOpcode opcode,
                                 bool accumulator, bool mix) {
+	// Experiment NativeF16Ops: V_MIN3/MAX3_F16 as two f16 NMin/NMax (the host's v_min3_f16).
+	if ((opcode == IR::ValueOpcode::FPMinTri32 || opcode == IR::ValueOpcode::FPMaxTri32) && !accumulator && !mix &&
+	    ShaderNativeF16Ops() && ShaderF16LaneViews() && inst.dst.omod == 0u && inst.src_count == 3u &&
+	    NativeScalarF16Source(inst.src0) && NativeScalarF16Source(inst.src1) && NativeScalarF16Source(inst.src2)) {
+		const auto max   = IR::Value(opcode == IR::ValueOpcode::FPMaxTri32 ? 1u : 0u);
+		const auto first = IR::U32(ir.Emit(IR::ValueOpcode::FPMinMax16Low,
+		                                   {NativeF16Lane(inst.src0), NativeF16Lane(inst.src1), max}));
+		WriteNativeF16Lane(inst, IR::U32(ir.Emit(IR::ValueOpcode::FPMinMax16Low,
+		                                         {first, NativeF16Lane(inst.src2), max})));
+		fp16_native = true;
+		return;
+	}
 	if (!mix && inst.opcode != Decoder::Opcode::V_FMAMK_F16 && inst.opcode != Decoder::Opcode::V_FMAAK_F16 &&
 	    NativeScalarF16(inst, opcode, false, accumulator)) {
 		return;
@@ -341,6 +433,9 @@ void Translator::V_FREXP_MANT_F32(const Decoder::Instruction& inst) {
 }
 
 void Translator::V_FRACT(const Decoder::Instruction& inst, bool half) {
+	if (half && NativeF16Unary(inst, IR::F16UnaryOp::Fract)) {
+		return;
+	}
 	// DX fract returns [0, 1): x - floor(x) rounds to 1.0 for tiny negative x, and the
 	// hardware clamps that to the largest value below one (LLVM matches
 	// minnum(x - floor(x), nextafter(1.0, 0.0)) to V_FRACT for the same reason).

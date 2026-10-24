@@ -71,6 +71,7 @@ uint64_t EnvironmentMask() {
 	set("KYTY_EXEC_RUN_TRANSPARENT", ExecRunTransparent, true);
 	set("KYTY_ALIGNED_BUFFER_OFFSETS", AlignedBufferOffsets, true);
 	set("KYTY_NATIVE_FRACT", NativeFract, true);
+	set("KYTY_NATIVE_F16_OPS", NativeF16Ops, true);
 	set("KYTY_BDA_LOAD_GROUPS", BdaLoadGroups, true);
 	// On since 2026-10-22: with the stage cores kept for the stages, the resolve thread limited the
 	// heavier scenes; sharing its core with the game, the second resolver took 60 Hz play 57.4 ->

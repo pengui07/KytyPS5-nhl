@@ -203,6 +203,13 @@ inline std::atomic<bool> g_shader_storage_align4 {false};
 	return g_shader_native_pkrtz.load(std::memory_order_relaxed) &&
 	       Common::Experiments::Enabled(Common::Experiments::NativeFract);
 }
+// Codegen option: experiment NativeF16Ops (key bit 33554432), AMD devices with native f16 and
+// native min/max: the f16 unary ops and min/max run as the host's f16 instructions (the guest's
+// own: v_rcp_f16, v_pk_max_f16, ...) instead of through f32 with NaN fix-ups.
+[[nodiscard]] inline bool ShaderNativeF16Ops() {
+	return ShaderNativeFp16() && ShaderNativeMinMax() && g_shader_native_pkrtz.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::NativeF16Ops);
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
@@ -216,7 +223,8 @@ inline std::atomic<bool> g_shader_storage_align4 {false};
 	       (ShaderUndefVgprs() ? 131072u : 0u) | (ShaderFtz32() ? 262144u : 0u) |
 	       (ShaderMovRelBounds() ? 524288u : 0u) | (ShaderF16Converts() ? 1048576u : 0u) |
 	       (ShaderF16ImagePack() ? 2097152u : 0u) | (ShaderExecRunTransparent() ? 4194304u : 0u) |
-	       (ShaderAlignedBufferOffsets() ? 8388608u : 0u) | (ShaderNativeFract() ? 16777216u : 0u);
+	       (ShaderAlignedBufferOffsets() ? 8388608u : 0u) | (ShaderNativeFract() ? 16777216u : 0u) |
+	       (ShaderNativeF16Ops() ? 33554432u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

@@ -45,6 +45,10 @@ private:
 	Decoder::Operand PlainOperand(const Decoder::Operand& operand);
 	void NativeScalarF16Lanes(const Decoder::Instruction& inst, IR::ValueOpcode native, bool subtract, bool three,
 	                          const Decoder::Operand* const* srcs);
+	IR::U32 NativeF16Lane(const Decoder::Operand& op);
+	void    WriteNativeF16Lane(const Decoder::Instruction& inst, IR::U32 result);
+	bool    NativeF16Unary(const Decoder::Instruction& inst, IR::F16UnaryOp op);
+	bool    NativeF16MinMax(const Decoder::Instruction& inst, bool max, bool packed);
 	std::array<IR::U32, 2> BallotMask(IR::U1 value);
 	IR::U32                ReadRawU32(const Decoder::Operand& operand);
 	IR::U32                ReadScalarCode(uint32_t code);
