@@ -43,6 +43,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <tuple>
 #include <fmt/format.h>
 #include <cstdlib>
 #include <functional>
@@ -1079,6 +1080,25 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+// A stage's flattened SRT and shader data in one stream reservation: one map and one commit
+// instead of two (the uploads were 1.8% of the execution thread).
+static std::pair<vk::DescriptorBufferInfo, vk::DescriptorBufferInfo>
+NativeUploadPair(RenderContext& context, std::span<const uint32_t> first, std::span<const uint32_t> second) {
+	EXIT_IF(first.empty() || second.empty());
+	auto& command_buffer = context.GetCommandScheduler().Current();
+	EXIT_IF(command_buffer.IsInvalid());
+	auto&            buffer       = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	constexpr uint64_t Alignment  = 256;
+	const uint64_t   second_start = (first.size_bytes() + Alignment - 1) & ~(Alignment - 1);
+	const auto [data, offset]     = buffer.Map(second_start + second.size_bytes(), Alignment);
+	EXIT_IF(data == nullptr);
+	std::memcpy(data, first.data(), first.size_bytes());
+	std::memcpy(data + second_start, second.data(), second.size_bytes());
+	buffer.Commit();
+	return {vk::DescriptorBufferInfo {buffer.Handle(), offset, first.size_bytes()},
+	        vk::DescriptorBufferInfo {buffer.Handle(), offset + second_start, second.size_bytes()}};
+}
+
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	auto& image = m_context.GetTextureCache().GetImage(id);
 	if (image.info.data.Empty()) {
@@ -1251,6 +1271,14 @@ void DrawRepeats::DrawEnd() {
 	RepeatPrint();
 }
 
+// Descriptor value arrays compared as bytes (DescriptorValue has no padding): the element-wise
+// compares of a stage's T#s and S#s against its last draw's were 1.4% of the execution thread.
+static bool SameDescriptorValues(const std::vector<ShaderRecompiler::IR::DescriptorValue>& a,
+                                 const std::vector<ShaderRecompiler::IR::DescriptorValue>& b) {
+	return a.size() == b.size() &&
+	       (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0);
+}
+
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
 	KYTY_PROFILER_FUNCTION();
@@ -1310,7 +1338,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	auto&      last_images = memo->images;
 	auto&      image_descs = memo->image_descs;
 	const bool same_descs  = memo->descs_generation == m_texture_descs_generation;
-	const bool same_images = same_descs && last_images == snapshot.images;
+	const bool same_images = same_descs && SameDescriptorValues(last_images, snapshot.images);
 	// Draws of a program change some T#s and keep the others: a slot whose T# is unchanged keeps
 	// its description instead of looking it up again.
 	const bool slot_reuse = same_descs && last_images.size() == snapshot.images.size() &&
@@ -1376,7 +1404,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	// Samplers live as long as the sampler cache: the same S#s of the same program give the same
 	// samplers.
 	if (!same_program || prepared.samplers.size() != program.info.samplers.size() ||
-	    prepared.last_samplers != snapshot.samplers) {
+	    !SameDescriptorValues(prepared.last_samplers, snapshot.samplers)) {
 		prepared.samplers.clear();
 		prepared.samplers.reserve(program.info.samplers.size());
 		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
@@ -1585,11 +1613,18 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	lookup_timer.Stop();
 	FrameBreakdown::Timer upload_timer(FrameBreakdown::g_counters.dp_rebind_upload_ns);
-	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
-	}
-	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
-		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
+	const bool srt  = layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0;
+	const bool data = layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0;
+	if (srt && data && !snapshot.flattened_srt.empty() && !prepared.shader_data.empty()) {
+		std::tie(prepared.flattened_srt, prepared.shader_data_buffer) =
+		    NativeUploadPair(m_context, snapshot.flattened_srt, prepared.shader_data);
+	} else {
+		if (srt) {
+			prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		}
+		if (data) {
+			prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
+		}
 	}
 }
 

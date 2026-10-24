@@ -1172,6 +1172,14 @@ Toward 120 fps (2026-10-23):
   1065. Paused per-draw A/B/A: `9380d724` 587 -> 385 us, `a36f0b4f` 1088 -> 896, PS `1ca26bbe`
   474 -> 388, `40d1ee8b` 405 -> 374 (unchanged shaders drifted 4-5% between captures); in-match
   frames look the same. PGO v13 (profile of the current code): draws 3.31 us, dispatches 2.30 us.
+* Execution thread, PGO v13 build: read-log compares of other mappings use the backing's MRU and
+  lookup cache before the map search (`TryCompareBacking`; `GuestReadLog::StillValid` 8.8 -> 6.7%,
+  `CompareCleanBacking` 1.7 -> 1.1%), a stage's flattened SRT and shader data share one stream
+  reservation (`NativeUploadPair`; `StreamBuffer::Copy` 2.1 -> 1.4%), and stage T#/S# arrays compare
+  as one memcmp. Game threads in play: 13 job threads at 25-58% of a CPU each (about 5.4 CPUs);
+  the GPU stage threads spin at ~99% on their CPUs (2 ms spin budget), four of which share cores
+  with guest threads; guest write faults cost ~8 ms of CPU per frame across threads
+  (`KYTY_PERF_STATS=1`, NHL27FRAME `faults=`).
 * Host ISA without playing: `KYTY_WARMUP_ONLY=<hex hash>[,...]` warms up only the recorded
   pipelines that use those shaders (the driver cache is left as it was) and `KYTY_EXIT_AFTER_WARMUP=1`
   exits after the warm-up; with `KYTY_DBG_PIPELINE_STATS` that is the shaders' VGPRs, SGPRs and ISA

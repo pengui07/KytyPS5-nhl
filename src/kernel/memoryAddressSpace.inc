@@ -335,6 +335,28 @@ public:
 					return true;
 				}
 			}
+			// As TryReadBacking's fast path: the mapping before the last, then the per-block
+			// lookup cache, before the map search (the search was a third of the execution
+			// thread's compares of read-log entries).
+			auto& p = t_read_cache_previous;
+			if (Common::Experiments::Enabled(Common::Experiments::BackingReadMru) && p.owner == this &&
+			    p.gen == g0 && size != 0 && vaddr >= p.begin && vaddr - p.begin < p.length &&
+			    size <= p.length - (vaddr - p.begin)) {
+				const bool match = std::memcmp(p.host + (vaddr - p.begin), source, size) == 0;
+				std::atomic_thread_fence(std::memory_order_acquire);
+				if (m_map_gen.load(std::memory_order_relaxed) == g0) {
+					std::swap(c, p);
+					equal = match;
+					return true;
+				}
+			}
+		}
+		if (Common::Experiments::Enabled(Common::Experiments::BackingLookupCache) &&
+		    TryCachedTransfer(vaddr, size, [source, &same](uint8_t* backing, size_t bytes) {
+			    same = std::memcmp(backing, source, bytes) == 0;
+		    })) {
+			equal = same;
+			return true;
 		}
 		const bool  ok     = TryTransferBacking(
 		    vaddr, size,
