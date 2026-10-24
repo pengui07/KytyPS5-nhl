@@ -1,0 +1,634 @@
+// Colours and table cells shared by the pages.
+
+export global Theme {
+    // 0 unknown, 1 in game, 2 main menu, 3 logo, 4 doesn't boot
+    public pure function status-color(code: int) -> color {
+        return code == 1 ? #30a46c : code == 2 ? #3a86ff : code == 3 ? #f5a524 : code == 4 ? #e5484d : #565f70;
+    }
+    out property <color> row-hover: #ffffff0f;
+    out property <color> row-selected: #ffffff1a;
+    out property <color> row-outline: #e7ecf3cc;
+    out property <color> card-glass: #11141ab8;
+    out property <color> bg: #0a0c10;
+    out property <color> panel: #0d0f14;
+    out property <color> card: #11141a;
+    out property <color> card-border: #2b3345;
+    out property <color> text: #d0d7e6;
+    out property <color> muted: #707b90;
+    out property <color> faint: #565f70;
+    out property <color> accent: #3a86ff;
+    out property <color> accent-hover: #5aa0ff;
+    out property <color> danger: #e5484d;
+    out property <color> danger-hover: #f06065;
+    out property <color> log-bg: #07090c;
+}
+
+export // Which sort arrow a sortable table header shows.
+enum SortState { none, ascending, descending }
+
+export // One fixed-width table cell; long text is cut with an ellipsis.
+component TextCell inherits HorizontalLayout {
+    in property <length> w;
+    in property <string> text;
+    in property <color> color: Theme.text;
+    in property <bool> bold: false;
+    width: root.w;
+    padding-left: 8px;
+    padding-right: 8px;
+    Text {
+        horizontal-stretch: 1;
+        min-width: 0px;
+        text: root.text;
+        color: root.color;
+        font-size: 13px;
+        font-weight: root.bold ? 700 : 400;
+        overflow: elide;
+        vertical-alignment: center;
+    }
+}
+
+export // Header cell with a drag grip on its right edge; clicking the label sorts by it.
+component HeaderCell inherits Rectangle {
+    in property <string> text;
+    in-out property <length> w;
+    in property <string> tooltip; // shown after hovering for a moment
+    in property <bool> sortable: false;
+    in property <SortState> sort-state: SortState.none;
+    callback clicked(); // a click on the label; the 6 px resize grip does not count as one
+    width: root.w;
+    background: head-touch.has-hover && root.sortable ? Theme.row-hover : transparent;
+    Text {
+        x: 8px;
+        width: parent.width - (root.sortable ? 26px : 16px);
+        height: parent.height;
+        text: root.text;
+        color: root.sort-state == SortState.none ? Theme.muted : Theme.text;
+        font-size: 12px;
+        font-weight: 600;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    // The sorted column's arrow: up for ascending, down for descending.
+    if root.sort-state == SortState.ascending: Path {
+        x: parent.width - 18px;
+        y: parent.height / 2 - 3px;
+        width: 7px;
+        height: 6px;
+        viewbox-width: 7;
+        viewbox-height: 6;
+        fill: Theme.text;
+        MoveTo { x: 0; y: 6; }
+        LineTo { x: 3.5; y: 0; }
+        LineTo { x: 7; y: 6; }
+    }
+    if root.sort-state == SortState.descending: Path {
+        x: parent.width - 18px;
+        y: parent.height / 2 - 3px;
+        width: 7px;
+        height: 6px;
+        viewbox-width: 7;
+        viewbox-height: 6;
+        fill: Theme.text;
+        MoveTo { x: 0; y: 0; }
+        LineTo { x: 7; y: 0; }
+        LineTo { x: 3.5; y: 6; }
+    }
+    head-touch := TouchArea {
+        x: 0px;
+        width: parent.width - 6px;
+        mouse-cursor: root.sortable ? pointer : default;
+        clicked => {
+            if (root.sortable) {
+                root.clicked();
+            }
+        }
+    }
+    Rectangle {
+        x: parent.width - 1px;
+        y: 5px;
+        width: 1px;
+        height: parent.height - 10px;
+        background: grip.has-hover || grip.pressed ? Theme.accent : Theme.card-border;
+    }
+    grip := TouchArea {
+        x: parent.width - 6px;
+        width: 6px;
+        mouse-cursor: col-resize;
+        // The grip moves with the edge, so each move adds the delta since the last one.
+        moved => {
+            if (self.pressed) {
+                root.w = max(40px, root.w + self.mouse-x - self.pressed-x);
+            }
+        }
+    }
+    if root.tooltip != "": Tooltip {
+        text: @markdown("\{root.tooltip}");
+    }
+}
+
+// Text field whose example text is dark and see-through (LineEdit's placeholder colour can't be set).
+export component ThemedEdit inherits Rectangle {
+    in property <string> placeholder;
+    in property <bool> editable: true;
+    in property <InputType> input-type: InputType.text; // password hides what is typed
+    in-out property <string> text <=> input.text;
+    out property <bool> has-focus: input.has-focus;
+    callback accepted();
+    callback edited(string); // the text changed by typing
+    min-width: 60px;
+    height: 26px;
+    border-width: 1px;
+    border-radius: 0px;
+    border-color: input.has-focus ? Theme.accent : Theme.card-border;
+    background: #07090c;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        // Clipped, and the text scrolls to keep the cursor in view (as std-widgets' LineEdit does).
+        Rectangle {
+            horizontal-stretch: 1;
+            min-width: 1px;
+            clip: true;
+            input := TextInput {
+                property <length> computed-x;
+                x: min(0px, max(parent.width - self.width - self.text-cursor-width, self.computed-x));
+                width: max(parent.width - self.text-cursor-width, self.preferred-width);
+                height: 100%;
+                cursor-position-changed(pos) => {
+                    if pos.x + self.computed-x < 0px {
+                        self.computed-x = -pos.x;
+                    } else if pos.x + self.computed-x > parent.width - self.text-cursor-width {
+                        self.computed-x = parent.width - pos.x - self.text-cursor-width;
+                    }
+                }
+                color: Theme.text;
+                font-size: 13px;
+                vertical-alignment: center;
+                single-line: true;
+                enabled: root.editable;
+                input-type: root.input-type;
+                accepted => { root.accepted(); }
+                edited => { root.edited(self.text); }
+            }
+            Text {
+                visible: input.text == "";
+                width: 100%;
+                height: 100%;
+                text: root.placeholder;
+                color: #4a5566b3;
+                font-size: 13px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+export component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <bool> enabled: true;
+    in property <length> icon-size: 22px;
+    in property <string> tooltip; // shown after hovering for a moment
+    callback clicked();
+    width: 40px;
+    height: 40px;
+    border-radius: 0px;
+    background: icon-touch.has-hover && root.enabled ? #1d212a : transparent;
+    animate background { duration: 100ms; }
+    Image {
+        source: root.icon;
+        colorize: root.enabled ? Theme.text : Theme.faint;
+        width: root.icon-size;
+        height: root.icon-size;
+    }
+    icon-touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    if root.tooltip != "": Tooltip {
+        text: @markdown("\{root.tooltip}");
+    }
+}
+
+// A name edited in place: Enter or clicking away keeps the change, Escape drops it.
+export component InlineEdit inherits Rectangle {
+    in property <string> text;
+    callback done(string);   // the new text, only when it changed
+    callback cancelled();
+    property <bool> finished: false;
+    min-width: 90px;
+    background: #07090c;
+    border-width: 1px;
+    border-color: Theme.accent;
+    border-radius: 0px;
+    Rectangle {
+        x: 6px;
+        width: parent.width - 12px;
+        height: parent.height;
+        clip: true;
+    input := TextInput {
+        property <length> computed-x;
+        x: min(0px, max(parent.width - self.width - self.text-cursor-width, self.computed-x));
+        width: max(parent.width - self.text-cursor-width, self.preferred-width);
+        height: 100%;
+        cursor-position-changed(pos) => {
+            if pos.x + self.computed-x < 0px {
+                self.computed-x = -pos.x;
+            } else if pos.x + self.computed-x > parent.width - self.text-cursor-width {
+                self.computed-x = parent.width - pos.x - self.text-cursor-width;
+            }
+        }
+        text: root.text;
+        color: Theme.text;
+        font-size: 13px;
+        vertical-alignment: center;
+        single-line: true;
+        accepted => { root.finish(); }
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.finished = true;
+                root.cancelled();
+                return accept;
+            }
+            return reject;
+        }
+        changed has-focus => {
+            if (!self.has-focus) {
+                root.finish();
+            }
+        }
+    }
+    }
+    function finish() {
+        if (root.finished) {
+            return;
+        }
+        root.finished = true;
+        if (input.text != root.text) {
+            root.done(input.text);
+        } else {
+            root.cancelled();
+        }
+    }
+    init => {
+        input.focus();
+        input.select-all();
+    }
+}
+
+// A compact drop-down (std ComboBox cannot be made as short as a thin text field).
+// ">" chevron that turns by `angle` (90deg points down). Drawn as a path with its points rotated here,
+// because the software renderer ignores rotation-angle on an Image.
+export component Chevron inherits Path {
+    in property <angle> angle: 0deg;
+    in property <color> color: Theme.text;
+    viewbox-width: 32;
+    viewbox-height: 32;
+    stroke: root.color;
+    stroke-width: 1.6px;
+    stroke-line-cap: round;
+    fill: transparent;
+    // The icons/chevron-right.svg points (12,7) (21,16) (12,25), turned about the centre (16,16).
+    MoveTo {
+        x: 16 + (12 - 16) * cos(root.angle) - (7 - 16) * sin(root.angle);
+        y: 16 + (12 - 16) * sin(root.angle) + (7 - 16) * cos(root.angle);
+    }
+    LineTo {
+        x: 16 + (21 - 16) * cos(root.angle) - (16 - 16) * sin(root.angle);
+        y: 16 + (21 - 16) * sin(root.angle) + (16 - 16) * cos(root.angle);
+    }
+    LineTo {
+        x: 16 + (12 - 16) * cos(root.angle) - (25 - 16) * sin(root.angle);
+        y: 16 + (12 - 16) * sin(root.angle) + (25 - 16) * cos(root.angle);
+    }
+}
+
+export component Selector inherits Rectangle {
+    in property <[string]> model;
+    in-out property <int> current-index: 0;
+    callback selected(int);
+    height: 26px;
+    min-width: 90px;
+    background: #07090c;
+    border-width: 1px;
+    border-radius: 0px;
+    border-color: touch.has-hover ? Theme.accent : Theme.card-border;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 8px;
+        spacing: 6px;
+        Text {
+            horizontal-stretch: 1;
+            text: root.current-index >= 0 && root.current-index < root.model.length ? root.model[root.current-index] : "";
+            color: Theme.text;
+            font-size: 13px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        VerticalLayout {
+            alignment: center;
+            Chevron {
+                color: Theme.muted;
+                width: 12px;
+                height: 12px;
+                angle: 90deg;
+            }
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { popup.show(); }
+    }
+    popup := PopupWindow {
+        x: 0px;
+        y: root.height + 2px;
+        width: root.width;
+        close-policy: close-on-click-outside;
+        Rectangle {
+            background: #141923;
+            border-width: 1px;
+            border-color: Theme.card-border;
+            border-radius: 0px;
+            VerticalLayout {
+                padding: 3px;
+                for item[i] in root.model: Rectangle {
+                    height: 26px;
+                    border-radius: 0px;
+                    background: item-touch.has-hover ? Theme.row-hover : i == root.current-index ? #ffffff10 : transparent;
+                    Text {
+                        x: 8px;
+                        text: item;
+                        color: Theme.text;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+                    item-touch := TouchArea {
+                        clicked => {
+                            root.current-index = i;
+                            popup.close();
+                            root.selected(i);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// A titled group: a thin frame with its title sitting on the top edge. `hint` is what the title explains in the
+// description panel when the pointer is over it.
+export component Card inherits VerticalLayout {
+    in property <string> title;
+    in property <string> hint;
+    padding-top: 8px; // room for the title, which rises above the frame
+    Rectangle {
+        border-width: 1px;
+        border-color: Theme.card-border;
+        border-radius: 0px;
+        VerticalLayout {
+            padding: 10px;
+            padding-top: 15px;
+            spacing: 6px;
+            alignment: start;
+            @children
+        }
+        // The title covers the border behind it.
+        Rectangle {
+            x: 10px;
+            y: -8px;
+            width: title-text.preferred-width + 8px;
+            height: 16px;
+            background: Theme.panel;
+            title-text := Text {
+                x: 4px;
+                width: self.preferred-width;
+                height: parent.height;
+                text: root.title;
+                color: Theme.text;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+            if root.hint != "": Tooltip {
+                text: @markdown("\{root.hint}");
+            }
+        }
+    }
+}
+
+// ---- Controls in the launcher's own style: square, 1 px borders, the reference's shading. They replace the
+// std-widgets ones, whose Fluent drawing (rounded corners, its own palette) does not follow the theme. ----
+
+export component AppButton inherits Rectangle {
+    in property <string> text;
+    in property <image> icon;
+    in property <bool> primary: false;
+    in property <bool> enabled: true;
+    callback clicked();
+    height: 28px;
+    min-width: 76px;
+    border-width: 1px;
+    border-radius: 0px;
+    border-color: root.primary ? (touch.has-hover ? #6db0ff : Theme.accent)
+        : touch.has-hover ? #3e4c66 : Theme.card-border;
+    background: root.primary
+        ? (touch.pressed ? #2f74e0 : touch.has-hover ? Theme.accent-hover : Theme.accent)
+        : touch.pressed ? #14171d : touch.has-hover ? #262c38 : @linear-gradient(180deg, #232834 0%, #191d26 100%);
+    opacity: root.enabled ? 1 : 0.45;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 6px;
+        alignment: center;
+        if root.icon.width > 0: VerticalLayout {
+            alignment: center;
+            Image {
+                source: root.icon;
+                width: 14px;
+                height: 14px;
+                colorize: root.primary ? #ffffff : Theme.text;
+            }
+        }
+        Text {
+            text: root.text;
+            color: root.primary ? #ffffff : Theme.text;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            if (root.enabled) {
+                root.clicked();
+            }
+        }
+    }
+}
+
+export component AppCheckBox inherits Rectangle {
+    in property <string> text;
+    in-out property <bool> checked: false;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+    height: 24px;
+    HorizontalLayout {
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 14px;
+                height: 14px;
+                border-width: 1px;
+                border-radius: 0px;
+                border-color: root.checked ? Theme.accent : check-touch.has-hover ? #3e4c66 : Theme.card-border;
+                background: root.checked ? Theme.accent : #07090c;
+                Text {
+                    text: "✓";
+                    color: #ffffff;
+                    font-size: 9px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    visible: root.checked;
+                }
+            }
+        }
+        Text {
+            text: root.text;
+            color: root.enabled ? Theme.text : Theme.faint;
+            font-size: 13px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+    check-touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => {
+            if (root.enabled) {
+                root.checked = !root.checked;
+                root.toggled(root.checked);
+            }
+        }
+    }
+}
+
+export component AppSlider inherits Rectangle {
+    in-out property <float> value: 0;
+    in property <float> minimum: 0;
+    in property <float> maximum: 100;
+    in property <float> step: 0;
+    in property <bool> enabled: true;
+    callback changed(float);
+    height: 24px;
+    min-width: 60px;
+    // Where a pointer at `x` puts the value: clamped to the range and snapped to `step`.
+    pure function value-at(x: length) -> float {
+        return root.maximum > root.minimum
+            ? root.minimum + clamp(0.0, 1.0, (x - thumb-w / 2) / max(1px, root.width - thumb-w)) * (root.maximum - root.minimum)
+            : root.minimum;
+    }
+    function snapped(v: float) -> float {
+        return root.step > 0 ? round(v / root.step) * root.step : v;
+    }
+    pure function ratio() -> float {
+        return root.maximum > root.minimum ? (root.value - root.minimum) / (root.maximum - root.minimum) : 0;
+    }
+    property <length> thumb-w: 10px;
+    Rectangle {
+        y: (parent.height - self.height) / 2;
+        width: 100%;
+        height: 1px;
+        background: Theme.card-border;
+    }
+    Rectangle {
+        x: root.ratio() * (parent.width - thumb-w);
+        y: (parent.height - self.height) / 2;
+        width: thumb-w;
+        height: 14px;
+        background: Theme.accent;
+    }
+    slider-touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        moved => {
+            root.value = root.snapped(root.value-at(self.mouse-x));
+            root.changed(root.value);
+        }
+        clicked => {
+            root.value = root.snapped(root.value-at(self.mouse-x));
+            root.changed(root.value);
+        }
+    }
+}
+
+export component AppSpinBox inherits Rectangle {
+    in-out property <int> value: 0;
+    in property <int> minimum: 0;
+    in property <int> maximum: 100;
+    in property <bool> enabled: true;
+    height: 26px;
+    min-width: 78px;
+    border-width: 1px;
+    border-radius: 0px;
+    border-color: Theme.card-border;
+    background: #07090c;
+    opacity: root.enabled ? 1 : 0.45;
+    function bump(by: int) {
+        root.value = max(root.minimum, min(root.maximum, root.value + by));
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 2px;
+        spacing: 6px;
+        Text {
+            horizontal-stretch: 1;
+            text: root.value;
+            color: Theme.text;
+            font-size: 13px;
+            vertical-alignment: center;
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 1px;
+            Rectangle {
+                width: 18px;
+                height: 11px;
+                background: up-touch.has-hover ? Theme.row-hover : transparent;
+                Chevron {
+                    x: 5px;
+                    y: 2px;
+                    width: 8px;
+                    height: 8px;
+                    angle: 270deg;
+                    color: Theme.muted;
+                }
+                up-touch := TouchArea {
+                    enabled: root.enabled && root.value < root.maximum;
+                    mouse-cursor: pointer;
+                    clicked => { root.bump(1); }
+                }
+            }
+            Rectangle {
+                width: 18px;
+                height: 11px;
+                background: down-touch.has-hover ? Theme.row-hover : transparent;
+                Chevron {
+                    x: 5px;
+                    y: 1px;
+                    width: 8px;
+                    height: 8px;
+                    angle: 90deg;
+                    color: Theme.muted;
+                }
+                down-touch := TouchArea {
+                    enabled: root.enabled && root.value > root.minimum;
+                    mouse-cursor: pointer;
+                    clicked => { root.bump(-1); }
+                }
+            }
+        }
+    }
+}

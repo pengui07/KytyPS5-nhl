@@ -33,11 +33,10 @@ uint32_t EmitMinMaxF64(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max
 	result = Select(state, TypeF64(state), equal,
 	                Unary(state, spv::OpBitcast, TypeF64(state), equal_bits), result);
 
-	// Non-IEEE mode selects the other operand for NaN, including rhs when both are NaN.
-	result = Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), rhs),
-	                lhs, result);
-	return Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), lhs),
-	              rhs, result);
+	// Non-IEEE mode selects the other operand for NaN, and lhs when both are NaN. The ordered
+	// compares already pick rhs for a NaN lhs.
+	return Select(state, TypeF64(state), Unary(state, spv::OpIsNan, TypeBool(state), rhs),
+	              lhs, result);
 }
 
 uint32_t EmitMulHigh(EmitterState& state, uint32_t lhs, uint32_t rhs, bool signed_value) {
@@ -68,36 +67,62 @@ uint32_t EmitExt(EmitterState& state, uint32_t type, uint32_t opcode,
 	return result;
 }
 
+uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t value) {
+	// Native half conversion causes regressions; use compact integer RTZ conversion.
+	const auto bits = EmitBitcastF32ToU32(state, value);
+	const auto abs  = EmitAndConstant(state, bits, 0x7fffffffu);
+	const auto sign = EmitAndConstant(
+	    state, Binary(state, spv::OpShiftRightLogical, TypeU32(state), bits, ConstantU32(state, 16)),
+	    0x8000u);
+	const auto exp = Binary(state, spv::OpShiftRightLogical, TypeU32(state), abs,
+	                        ConstantU32(state, 23));
+	const auto mant = EmitAndConstant(state, abs, 0x007fffffu);
+
+	// Align the hidden bit to the half subnormal mantissa. Even unused shifts must be < 32.
+	const auto shift = EmitUMin32(
+	    state, Binary(state, spv::OpISub, TypeU32(state), ConstantU32(state, 126), exp),
+	    ConstantU32(state, 31));
+	const auto sub = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+	                        EmitOrU32(state, mant, ConstantU32(state, 0x00800000u)), shift);
+
+	// Drop 13 mantissa bits and rebias the exponent; finite overflow saturates to max half.
+	const auto truncated = Binary(state, spv::OpShiftRightLogical, TypeU32(state), abs,
+	                              ConstantU32(state, 13));
+	const auto normal = EmitUMin32(
+	    state, Binary(state, spv::OpISub, TypeU32(state), truncated, ConstantU32(state, 0x1c000u)),
+	    ConstantU32(state, 0x7bffu));
+	const auto finite = Select(state, TypeU32(state),
+	                           EmitCompareU32Constant(state, spv::OpULessThan, abs, 0x38800000u),
+	                           sub, normal);
+	const auto nan = EmitOrU32(state, EmitAndConstant(state, truncated, 0x03ffu),
+	                           ConstantU32(state, 0x7e00u));
+	const auto special = Select(state, TypeU32(state),
+	                            EmitCompareU32Constant(state, spv::OpIEqual, mant, 0),
+	                            ConstantU32(state, 0x7c00u), nan);
+	const auto magnitude = Select(
+	    state, TypeU32(state),
+	    EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, abs, 0x7f800000u), special, finite);
+	return EmitOrU32(state, sign, magnitude);
+}
+
 uint32_t EmitF32ToU32(EmitterState& state, uint32_t src, bool signed_value) {
-	const auto trunc         = EmitTruncF32Value(state, src);
-	const auto converted_raw = state.builder.AllocateId();
-	if (signed_value) {
-		const auto converted_i = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpConvertFToS, TypeI32(state), converted_i, trunc);
-		state.builder.AddFunction(spv::OpBitcast, TypeU32(state), converted_raw, converted_i);
-	} else {
-		state.builder.AddFunction(spv::OpConvertFToU, TypeU32(state), converted_raw, trunc);
-	}
-	const auto nan = EmitClassifyF32(state, src).nan;
-	if (signed_value) {
-		const auto below = Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), src,
-		                          ConstantF32(state, 0xcf000000u));
-		const auto above = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), src,
-		                          ConstantF32(state, 0x4f000000u));
-		const auto high =
-		    Select(state, TypeU32(state), above, ConstantU32(state, 0x7fffffffu), converted_raw);
-		const auto low =
-		    Select(state, TypeU32(state), below, ConstantU32(state, 0x80000000u), high);
-		return Select(state, TypeU32(state), nan, ConstantU32(state, 0), low);
-	}
-	const auto below =
-	    Binary(state, spv::OpFOrdLessThanEqual, TypeBool(state), src, ConstantF32(state, 0));
-	const auto above = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), src,
-	                          ConstantF32(state, 0x4f800000u));
-	const auto zero  = Binary(state, spv::OpLogicalOr, TypeBool(state), nan, below);
+	// Clamping first keeps the truncating conversion defined; NaN and values past the largest
+	// float below the integer limit are selected afterwards.
+	const auto clamped =
+	    EmitExt(state, TypeF32(state), GLSLstd450NClamp,
+	            {src, ConstantF32(state, signed_value ? 0xcf000000u : 0u),
+	             ConstantF32(state, signed_value ? 0x4effffffu : 0x4f7fffffu)});
+	const auto converted = signed_value
+	                           ? Unary(state, spv::OpBitcast, TypeU32(state),
+	                                   Unary(state, spv::OpConvertFToS, TypeI32(state), clamped))
+	                           : Unary(state, spv::OpConvertFToU, TypeU32(state), clamped);
+	const auto above     = Binary(state, spv::OpFOrdGreaterThanEqual, TypeBool(state), src,
+	                              ConstantF32(state, signed_value ? 0x4f000000u : 0x4f800000u));
 	const auto high =
-	    Select(state, TypeU32(state), above, ConstantU32(state, 0xffffffffu), converted_raw);
-	return Select(state, TypeU32(state), zero, ConstantU32(state, 0), high);
+	    Select(state, TypeU32(state), above,
+	           ConstantU32(state, signed_value ? 0x7fffffffu : 0xffffffffu), converted);
+	return Select(state, TypeU32(state), Unary(state, spv::OpIsNan, TypeBool(state), src),
+	              ConstantU32(state, 0), high);
 }
 
 } // namespace
@@ -323,25 +348,6 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 	return sum;
 }
 
-uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	if (ShaderFastMinMax()) {
-		// max(min(a, b), min(max(a, b), c)); the driver can fold this into v_med3_f32.
-		const auto lo = EmitFastMinMaxF32(state, a, b, false);
-		const auto hi = EmitFastMinMaxF32(state, a, b, true);
-		return EmitFastMinMaxF32(state, lo, EmitFastMinMaxF32(state, hi, c, false), true);
-	}
-	const auto min_ab   = EmitMinMaxF32Value(state, a, b, false);
-	const auto min3     = EmitMinMaxF32Value(state, min_ab, c, false);
-	const auto max_ab   = EmitMinMaxF32Value(state, a, b, true);
-	const auto high_min = EmitMinMaxF32Value(state, max_ab, c, false);
-	const auto median   = EmitMinMaxF32Value(state, min_ab, high_min, true);
-	const auto nan_ab   = Binary(state, spv::OpLogicalOr, TypeBool(state),
-	                             EmitClassifyF32(state, a).nan, EmitClassifyF32(state, b).nan);
-	const auto any_nan =
-	    Binary(state, spv::OpLogicalOr, TypeBool(state), nan_ab, EmitClassifyF32(state, c).nan);
-	return Select(state, TypeF32(state), any_nan, min3, median);
-}
-
 uint32_t EmitFindUMsb64(EmitterState& state, uint32_t value) {
 	// GLSL FindUMsb is restricted to 32-bit components.
 	const auto unpacked = Unary(state, spv::OpBitcast, TypeU32Vector(state, 2), value);
@@ -435,14 +441,18 @@ uint32_t EmitPackFloat2x16Rtz(EmitterState& state, uint32_t arg0, uint32_t arg1)
 		              Binary(state, spv::OpShiftLeftLogical, TypeU32(state), pack_lane(arg1),
 		                     ConstantU32(state, 16)));
 	}
-	const auto low  = EmitF32ToF16RtzBits(state, arg0);
-	const auto high = Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
-	                         EmitF32ToF16RtzBits(state, arg1), ConstantU32(state, 16));
-	return Binary(state, spv::OpBitwiseOr, TypeU32(state), low, high);
+	return EmitNative<spv::OpBitFieldInsert, IR::Type::U32>(
+	    state, EmitF32ToF16RtzBits(state, arg0), EmitF32ToF16RtzBits(state, arg1),
+	    ConstantU32(state, 16), ConstantU32(state, 16));
 }
 
 uint32_t EmitFPSaturate32(EmitterState& state, uint32_t arg0) {
-	return EmitExt(state, TypeF32(state), GLSLstd450FClamp,
+	if (!ShaderNanClamp()) {
+		return EmitExt(state, TypeF32(state), GLSLstd450FClamp,
+		               {arg0, ConstantF32(state, 0), ConstantF32(state, 0x3f800000u)});
+	}
+	// The clamp modifier runs in DX10 clamp mode: NaN becomes 0, as NClamp's NMax step does.
+	return EmitExt(state, TypeF32(state), GLSLstd450NClamp,
 	               {arg0, ConstantF32(state, 0), ConstantF32(state, 0x3f800000u)});
 }
 
@@ -452,14 +462,6 @@ uint32_t EmitSMulHi(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 
 uint32_t EmitUMulHi(EmitterState& state, uint32_t arg0, uint32_t arg1) {
 	return EmitMulHigh(state, arg0, arg1, false);
-}
-
-uint32_t EmitBitCount64(EmitterState& state, uint32_t arg0) {
-	// Vulkan bit-count operands remain 32-bit, including when counting a U64.
-	const auto unpacked = Unary(state, spv::OpBitcast, TypeU32Vector(state, 2), arg0);
-	const auto pair =
-	    ExtractPair(state, Unary(state, spv::OpBitCount, TypeU32Vector(state, 2), unpacked));
-	return Binary(state, spv::OpIAdd, TypeU32(state), pair.low, pair.high);
 }
 
 uint32_t EmitSMinTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint32_t arg2) {
@@ -524,8 +526,13 @@ uint32_t EmitFPMaxTri32(EmitterState& state, uint32_t arg0, uint32_t arg1, uint3
 	return EmitFMinMax3(state, arg0, arg1, arg2, true);
 }
 
+// KYTY_FAST_DENORM: skip the explicit input flush (see spirvHalfLanes.h).
+static uint32_t FlushInputDenorm(EmitterState& state, uint32_t value) {
+	return FastDenormEnabled() ? value : EmitFlushF32DenormToSignedZero(state, value);
+}
+
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
-	const auto source = EmitFlushF32DenormToSignedZero(state, arg0);
+	const auto source = FlushInputDenorm(state, arg0);
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
 }
 
@@ -541,22 +548,23 @@ uint32_t EmitFPRecipIFlag32(EmitterState& state, uint32_t arg0) {
 
 uint32_t EmitFPRecipSqrt32(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450InverseSqrt,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {FlushInputDenorm(state, arg0)});
 }
 
 uint32_t EmitFPSqrt(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Sqrt,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {FlushInputDenorm(state, arg0)});
 }
 
 uint32_t EmitFPExp2(EmitterState& state, uint32_t arg0) {
+	// KYTY_FAST_DENORM: FlushInputDenorm matches upstream's no-flush when fast-denorm is on.
 	return EmitExt(state, TypeF32(state), GLSLstd450Exp2,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {FlushInputDenorm(state, arg0)});
 }
 
 uint32_t EmitFPLog2(EmitterState& state, uint32_t arg0) {
 	return EmitExt(state, TypeF32(state), GLSLstd450Log2,
-	               {EmitFlushF32DenormToSignedZero(state, arg0)});
+	               {FlushInputDenorm(state, arg0)});
 }
 
 uint32_t EmitFPLdexp(EmitterState& state, uint32_t arg0, uint32_t arg1) {

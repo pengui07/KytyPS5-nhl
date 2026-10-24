@@ -4,6 +4,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/runtimeFlags.h"
@@ -34,6 +35,10 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#if defined(_M_X64) || defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace Libs::Graphics {
 
@@ -90,6 +95,26 @@ const bool g_perf_no_sync_readback = EnvFlag("KYTY_PERF_NO_SYNC_READBACK");
 
 bool PerfStatsEnabled() {
 	return g_perf_stats_enabled;
+}
+
+std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandScheduler& scheduler,
+                                        StreamBuffer& staging, uint64_t size, uint64_t alignment,
+                                        vk::BufferUsageFlags usage, const auto& write) {
+	const auto [mapped, offset] = staging.Map(size, alignment);
+	if (mapped != nullptr) {
+		write(mapped, offset);
+		staging.Commit();
+		return {&staging, offset};
+	}
+
+	// Large transfers use the same one-time host allocation as ordinary buffer uploads.
+	auto temporary = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Upload, 0,
+	                                         usage, size);
+	write(temporary->Mapped().data(), 0);
+	temporary->Flush(0, size);
+	auto* buffer = temporary.get();
+	scheduler.DeferOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
+	return {buffer, 0};
 }
 
 } // namespace
@@ -402,6 +427,59 @@ void BufferCache::RecordGpuFill(uint64_t vaddr, uint64_t size, uint32_t value) {
 	m_gpu_fill_count.store(m_gpu_fills.size(), std::memory_order_release);
 }
 
+void BufferCache::RecordGpuFillPattern(uint64_t vaddr, uint64_t size, uint32_t stride,
+                                       std::span<const uint32_t> words) {
+	if (!PerfNoSyncReadback() || words.empty() || words.size() > 4 || (vaddr & 3u) != 0 ||
+	    stride < words.size() * 4u || size == 0 || size % stride != 0 || size > UINT64_MAX - vaddr) {
+		return;
+	}
+	DropGpuFills(vaddr, size);
+	constexpr size_t MaxFills = 64;
+	if (m_gpu_fills.size() >= MaxFills) {
+		m_gpu_fills.erase(m_gpu_fills.begin());
+	}
+	GpuFill fill {vaddr, vaddr + size, words[0]};
+	fill.words  = static_cast<uint32_t>(words.size());
+	fill.stride = stride;
+	std::copy(words.begin(), words.end(), fill.pattern.begin());
+	std::array<uint8_t, 16> bytes {};
+	std::memcpy(bytes.data(), fill.pattern.data(), fill.words * 4u);
+	fill.non_uniform = std::any_of(bytes.begin(), bytes.begin() + fill.words * 4u,
+	                               [&](uint8_t byte) { return byte != bytes[0]; });
+	if (!fill.non_uniform) {
+		return; // Only non-uniform patterns are consumed; others keep the readback.
+	}
+	m_gpu_fills.push_back(fill);
+	if (FrameBreakdown::Enabled()) {
+		static std::atomic<uint64_t> recorded {0};
+		static std::atomic<int64_t>  last_print {0};
+		const auto n = recorded.fetch_add(1, std::memory_order_relaxed) + 1;
+		const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+		                        std::chrono::steady_clock::now().time_since_epoch()).count();
+		int64_t last = last_print.load(std::memory_order_relaxed);
+		if (now - last >= 5000 && last_print.compare_exchange_strong(last, now)) {
+			std::printf("NHL27PATTERN: fills recorded=%llu last=0x%llx size=0x%llx words=%u %08x %08x %08x %08x\n",
+			            static_cast<unsigned long long>(n), static_cast<unsigned long long>(vaddr),
+			            static_cast<unsigned long long>(size), fill.words, fill.pattern[0], fill.pattern[1],
+			            fill.pattern[2], fill.pattern[3]);
+			std::fflush(stdout);
+		}
+	}
+}
+
+bool BufferCache::GpuFillCoversNonUniform(uint64_t vaddr, uint64_t size) const {
+	if (size == 0 || size > UINT64_MAX - vaddr) {
+		return false;
+	}
+	for (const auto& fill: m_gpu_fills) {
+		if (fill.stride == 0 || !fill.non_uniform || vaddr < fill.begin || vaddr + size > fill.end)
+			continue;
+		// Any window of stride + element bytes holds one whole written element.
+		if (size >= uint64_t {fill.stride} + uint64_t {fill.words} * 4u) return true;
+	}
+	return false;
+}
+
 bool BufferCache::TryGetGpuFill(uint64_t vaddr, uint64_t size, uint32_t& value) const {
 	if (size == 0 || size > UINT64_MAX - vaddr) {
 		return false;
@@ -411,6 +489,7 @@ bool BufferCache::TryGetGpuFill(uint64_t vaddr, uint64_t size, uint32_t& value) 
 	}
 	std::scoped_lock lock(m_gpu_fills_mutex);
 	for (const auto& fill: m_gpu_fills) {
+		if (fill.stride != 0) continue;
 		if (vaddr >= fill.begin && vaddr + size <= fill.end && ((vaddr - fill.begin) & 3u) == 0) {
 			value = fill.value;
 			return true;
@@ -566,6 +645,9 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	if (IsBufferInvalid(id)) {
 		return;
 	}
+	if (m_async_count.load(std::memory_order_acquire) != 0) {
+		WaitAsyncReadbacksOf(id);
+	}
 	PerfCount(PerfEvent::BufferDelete);
 	Unregister(id);
 	if (m_scheduler.Active()) {
@@ -575,7 +657,165 @@ void BufferCache::DeleteBuffer(BufferId id) {
 	}
 }
 
+// The command buffer (tick) that last wrote each byte range on the GPU, finer than a buffer's
+// last_write_tick. Two direct-mapped tables keep the highest write tick seen per 4 KiB page (writes
+// up to 256 KiB) and per 1 MiB block (writes up to 64 MiB); larger writes raise one global tick
+// that every lookup includes. Collisions only make a lookup later, never earlier. Used by the
+// DirectGpuReads experiment; NHL27RBTICK (KYTY_PERF_STATS) reports what downloads wait for.
 namespace {
+namespace RangeTicks {
+constexpr uint64_t PageShift  = 12;
+constexpr uint64_t BlockShift = 20;
+constexpr uint64_t PageSlots  = uint64_t {1} << 20u;
+constexpr uint64_t BlockSlots = uint64_t {1} << 16u;
+constexpr uint64_t SmallLimit = uint64_t {256} * 1024;
+constexpr uint64_t BlockLimit = uint64_t {64} * 1024 * 1024;
+
+std::atomic<uint64_t> g_huge_tick {0};
+
+std::atomic<uint64_t>* Table(bool pages) {
+	static const auto page_table  = std::make_unique<std::atomic<uint64_t>[]>(PageSlots);
+	static const auto block_table = std::make_unique<std::atomic<uint64_t>[]>(BlockSlots);
+	return pages ? page_table.get() : block_table.get();
+}
+
+void RaiseTo(std::atomic<uint64_t>& slot, uint64_t tick) {
+	uint64_t old = slot.load(std::memory_order_relaxed);
+	while (old < tick && !slot.compare_exchange_weak(old, tick, std::memory_order_relaxed)) {
+	}
+}
+
+void Note(uint64_t vaddr, uint64_t size, uint64_t tick) {
+	if (size == 0 || size > UINT64_MAX - vaddr) {
+		return;
+	}
+	const uint64_t last = vaddr + size - 1;
+	if (size <= SmallLimit) {
+		auto* table = Table(true);
+		for (uint64_t page = vaddr >> PageShift; page <= last >> PageShift; ++page) {
+			RaiseTo(table[page & (PageSlots - 1)], tick);
+		}
+	} else if (size <= BlockLimit) {
+		auto* table = Table(false);
+		for (uint64_t block = vaddr >> BlockShift; block <= last >> BlockShift; ++block) {
+			RaiseTo(table[block & (BlockSlots - 1)], tick);
+		}
+	} else {
+		RaiseTo(g_huge_tick, tick);
+	}
+}
+
+uint64_t Lookup(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || size > UINT64_MAX - vaddr) {
+		return 0;
+	}
+	const uint64_t last  = vaddr + size - 1;
+	uint64_t       tick  = g_huge_tick.load(std::memory_order_relaxed);
+	auto*          pages = Table(true);
+	for (uint64_t page = vaddr >> PageShift; page <= last >> PageShift; ++page) {
+		tick = std::max(tick, pages[page & (PageSlots - 1)].load(std::memory_order_relaxed));
+	}
+	auto* blocks = Table(false);
+	for (uint64_t block = vaddr >> BlockShift; block <= last >> BlockShift; ++block) {
+		tick = std::max(tick, blocks[block & (BlockSlots - 1)].load(std::memory_order_relaxed));
+	}
+	return tick;
+}
+
+// [0] = second (readback) queue path, [1] = current command buffer path (flush + wait for all).
+struct PathStats {
+	std::atomic<uint64_t> n {0}, ns {0}, older_n {0}, older_ns {0}, done_n {0}, done_ns {0}, untracked_n {0};
+};
+PathStats g_paths[2];
+
+// Experiment DirectGpuReads: copies [src, src + size) out of mapped video memory into dst. That memory
+// is write-combined and uncached for the CPU, so ordinary loads cost one bus round trip per 8-16
+// bytes; streaming loads (MOVNTDQA) fetch whole 64-byte lines. The lines covering the range are read
+// in full: game buffers are page-aligned and page-sized, so they stay inside the allocation.
+#if defined(_M_X64) || defined(__x86_64__)
+#if defined(__clang__) || defined(__GNUC__)
+__attribute__((target("sse4.1")))
+#endif
+void CopyFromVideoMemory(uint8_t* dst, const uint8_t* src, uint64_t size) {
+	thread_local std::vector<__m128i> lines;
+	const auto begin = reinterpret_cast<uintptr_t>(src) & ~uintptr_t {63};
+	const auto end   = (reinterpret_cast<uintptr_t>(src) + size + 63) & ~uintptr_t {63};
+	lines.resize((end - begin) / sizeof(__m128i));
+	auto* from = reinterpret_cast<__m128i*>(begin);
+	for (size_t i = 0; i < lines.size(); i += 4) {
+		const __m128i a = _mm_stream_load_si128(from + i);
+		const __m128i b = _mm_stream_load_si128(from + i + 1);
+		const __m128i c = _mm_stream_load_si128(from + i + 2);
+		const __m128i d = _mm_stream_load_si128(from + i + 3);
+		lines[i]     = a;
+		lines[i + 1] = b;
+		lines[i + 2] = c;
+		lines[i + 3] = d;
+	}
+	std::memcpy(dst, reinterpret_cast<const uint8_t*>(lines.data()) + (reinterpret_cast<uintptr_t>(src) - begin),
+	            size);
+}
+#else
+void CopyFromVideoMemory(uint8_t* dst, const uint8_t* src, uint64_t size) {
+	std::memcpy(dst, src, size);
+}
+#endif
+
+// Experiment DirectGpuReads: downloads served from the mapped game buffer, and why others were not.
+std::atomic<uint64_t> g_direct_n {0}, g_direct_ns {0}, g_direct_bytes {0}, g_direct_busy {0},
+    g_direct_big {0}, g_direct_untracked {0}, g_direct_unmapped {0};
+
+void Record(bool second_queue, uint64_t ns, bool untracked, bool older, bool done) {
+	auto& path = g_paths[second_queue ? 0 : 1];
+	path.n.fetch_add(1, std::memory_order_relaxed);
+	path.ns.fetch_add(ns, std::memory_order_relaxed);
+	if (untracked) {
+		path.untracked_n.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		if (older) {
+			path.older_n.fetch_add(1, std::memory_order_relaxed);
+			path.older_ns.fetch_add(ns, std::memory_order_relaxed);
+		}
+		if (done) {
+			path.done_n.fetch_add(1, std::memory_order_relaxed);
+			path.done_ns.fetch_add(ns, std::memory_order_relaxed);
+		}
+	}
+	static std::mutex print_mutex;
+	static auto       last = std::chrono::steady_clock::now();
+	std::scoped_lock  lock {print_mutex};
+	const auto        now = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(5)) {
+		return;
+	}
+	const double window = std::chrono::duration<double>(now - last).count();
+	last                = now;
+	auto take = [](std::atomic<uint64_t>& v) { return v.exchange(0, std::memory_order_relaxed); };
+	std::printf("NHL27RBTICK: window=%.1fs", window);
+	for (int i = 0; i < 2; i++) {
+		auto&          p      = g_paths[i];
+		const uint64_t n      = take(p.n);
+		const double   ms     = static_cast<double>(take(p.ns)) / 1e6;
+		const uint64_t on     = take(p.older_n);
+		const double   oms    = static_cast<double>(take(p.older_ns)) / 1e6;
+		const uint64_t dn     = take(p.done_n);
+		const double   dms    = static_cast<double>(take(p.done_ns)) / 1e6;
+		const uint64_t un     = take(p.untracked_n);
+		std::printf(" | %s n=%llu ms=%.1f older=%llu(%.1fms) done=%llu(%.1fms) untracked=%llu",
+		            i == 0 ? "queue2" : "current", static_cast<unsigned long long>(n), ms,
+		            static_cast<unsigned long long>(on), oms, static_cast<unsigned long long>(dn), dms,
+		            static_cast<unsigned long long>(un));
+	}
+	std::printf(" || direct n=%llu ms=%.1f KiB=%.1f | not: busy=%llu big=%llu untracked=%llu unmapped=%llu\n",
+	            static_cast<unsigned long long>(take(g_direct_n)),
+	            static_cast<double>(take(g_direct_ns)) / 1e6, static_cast<double>(take(g_direct_bytes)) / 1024.0,
+	            static_cast<unsigned long long>(take(g_direct_busy)),
+	            static_cast<unsigned long long>(take(g_direct_big)),
+	            static_cast<unsigned long long>(take(g_direct_untracked)),
+	            static_cast<unsigned long long>(take(g_direct_unmapped)));
+	std::fflush(stdout);
+}
+} // namespace RangeTicks
 // KYTY_DBG_CP_READS=1: what the synchronous downloads wait for, printed as NHL27RBWAIT every 2 s.
 // lag = submissions between the last write of the buffer and the command buffer being recorded
 // (0: the write is in it, so it must be submitted first); done = the write had finished on the
@@ -679,6 +919,8 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 		    m_gpu_modified_ranges.Subtract(address, bytes);
 		    PublishGpuRangesVersion();
+		    ForgetColorMetadataChecks(address, bytes);
+
 	    });
 	m_last_download_bytes = 0;
 	if (copies.empty()) {
@@ -687,6 +929,79 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 	for (const auto& copy: copies) {
 		m_last_download_bytes += copy.size;
 	}
+	// NHL27RBTICK: "older" = the copied bytes were last written before the tick this download waits
+	// for; "done" = their writer had already finished on the GPU when the download started.
+	const bool tick_stats  = !async && PerfStatsEnabled();
+	uint64_t   range_tick  = 0;
+	bool       range_older = false;
+	bool       range_done  = false;
+	std::chrono::steady_clock::time_point tick_start {};
+	if (tick_stats) {
+		for (const auto& copy: copies) {
+			range_tick = std::max(range_tick, RangeTicks::Lookup(buffer_address + copy.srcOffset, copy.size));
+		}
+		const bool second_queue = buffer.last_write_tick < m_scheduler.CurrentTick() &&
+		                          Common::RuntimeFlags::Current().readback_queue;
+		range_older = range_tick < (second_queue ? buffer.last_write_tick : m_scheduler.CurrentTick());
+		range_done  = range_tick != 0 && m_scheduler.IsFree(range_tick);
+		tick_start  = std::chrono::steady_clock::now();
+	}
+	const auto note_tick = [&](bool second_queue) {
+		if (tick_stats) {
+			RangeTicks::Record(second_queue,
+			                   static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                       std::chrono::steady_clock::now() - tick_start).count()),
+			                   range_tick == 0, range_older, range_done);
+		}
+	};
+	(void)note_tick;
+
+	if constexpr (!async) {
+		// Experiment DirectGpuReads: when the last GPU writer of every copied byte has finished, read
+		// the bytes straight from the mapped game buffer instead of copying them on the GPU and
+		// waiting for that copy. Large downloads stay on the GPU path: reads of video memory over
+		// PCIe are slow per byte.
+		constexpr uint64_t DirectLimit = uint64_t {64} * 1024;
+		if (Common::Experiments::EnvEnabled(Common::Experiments::EnvBit::DirectGpuReads)) {
+			const auto start = std::chrono::steady_clock::now();
+			uint64_t   tick  = range_tick;
+			if (!tick_stats) {
+				for (const auto& copy: copies) {
+					tick = std::max(tick, RangeTicks::Lookup(buffer_address + copy.srcOffset, copy.size));
+				}
+			}
+			const auto count = [](std::atomic<uint64_t>& v) { v.fetch_add(1, std::memory_order_relaxed); };
+			if (buffer.Mapped().empty()) {
+				count(RangeTicks::g_direct_unmapped);
+			} else if (m_last_download_bytes > DirectLimit) {
+				count(RangeTicks::g_direct_big);
+			} else if (tick == 0) {
+				count(RangeTicks::g_direct_untracked);
+			} else if (!m_scheduler.IsFree(tick)) {
+				count(RangeTicks::g_direct_busy);
+			} else {
+				// Older asynchronous downloads of these bytes publish first, as on the GPU path.
+				m_scheduler.WaitPriorityOperations(tick);
+				const auto*                  gpu = buffer.Mapped().data();
+				thread_local std::vector<uint8_t> bytes;
+				for (const auto& copy: copies) {
+					buffer.Invalidate(copy.srcOffset, copy.size);
+					bytes.resize(copy.size);
+					RangeTicks::CopyFromVideoMemory(bytes.data(), gpu + copy.srcOffset, copy.size);
+					Libs::LibKernel::Memory::WriteBacking(buffer_address + copy.srcOffset, bytes.data(), copy.size);
+				}
+				count(RangeTicks::g_direct_n);
+				RangeTicks::g_direct_bytes.fetch_add(m_last_download_bytes, std::memory_order_relaxed);
+				RangeTicks::g_direct_ns.fetch_add(
+				    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+				        std::chrono::steady_clock::now() - start).count()),
+				    std::memory_order_relaxed);
+				return true;
+			}
+		}
+	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferDownloadBytes, total_size);
+
 
 	auto [mapped, offset] = m_download_buffer.Map(total_size, 64);
 	std::unique_ptr<Buffer> temporary;
@@ -786,6 +1101,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 				// Older asynchronous downloads of these bytes publish first, as on the normal path.
 				m_scheduler.WaitPriorityOperations(wait_tick);
 				publish();
+				note_tick(true);
 				wait_note.queue = true;
 				return true;
 			}
@@ -833,6 +1149,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		m_scheduler.Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		publish();
+		note_tick(false);
 	}
 	return true;
 }
@@ -972,6 +1289,10 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
 	                     "BDA Page Table Buffer");
+	m_scheduler.BeginCommand();
+	for (auto* buffer: {&m_bda_pagetable_buffer, m_fault_manager.GetFaultBuffer()}) {
+		buffer->Fill(0, buffer->Size(), 0);
+	}
 	const auto null_id =
 	    m_slot_buffers.insert(m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 16);
 	EXIT_IF(null_id != NULL_BUFFER_ID);
@@ -1282,12 +1603,33 @@ struct WriteBackStat {
 	uint64_t size   = 0;
 	uint64_t bytes  = 0;
 	bool     on_gpu = false;
+	// KYTY_DBG_WRITEBACK_DIFF: pages compared before/after the download, how many came back identical
+	// (the GPU had not changed them), total bytes that differed, and the last GPU writer of the page.
+	uint64_t    compared  = 0;
+	uint64_t    unchanged = 0;
+	uint64_t    diff_bytes = 0;
+	const char* writer     = "";
+	uint64_t    writer_hash = 0;
 };
+struct WriteBackDiff {
+	bool        valid      = false;
+	uint64_t    diff_bytes = 0;
+	const char* writer     = "unknown";
+	uint64_t    writer_hash = 0;
+};
+
+static bool WriteBackDiffEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_WRITEBACK_DIFF");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
 static std::mutex                                g_writeback_mutex;
 static std::unordered_map<uint64_t, WriteBackStat> g_writeback;
 
 static void WriteBackRecord(uint64_t rip, bool on_gpu, uint64_t vaddr, uint64_t size, uint64_t bytes,
-                            uint64_t ns) {
+                            uint64_t ns, const WriteBackDiff& diff = {}) {
 	std::scoped_lock lock {g_writeback_mutex};
 	const uint64_t   key = rip != 0 ? rip
 	                                : (uint64_t {1} << 63u) | (on_gpu ? uint64_t {1} << 62u : 0u) |
@@ -1300,6 +1642,13 @@ static void WriteBackRecord(uint64_t rip, bool on_gpu, uint64_t vaddr, uint64_t 
 	stat.ns += ns;
 	stat.bytes += bytes;
 	stat.vaddr = vaddr;
+	if (diff.valid) {
+		stat.compared++;
+		stat.unchanged += diff.diff_bytes == 0 ? 1 : 0;
+		stat.diff_bytes += diff.diff_bytes;
+		stat.writer      = diff.writer;
+		stat.writer_hash = diff.writer_hash;
+	}
 	static auto last = std::chrono::steady_clock::now();
 	const auto  now  = std::chrono::steady_clock::now();
 	if (now - last < std::chrono::seconds(5)) {
@@ -1317,9 +1666,11 @@ static void WriteBackRecord(uint64_t rip, bool on_gpu, uint64_t vaddr, uint64_t 
 			std::snprintf(rip, sizeof(rip), "0x%016" PRIx64, stat.rip);
 		}
 		std::printf("NHL27WRITEBACK: rip=%s thread=%s size=0x%" PRIx64 " count=%" PRIu64
-		            " ms=%.1f downloaded_KiB=%.1f last_vaddr=0x%016" PRIx64 "\n",
+		            " ms=%.1f downloaded_KiB=%.1f last_vaddr=0x%016" PRIx64
+		            " compared=%" PRIu64 " unchanged=%" PRIu64 " diff_bytes=%" PRIu64 " writer=%s:%016" PRIx64 "\n",
 		            rip, stat.on_gpu ? "gpu" : "guest", stat.size, stat.count,
-		            static_cast<double>(stat.ns) / 1e6, static_cast<double>(stat.bytes) / 1024.0, stat.vaddr);
+		            static_cast<double>(stat.ns) / 1e6, static_cast<double>(stat.bytes) / 1024.0, stat.vaddr,
+		            stat.compared, stat.unchanged, stat.diff_bytes, stat.writer, stat.writer_hash);
 	}
 	std::fflush(stdout);
 }
@@ -1341,6 +1692,56 @@ void BufferCache::NoteDirtyRead(uint64_t vaddr, uint64_t size) {
 		m_watched_next                   = (m_watched_next + 1) % MaxWatched;
 	}
 }
+
+// Experiment AsyncReadback (KYTY_ASYNC_READBACK): see BufferCache::ReadMemory.
+struct BufferCache::AsyncReadback {
+	uint64_t                                    vaddr          = 0;
+	uint64_t                                    size           = 0;
+	bool                                        is_write       = false;
+	bool                                        stale          = false;
+	BufferId                                    buffer_id      = NULL_BUFFER_ID;
+	uint64_t                                    buffer_address = 0;
+	uint64_t                                    wait_tick      = 0;
+	uint64_t                                    total          = 0;
+	vk::CommandBuffer                           command        = nullptr;
+	vk::Fence                                   fence          = nullptr;
+	std::unique_ptr<Buffer>                     staging;
+	std::vector<vk::BufferCopy>                 copies;
+	std::vector<std::pair<uint64_t, uint64_t>>  ranges; // download ranges (address, bytes)
+};
+
+namespace {
+// NHL27ASYNCRB (KYTY_PERF_STATS): async readbacks every 5 s.
+struct AsyncReadbackStats {
+	std::atomic<uint64_t> started {0};
+	std::atomic<uint64_t> stale {0};
+	std::atomic<uint64_t> sync {0};
+	std::atomic<uint64_t> wait_ns {0};
+	std::atomic<int64_t>  last_print_ms {0};
+};
+AsyncReadbackStats g_async_rb_stats;
+
+void AsyncReadbackMaybePrint() {
+	if (!FrameBreakdown::Enabled()) return;
+	auto&      s      = g_async_rb_stats;
+	const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+	                        std::chrono::steady_clock::now().time_since_epoch()).count();
+	const auto last = s.last_print_ms.load(std::memory_order_relaxed);
+	if (last == 0) {
+		s.last_print_ms.store(now_ms, std::memory_order_relaxed);
+		return;
+	}
+	if (now_ms - last < 5000) return;
+	s.last_print_ms.store(now_ms, std::memory_order_relaxed);
+	std::printf("NHL27ASYNCRB: window=%.1fs started=%llu stale=%llu sync=%llu guest_wait_ms=%.1f\n",
+	            static_cast<double>(now_ms - last) / 1000.0,
+	            static_cast<unsigned long long>(s.started.exchange(0, std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(s.stale.exchange(0, std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(s.sync.exchange(0, std::memory_order_relaxed)),
+	            static_cast<double>(s.wait_ns.exchange(0, std::memory_order_relaxed)) / 1e6);
+	std::fflush(stdout);
+}
+} // namespace
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadCaller caller) {
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
@@ -1601,6 +2002,34 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 	}
 }
 
+void BufferCache::NoteAsyncReadbackWrite(uint64_t vaddr, uint64_t size) {
+	const auto       end = vaddr + size;
+	std::scoped_lock lock(m_async_mutex);
+	for (auto* readback: m_async_readbacks) {
+		for (const auto& [address, bytes]: readback->ranges) {
+			if (address < end && vaddr < address + bytes) {
+				readback->stale = true;
+				break;
+			}
+		}
+	}
+}
+
+// A buffer an async copy still reads must not be destroyed before the copy finished.
+void BufferCache::WaitAsyncReadbacksOf(BufferId id) {
+	std::vector<vk::Fence> fences;
+	{
+		std::scoped_lock lock(m_async_mutex);
+		for (const auto* readback: m_async_readbacks) {
+			if (readback->buffer_id == id) fences.push_back(readback->fence);
+		}
+	}
+	if (!fences.empty()) {
+		EXIT_NOT_IMPLEMENTED(m_graphics.device.waitForFences(static_cast<uint32_t>(fences.size()), fences.data(),
+		                                                     VK_TRUE, UINT64_MAX) != vk::Result::eSuccess);
+	}
+}
+
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
@@ -1679,6 +2108,12 @@ void BufferCache::JoinOverlap(BufferId new_id, BufferId overlap_id, bool accumul
 	}
 	new_buffer.CopyFrom(m_scheduler.Current(), overlap, 0,
 	                    overlap.CpuAddress() - new_buffer.CpuAddress(), overlap.Size());
+	if (IsRegionGpuModified(overlap.CpuAddress(), overlap.Size())) {
+		// The GPU-written bytes exist in the new buffer only once this copy runs: a download must
+		// wait for the current command buffer, not for the old buffer's writers.
+		new_buffer.last_write_tick = m_scheduler.CurrentTick();
+		RangeTicks::Note(overlap.CpuAddress(), overlap.Size(), m_scheduler.CurrentTick());
+	}
 	DeleteBuffer(overlap_id);
 }
 
@@ -1783,6 +2218,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (copies.empty()) {
 		return nullptr;
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
 
 	auto [mapped, base_offset] = m_staging_buffer.Map(total_size, 4);
 	if (mapped != nullptr) {
@@ -1974,6 +2410,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	if (is_written) {
 		buffer.last_write_tick = m_scheduler.CurrentTick();
+		RangeTicks::Note(vaddr, size, buffer.last_write_tick);
 		if (PerfStatsEnabled()) {
 			LogGpuWrite(vaddr, size);
 		}
@@ -1987,6 +2424,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 			PublishGpuRangesVersion();
 			PageWriteSeq::RaiseCurrent(vaddr, size);
 		}
+		if (m_async_count.load(std::memory_order_acquire) != 0) {
+			NoteAsyncReadbackWrite(vaddr, size);
+		}
 		++m_gpu_dirty_generation;
 		if (!m_watched_writes.empty() && !m_submit_requested &&
 		    Common::Experiments::Enabled(Common::Experiments::EarlySubmitWriters)) {
@@ -1997,6 +2437,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 				}
 			}
 		}
+		ForgetColorMetadataChecks(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
@@ -2126,12 +2567,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
-	auto [staging, stage_offset] = m_staging_buffer.Map(size, 16);
-	if (staging == nullptr || !Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, staging, size)) {
-		EXIT("BufferCache: failed to read mapped guest image backing\n");
-	}
-	m_staging_buffer.Commit();
-	return {&m_staging_buffer, stage_offset};
+	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
+	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
+	    [&](uint8_t* mapped, uint64_t) {
+		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
+			EXIT("BufferCache: failed to read mapped guest image backing\n");
+		}
+	});
 }
 
 void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds) {
@@ -2220,6 +2662,29 @@ bool BufferCache::IsRegionRegistered(uint64_t vaddr, uint64_t size) {
 	}
 	const auto& [address, id] = *std::prev(candidate);
 	return address + m_slot_buffers[id].Size() > vaddr;
+}
+
+void BufferCache::MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) {
+	for (uint32_t slot = 0; slot < m_checked_color_metadata.size(); slot++) {
+		if ((keys & (1u << slot)) != 0) {
+			m_checked_color_metadata[slot].Add(vaddr, size);
+		}
+	}
+}
+
+bool BufferCache::IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const {
+	for (uint32_t slot = 0; slot < m_checked_color_metadata.size(); slot++) {
+		if ((keys & (1u << slot)) != 0 && !m_checked_color_metadata[slot].Contains(vaddr, size)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void BufferCache::ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size) {
+	for (auto& checked: m_checked_color_metadata) {
+		checked.Subtract(vaddr, size);
+	}
 }
 
 bool BufferCache::IsRegionGpuModified(uint64_t vaddr, uint64_t size) {
@@ -2397,8 +2862,49 @@ void BufferCache::NoteDirtyRead(uint64_t vaddr, uint64_t size, bool changed, con
 	SpecMaybePrint();
 }
 
+bool BufferCache::IsStrictRefused(uint64_t vaddr, uint64_t size) {
+	if (size == 0 || size > SpecMaxBytes || !Common::Experiments::EnvEnabled(Common::Experiments::EnvBit::SpeculateStrict)) {
+		return false;
+	}
+	std::scoped_lock lock(g_spec_mutex);
+	const auto       it = g_spec_reads.find(SpecKey(vaddr, size));
+	return it != g_spec_reads.end() && (it->second.changed >= 2 || it->second.mispredicts > 0);
+}
+
+// KYTY_SPECULATE_NO_GUESS: keep the dirty-read bookkeeping (changes, strict refusals, which
+// KYTY_SRT_UNION_DIRTY relies on) but return no guess, so those reads download. "1" = for every
+// shader; otherwise a comma-separated list of shader hashes (hex), e.g. 45066550b711ac4b, whose
+// lighting tables are the suspected cause of dark/brown players. Other shaders keep guessing.
+static bool SpeculateNoGuess(uint64_t shader) {
+	struct Config {
+		bool                  all = false;
+		std::vector<uint64_t> shaders;
+	};
+	static const Config config = [] {
+		Config      c;
+		const char* value = std::getenv("KYTY_SPECULATE_NO_GUESS");
+		if (value == nullptr || value[0] == '\0' || value[0] == '0') return c;
+		if (value[0] == '1' && value[1] == '\0') {
+			c.all = true;
+			return c;
+		}
+		for (const char* p = value; *p != '\0';) {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(p, &end, 16);
+			if (end == p) break;
+			c.shaders.push_back(hash);
+			p = (*end == ',') ? end + 1 : end;
+		}
+		return c;
+	}();
+	if (config.all) return true;
+	return !config.shaders.empty() &&
+	       std::find(config.shaders.begin(), config.shaders.end(), shader) != config.shaders.end();
+}
+
 bool BufferCache::TrySpeculativeRead(uint64_t vaddr, void* data, uint64_t size) {
-	if (size == 0 || size > SpecMaxBytes || data == nullptr || !GuestGpu::IsGpuThread()) {
+	if (size == 0 || size > SpecMaxBytes || data == nullptr || !GuestGpu::IsGpuThread() ||
+	    SpeculateNoGuess(Libs::LibKernel::Memory::ReadContext())) {
 		return false;
 	}
 	const auto key = SpecKey(vaddr, size);
@@ -2406,6 +2912,13 @@ bool BufferCache::TrySpeculativeRead(uint64_t vaddr, void* data, uint64_t size) 
 		std::scoped_lock lock(g_spec_mutex);
 		const auto       it = g_spec_reads.find(key);
 		if (it == g_spec_reads.end() || it->second.stable < SpecStableNeeded) {
+			return false;
+		}
+		// Experiment SpeculateStrict: bytes the GPU really changes (seen changing twice, or a
+		// wrong guess) are always downloaded. A wrong guess is only found after the frame used
+		// it, so NHL 27's lighting tables that change now and then must not be guessed.
+		if (Common::Experiments::EnvEnabled(Common::Experiments::EnvBit::SpeculateStrict) &&
+		    (it->second.changed >= 2 || it->second.mispredicts > 0)) {
 			return false;
 		}
 	}
@@ -2522,6 +3035,7 @@ void BufferCache::RunGarbageCollector() {
 				m_released_ranges.Add(buffer.CpuAddress(), buffer.Size());
 			}
 			DeleteBuffer(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferEvictions);
 		}
 		return ++retire_count == limit;
 	});
@@ -2575,12 +3089,37 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 		    start, finish - start, [&](uint64_t page, uint64_t bytes) {
 			    const auto first = std::max(page, start);
 			    const auto last  = std::min(page + bytes, finish);
-			    std::unique_lock ranges_lock(m_gpu_ranges_mutex);
-			    m_gpu_modified_ranges.Add(first, last - first);
-			    PublishGpuRangesVersion();
-			    PageWriteSeq::RaiseCurrent(first, last - first);
+			    RangeTicks::Note(first, last - first, m_scheduler.CurrentTick());
+			    {
+				    std::unique_lock ranges_lock(m_gpu_ranges_mutex);
+				    m_gpu_modified_ranges.Add(first, last - first);
+				    PublishGpuRangesVersion();
+				    PageWriteSeq::RaiseCurrent(first, last - first);
+			    }
+			    if (m_async_count.load(std::memory_order_acquire) != 0) {
+				    NoteAsyncReadbackWrite(first, last - first);
+			    }
 		    });
 	}
+}
+
+void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
+	// Only tracking regions with pending CPU writes can have anything to upload.
+	m_memory_tracker.ForEachCpuDirtySpan(vaddr, size, [&](uint64_t span, uint64_t span_size) {
+		const auto end = span + span_size;
+		auto       it  = m_buffers.upper_bound(span);
+		if (it != m_buffers.begin()) {
+			--it;
+		}
+		for (; it != m_buffers.end() && it->first < end; ++it) {
+			auto&      buffer = m_slot_buffers[it->second];
+			const auto start  = std::max(buffer.CpuAddress(), span);
+			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
+			if (start < finish) {
+				(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
+			}
+		}
+	});
 }
 
 uint64_t BufferCache::SynchronizeBuffersInRanges(const RangeSet& ranges, bool full) {
@@ -2679,25 +3218,6 @@ void BufferCache::SynchronizeDirtyRegionsInRanges(const RangeSet& ranges, bool a
 	for (const auto& [index, epoch]: m_sync_regions) {
 		m_synced_region_epochs[index] = epoch;
 	}
-}
-
-void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
-	// Only tracking regions with pending CPU writes can have anything to upload.
-	m_memory_tracker.ForEachCpuDirtySpan(vaddr, size, [&](uint64_t span, uint64_t span_size) {
-		const auto end = span + span_size;
-		auto       it  = m_buffers.upper_bound(span);
-		if (it != m_buffers.begin()) {
-			--it;
-		}
-		for (; it != m_buffers.end() && it->first < end; ++it) {
-			auto&      buffer = m_slot_buffers[it->second];
-			const auto start  = std::max(buffer.CpuAddress(), span);
-			const auto finish = std::min(buffer.CpuAddress() + buffer.Size(), end);
-			if (start < finish) {
-				(void)SynchronizeBuffer(buffer, start, finish - start, false, false);
-			}
-		}
-	});
 }
 
 } // namespace Libs::Graphics

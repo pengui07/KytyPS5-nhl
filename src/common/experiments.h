@@ -159,6 +159,30 @@ extern std::atomic<uint64_t> g_mask;
 // reads of clean bytes on GPU-written pages through the backing.
 [[nodiscard]] bool FalseShareReads() noexcept;
 
+// KYTY_DIRECT_GPU_READS=1 at startup: game buffers are allocated CPU-visible (Resizable BAR) and every
+// submission makes its writes visible to the CPU. Fixed for the whole run; the DirectGpuReads bit
+// only decides whether downloads use it.
+[[nodiscard]] bool DirectGpuReadsMemory() noexcept;
+
+// KYTY_SRT_UNION_DIRTY=1 at startup (default off): when a shader-table branch condition would need
+// GPU-written bytes that are not downloaded yet, the walker does not wait for them. It treats the
+// branch as "could go either way" and keeps the resources of both sides (RefreshDirectControlFlow).
+[[nodiscard]] bool SrtUnionDirty() noexcept;
+// Set by the walker while it evaluates such a condition: strict reads of GPU-dirty bytes then fail
+// instead of downloading (TryReadBufferBacking).
+inline thread_local bool g_no_wait_dirty_reads = false;
+
+// Experiments of the NHL 27 Stage 1.5/2 line, read from the environment only: the mask has no
+// bits left (they had taken bits 38-43 of the perf line's experiments).
+//   ProgramLockSplit: KYTY_PROGRAM_LOCK_SPLIT (default off; the resolve thread walks shader tables without holding the program lock)
+//   FillPatterns: KYTY_FILL_PATTERNS (default off; a proven compute fill of a repeating 2-4 word pattern is remembered like a uniform fill, so color-clear decoding needs no readback)
+//   UnmapBufferWait: KYTY_UNMAP_BUFFER_WAIT (default off; an unmap of GPU-written buffer bytes waits only for their writers, not for the whole GPU)
+//   DirectGpuReads: KYTY_DIRECT_GPU_READS (default off; downloads of bytes whose GPU writer already finished read the mapped game buffer, needs the same variable at startup)
+//   AsyncReadback: KYTY_ASYNC_READBACK (default off; guest and command-processor downloads wait on their own thread, not the execution thread)
+//   SpeculateStrict: KYTY_SPECULATE_STRICT (default off; with SpeculateDirtyReads, never guess bytes that changed twice or were guessed wrong once)
+enum class EnvBit { ProgramLockSplit, FillPatterns, UnmapBufferWait, DirectGpuReads, AsyncReadback, SpeculateStrict };
+[[nodiscard]] bool EnvEnabled(EnvBit bit) noexcept;
+
 } // namespace Common::Experiments
 
 namespace Common::Timeline {
@@ -173,5 +197,15 @@ void Mark(const char* what, uint64_t value = 0) noexcept;
 void MarkStack() noexcept;
 
 } // namespace Common::Timeline
+
+namespace Common::Sampler {
+
+// Diagnostics: KYTY_PERF_SAMPLE=1 samples the registered threads about 1000 times a second
+// (suspend, read the instruction pointer, unwind) and every 10 s prints the functions they were
+// in (NHL27SAMPLE self = innermost function, incl = anywhere on the stack). Addresses are
+// absolute; for the exe (fixed base 0x140000000) resolve them with the linker map.
+void RegisterCurrentThread(const char* name) noexcept;
+
+} // namespace Common::Sampler
 
 #endif // EMULATOR_SRC_COMMON_EXPERIMENTS_H_

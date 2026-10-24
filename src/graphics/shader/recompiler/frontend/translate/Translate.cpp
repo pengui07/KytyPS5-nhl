@@ -299,15 +299,11 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 				value               = ir.ShiftLeftLogical(extended, IR::U32(IR::Value(offset)));
 				break;
 			}
-			case 2: {
-				const uint32_t field_mask = width == 32u ? 0xffffffffu : (1u << width) - 1u;
-				const auto     inserted =
-				    ir.ShiftLeftLogical(ir.BitwiseAnd(value, IR::U32(IR::Value(field_mask))),
-				                        IR::U32(IR::Value(offset)));
-				const auto cleared = ir.BitwiseAnd(ReadRawU32(PlainOperand(operand)),
-				                                   IR::U32(IR::Value(~(field_mask << offset))));
-				value              = ir.BitwiseOr(cleared, inserted);
-			} break;
+			case 2:
+				value = IR::U32(ir.Emit(IR::ValueOpcode::BitFieldInsert,
+				                        {ReadRawU32(PlainOperand(operand)), value, IR::Value(offset),
+				                         IR::Value(width)}));
+				break;
 			default: EXIT("reserved SDWA DST_U mode");
 		}
 	}
@@ -315,7 +311,7 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 		case Decoder::OperandKind::Sgpr: {
 			const auto reg = static_cast<IR::ScalarReg>(operand.reg);
 			ir.SetScalarReg(reg, value);
-			program.scalar_writes.push_back({current_pc, reg});
+			program.scalar_writes.push_back({current_pc, reg, value});
 			ir.SetScalarMaskTag(reg, IR::U1(IR::Value(false)));
 			if (IR::RegIndex(reg) > 0u) {
 				ir.SetScalarMaskTag(static_cast<IR::ScalarReg>(IR::RegIndex(reg) - 1u),
@@ -326,7 +322,10 @@ void Translator::WriteRawU32(const Decoder::Operand& operand, IR::U32 value) {
 		case Decoder::OperandKind::Vgpr: {
 			const auto reg = static_cast<IR::VectorReg>(operand.reg);
 			const auto old = ir.GetVectorReg(reg);
-			if (operand.dpp) {
+			// DPP skips EXEC lanes only through row/bank masks, or for invalid sources without
+			// BOUND_CTRL (dpp8 reads zero); otherwise it is a plain masked write.
+			if (operand.dpp && (operand.dpp_row_mask != 0xfu || operand.dpp_bank_mask != 0xfu ||
+			                    (!operand.dpp_bound_ctrl && !operand.dpp8))) {
 				value = IR::U32(ir.Emit(IR::ValueOpcode::DppUpdateU32, {value, old, ir.GetExec()},
 				                        DppFlags(operand)));
 			} else {
@@ -456,7 +455,10 @@ void Translator::Write16Bits(const Decoder::Operand& operand, IR::U32 value) {
 	destination.omod   = 0u;
 	destination.op_sel = false;
 	destination.clamp  = false;
-	WriteRawU32(destination, ir.BitwiseAnd(value, IR::U32(IR::Value(0xffffu))));
+	// A field selector keeps only the field's bits; a full-dword SDWA selector zero-extends.
+	WriteRawU32(destination, destination.sdwa_sel == 6u
+	                             ? ir.BitwiseAnd(value, IR::U32(IR::Value(0xffffu)))
+	                             : value);
 }
 
 void Translator::WriteF16(const Decoder::Operand& operand, IR::F32 value) {
@@ -487,10 +489,10 @@ std::array<IR::U32, 2> Translator::ReadU32Pair(const Decoder::Operand& operand) 
 	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
 		// A 64-bit operand (integer or float) receives the double-precision encoding of a
 		// float inline constant: s_mov_b64 s[0:1], 1.0 yields 0x3ff0000000000000.
-		const auto bits = operand.value == 0x3e22f983u
-		                      ? 0x3fc45f306dc9c882ull
-		                      : std::bit_cast<uint64_t>(
-		                            static_cast<double>(std::bit_cast<float>(operand.value)));
+		const auto bits =
+		    operand.value == 0x3e22f983u
+		        ? 0x3fc45f306dc9c882ull
+		        : std::bit_cast<uint64_t>(static_cast<double>(std::bit_cast<float>(operand.value)));
 		return {IR::U32(IR::Value(static_cast<uint32_t>(bits))),
 		        IR::U32(IR::Value(static_cast<uint32_t>(bits >> 32u)))};
 	}
@@ -552,9 +554,11 @@ IR::U32 Translator::Read16LaneBits(const Decoder::Operand& operand, bool high_la
 	auto bits             = ReadRawU32(operand);
 	if (operand.kind == Decoder::OperandKind::FloatInlineConstant) {
 		// Inline floats encode the operand's width before SDWA or OP_SEL selects bits.
-		const auto half      = IR::F16(ir.Emit(IR::ValueOpcode::ConvertF16F32, {ir.BitCastF32(bits)}));
-		const auto half_bits = IR::U16(ir.Emit(IR::ValueOpcode::BitCastU16F16, {half}));
-		bits                = IR::U32(ir.Emit(IR::ValueOpcode::ConvertU32U16, {half_bits}));
+		const auto value = operand.value;
+		bits             = IR::U32(IR::Value(value == 0x3e22f983u
+		                                         ? 0x3118u
+		                                         : ((value >> 16u) & 0x8000u) |
+		                                               ((((value >> 23u) & 0xffu) - 112u) << 10u)));
 	}
 	bits = ApplyBitSourceModifiers(raw_operand, bits);
 	uint32_t offset = (high_lane ? operand.op_sel_hi : operand.op_sel) ? 16u : 0u;
@@ -694,13 +698,13 @@ std::array<IR::U32, 2> Translator::WriteMask(const Decoder::Operand& operand, IR
 				                    IR::U1(IR::Value(false)));
 			}
 			ir.SetScalarReg(reg, mask[0]);
-			program.scalar_writes.push_back({current_pc, reg});
+			program.scalar_writes.push_back({current_pc, reg, mask[0]});
 			// A wave32 VALU mask destination must not overwrite the neighboring SGPR.
 			if ((write_64 || program.wave_size == 64u) &&
 			    IR::RegIndex(reg) + 1u < IR::NumScalarRegs) {
 				const auto high = static_cast<IR::ScalarReg>(IR::RegIndex(reg) + 1u);
 				ir.SetScalarReg(high, mask[1]);
-				program.scalar_writes.push_back({current_pc, high});
+				program.scalar_writes.push_back({current_pc, high, mask[1]});
 				ir.SetThreadBitScalarReg(high, IR::U1(IR::Value(false)));
 				ir.SetScalarMaskTag(high, IR::U1(IR::Value(false)));
 			}
@@ -746,14 +750,16 @@ void Translator::WriteCompareResult(const Decoder::Operand& operand, IR::U1 valu
 void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
                                     IR::Block& info) {
 	const auto native_condition = [&](CFG::BranchCondition kind) -> IR::U1 {
+		// A zero kind negates the vote of the nonzero kind that follows it in the enum.
+		const bool zero = kind == CFG::BranchCondition::SccZero ||
+		                  kind == CFG::BranchCondition::VccZero ||
+		                  kind == CFG::BranchCondition::ExecZero;
+		if (zero) kind = static_cast<CFG::BranchCondition>(static_cast<int>(kind) + 1);
 		IR::U1 condition;
 		switch (kind) {
 			case CFG::BranchCondition::Always: condition = IR::U1(IR::Value(true)); break;
-			case CFG::BranchCondition::SccZero: condition = ir.LogicalNot(ir.GetScc()); break;
 			case CFG::BranchCondition::SccNonZero: condition = ir.GetScc(); break;
-			case CFG::BranchCondition::VccZero: condition = ir.LogicalNot(ir.GetVcc()); break;
 			case CFG::BranchCondition::VccNonZero: condition = ir.GetVcc(); break;
-			case CFG::BranchCondition::ExecZero: condition = ir.LogicalNot(ir.GetExec()); break;
 			case CFG::BranchCondition::ExecNonZero: condition = ir.GetExec(); break;
 			case CFG::BranchCondition::ScalarInstruction:
 				EXIT_IF(instruction_branch_condition.IsEmpty());
@@ -761,7 +767,8 @@ void Translator::AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlo
 				break;
 			default: EXIT("block %u has an invalid native branch condition", source.id);
 		}
-		return IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {condition}, kind));
+		const auto vote = IR::U1(ir.Emit(IR::ValueOpcode::ConditionRef, {condition}, kind));
+		return zero ? ir.LogicalNot(vote) : vote;
 	};
 	const auto selector_eq = [&](uint32_t code, uint32_t value) -> IR::U1 {
 		return ir.IEqual(ReadScalarCode(code), IR::U32(IR::Value(value)));
@@ -1176,9 +1183,14 @@ void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_
 		switch (inst.opcode) {
 			case Decoder::Opcode::DS_ADD_U64:
 			case Decoder::Opcode::DS_OR_B64:
+			case Decoder::Opcode::DS_MAX_RTN_U64:
 			case Decoder::Opcode::DS_WRITE_B64:
 			case Decoder::Opcode::DS_WRITE_B96:
 			case Decoder::Opcode::DS_WRITE_B128: include_vector(inst.src1, inst.data_dwords); break;
+			case Decoder::Opcode::DS_CMPST_RTN_B64:
+				include_vector(inst.src1, 2u);
+				include_vector(inst.src2, 2u);
+				break;
 			case Decoder::Opcode::DS_WRITE2_B32:
 			case Decoder::Opcode::DS_WRITE2ST64_B32:
 			case Decoder::Opcode::DS_WRITE2_B64:
@@ -1206,30 +1218,6 @@ void ValidateTranslateOptions(const TranslateOptions& options) {
 	if (options.embedded_fetch != nullptr && options.stage != ShaderType::Vertex &&
 	    options.stage != ShaderType::Local) {
 		EXIT("embedded fetch requires a vertex or local shader");
-	}
-	switch (options.stage) {
-		case ShaderType::Vertex:
-		case ShaderType::Local:
-		case ShaderType::TessellationControl:
-		case ShaderType::TessellationEvaluation:
-		case ShaderType::Mesh:
-			if (options.input_info.vertex == nullptr) {
-				EXIT("vertex shader translation has no vertex input metadata");
-			}
-			return;
-		case ShaderType::Pixel:
-			if (options.input_info.pixel == nullptr) {
-				EXIT("pixel shader translation has no pixel input metadata");
-			}
-			return;
-		case ShaderType::Compute:
-			if (options.input_info.compute == nullptr) {
-				EXIT("compute shader translation has no compute input metadata");
-			}
-			return;
-		default:
-			EXIT("shader translation has unsupported stage %u",
-			     static_cast<uint32_t>(options.stage));
 	}
 }
 
@@ -1264,7 +1252,9 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		case ShaderType::Compute:
 			result.scratch_dwords = options.input_info.compute->scratch_size_dwords;
 			break;
-		default: break; // ValidateTranslateOptions rejects unsupported stages.
+		default:
+			EXIT("shader translation has unsupported stage %u",
+			     static_cast<uint32_t>(options.stage));
 	}
 	result.dispatcher_fallback = cfg.irreducible || cfg.unsupported;
 	result.cfg_failure_kind    = cfg.failure_kind;

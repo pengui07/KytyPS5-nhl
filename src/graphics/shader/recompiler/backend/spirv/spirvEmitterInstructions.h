@@ -1,19 +1,22 @@
 #pragma once
 
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
+#include "graphics/shader/recompiler/backend/spirv/spirvHalfLanes.h"
 
 #include <bit>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+uint32_t EmitIdentity(ValueEmitContext& ctx, uint32_t value);
+
 // Operand signatures distinguish SPIR-V IDs (uint32_t), raw literals/values
 // (IR::Value), and instructions whose metadata or operand loads must stay lazy.
 #define EMIT_NATIVE(name, opcode, type, ...)                                                       \
 	inline constexpr auto Emit##name = EmitNative<spv::opcode, IR::Type::type, __VA_ARGS__>;
-EMIT_NATIVE(BitCastU16F16, OpBitcast, U32, uint32_t)
+inline constexpr auto EmitBitCastU16F16 = EmitIdentity;
 inline constexpr auto EmitBitCastF16U16 = EmitBitCastU16F16;
 inline constexpr auto EmitConvertU32U16 = EmitBitCastU16F16;
 inline constexpr auto EmitConvertU32U8  = EmitBitCastU16F16;
-inline constexpr auto EmitBitCastU32F32 = EmitBitCastU16F16;
+EMIT_NATIVE(BitCastU32F32, OpBitcast, U32, uint32_t)
 EMIT_NATIVE(BitCastF32U32, OpBitcast, F32, uint32_t)
 EMIT_NATIVE(BitCastU64F64, OpBitcast, U64, uint32_t)
 EMIT_NATIVE(BitCastF64U64, OpBitcast, F64, uint32_t)
@@ -60,8 +63,6 @@ EMIT_NATIVE(IMul32, OpIMul, U32, uint32_t, uint32_t)
 EMIT_NATIVE(UDiv32, OpUDiv, U32, uint32_t, uint32_t)
 EMIT_NATIVE(IAdd64, OpIAdd, U64, uint32_t, uint32_t)
 EMIT_NATIVE(ISub64, OpISub, U64, uint32_t, uint32_t)
-EMIT_NATIVE(IMul64, OpIMul, U64, uint32_t, uint32_t)
-EMIT_NATIVE(IAddCarry32, OpIAddCarry, U32x2, uint32_t, uint32_t)
 uint32_t EmitSMulHi(EmitterState& state, uint32_t arg0, uint32_t arg1);
 uint32_t EmitUMulHi(EmitterState& state, uint32_t arg0, uint32_t arg1);
 inline constexpr auto EmitIAbs32 = EmitGlsl<GLSLstd450SAbs, IR::Type::U32, uint32_t>;
@@ -90,10 +91,8 @@ EMIT_NATIVE(BitwiseNot32, OpNot, U32, uint32_t)
 EMIT_NATIVE(BitwiseAnd64, OpBitwiseAnd, U64, uint32_t, uint32_t)
 EMIT_NATIVE(BitReverse32, OpBitReverse, U32, uint32_t)
 EMIT_NATIVE(BitCount32, OpBitCount, U32, uint32_t)
-uint32_t EmitBitCount64(EmitterState& state, uint32_t arg0);
 inline constexpr auto EmitFindILsb32 = EmitGlsl<GLSLstd450FindILsb, IR::Type::U32, uint32_t>;
 inline constexpr auto EmitFindUMsb32 = EmitGlsl<GLSLstd450FindUMsb, IR::Type::U32, uint32_t>;
-uint32_t EmitFindUMsb64(EmitterState& state, uint32_t arg0);
 inline constexpr auto EmitSMin32 = EmitGlsl<GLSLstd450SMin, IR::Type::U32, uint32_t, uint32_t>;
 inline constexpr auto EmitSMax32 = EmitGlsl<GLSLstd450SMax, IR::Type::U32, uint32_t, uint32_t>;
 inline constexpr auto EmitUMin32 = EmitGlsl<GLSLstd450UMin, IR::Type::U32, uint32_t, uint32_t>;
@@ -129,7 +128,7 @@ EMIT_NATIVE(LogicalNot, OpLogicalNot, U1, uint32_t)
 template <spv::Op opcode>
 uint32_t EmitFloatCompare32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// SPIR-V's DenormFlushToZero mode does not require comparison operands to flush.
-	const bool flush = inst.Flags<IR::FPCompareFlags>().flush_input_denorms;
+	const bool flush = inst.Flags<IR::FPCompareFlags>().flush_input_denorms && !FastDenormEnabled();
 	const auto operand = [&](size_t index) {
 		const auto value = inst.Arg(index);
 		if (flush && value.IsImmediate()) {
@@ -223,7 +222,6 @@ uint32_t              EmitFPSin(EmitterState& state, uint32_t arg0);
 uint32_t              EmitFPCos(EmitterState& state, uint32_t arg0);
 #undef EMIT_NATIVE
 
-uint32_t              EmitIdentity(ValueEmitContext& ctx, uint32_t value);
 void                  EmitVoid(ValueEmitContext&);
 inline constexpr auto EmitReference    = EmitVoid;
 inline constexpr auto EmitReferenceU32 = EmitVoid;
@@ -233,6 +231,7 @@ inline constexpr auto EmitTtraceData   = EmitVoid;
 inline constexpr auto EmitInstPrefetch = EmitVoid;
 void                  EmitBarrier(EmitterState& state);
 void                  EmitStoreCompletion(EmitterState& state);
+void                  EmitDataCacheInvalidate(EmitterState& state);
 void                  EmitMeshAllocate(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitMeshDrawParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetTessellationAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
@@ -241,10 +240,7 @@ uint32_t              EmitGetUserData(EmitterState& state, IR::ScalarReg reg);
 uint32_t              EmitGetDispatchThreadExtent(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetBuiltin(ValueEmitContext& ctx, IR::Value kind, IR::Value index);
 uint32_t              EmitUndefU1(EmitterState& state, const IR::Inst& inst);
-inline constexpr auto EmitUndefU8  = EmitUndefU1;
-inline constexpr auto EmitUndefU16 = EmitUndefU1;
 inline constexpr auto EmitUndefU32 = EmitUndefU1;
-inline constexpr auto EmitUndefU64 = EmitUndefU1;
 uint32_t              EmitDppMoveU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitWqmU64(EmitterState& state, uint32_t value);
@@ -254,14 +250,17 @@ uint32_t              EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& in
 uint32_t              EmitReadFirstLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitWaveReduceU32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitWriteLane(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitPermlane16U32(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitGetAttributeF16(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetInterpolationParameter(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitGetShaderBase(ValueEmitContext& ctx);
 inline constexpr auto EmitGetSrtResource     = EmitVoid;
 inline constexpr auto EmitGetBufferResource  = EmitGetSrtResource;
+uint32_t              EmitGetBufferResourceIndex(ValueEmitContext& ctx, const IR::Inst& inst);
 inline constexpr auto EmitGetAddressResource = EmitGetSrtResource;
 inline constexpr auto EmitGetScratchResource = EmitGetSrtResource;
 inline constexpr auto EmitGetImageResource   = EmitGetSrtResource;
@@ -310,6 +309,7 @@ inline constexpr auto EmitBufferAtomicSMax32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicUMax32    = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicAnd32     = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicAnd64     = EmitBufferAtomic64;
+inline constexpr auto EmitBufferAtomicIAdd64    = EmitBufferAtomic64;
 inline constexpr auto EmitBufferAtomicOr32      = EmitAtomic32;
 inline constexpr auto EmitBufferAtomicOr64      = EmitBufferAtomic64;
 inline constexpr auto EmitBufferAtomicXor32     = EmitAtomic32;
@@ -338,6 +338,9 @@ inline constexpr auto EmitSharedAtomicDec32     = EmitSharedIncDec;
 inline constexpr auto EmitSharedAtomicSMin32    = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicUMin32    = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicSMax32    = EmitAtomic32;
+inline constexpr auto EmitSharedAtomicUMax64    = EmitSharedAtomic64;
+inline constexpr auto EmitSharedAtomicCmpSwap32 = EmitAtomic32;
+inline constexpr auto EmitSharedAtomicCmpSwap64 = EmitSharedAtomic64;
 inline constexpr auto EmitSharedAtomicUMax32    = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicAnd32     = EmitAtomic32;
 inline constexpr auto EmitSharedAtomicOr32      = EmitAtomic32;

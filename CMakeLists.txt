@@ -195,7 +195,7 @@ if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0.0)
 	)
 endif()
 
-option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
+option(KYTY_BUILD_LAUNCHER "Build Slint launcher (fetches Slint, needs Rust)" ON)
 
 config_compiler_and_linker()
 
@@ -244,6 +244,8 @@ file(GLOB kyty_emulator_src CONFIGURE_DEPENDS
 	"${KYTY_SOURCE_DIR}/graphics/presentation/*.h"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/window/*.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/presentation/window/*.h"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/*.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/*.h"
 	"${KYTY_SOURCE_DIR}/kernel/*.cpp"
 	"${KYTY_SOURCE_DIR}/kernel/*.h"
 	"${KYTY_SOURCE_DIR}/loader/*.cpp"
@@ -269,6 +271,9 @@ set(gpu_tiler_shader_names
 	dispatch_guard
 	color_transform
 	color_clear_check
+	fsr_color_clean
+	fsr_ghost_guard
+	color_clear
 )
 file(GLOB gpu_tiler_shader_includes CONFIGURE_DEPENDS "${gpu_tiler_shader_dir}/gpu_tiler_*.inc")
 foreach(shader_name IN LISTS gpu_tiler_shader_names)
@@ -334,7 +339,7 @@ function(add_gpu_blit_shader shader_name shader_file)
 		        "-I${gpu_tiler_shader_dir}" -o "${shader_spv}" "${shader_source}"
 		COMMAND ${CMAKE_COMMAND} -DINPUT=${shader_spv} -DOUTPUT=${shader_header}
 		        -DSYMBOL=${shader_symbol} -P "${KYTY_SOURCE_DIR}/embed_spirv.cmake"
-		DEPENDS "${shader_source}"
+		DEPENDS "${shader_source}" ${gpu_fsr1_includes}
 		VERBATIM
 	)
 	set(gpu_blit_shader_headers ${gpu_blit_shader_headers} "${shader_header}" PARENT_SCOPE)
@@ -343,6 +348,10 @@ add_gpu_blit_shader(gpu_blit_fs_triangle gpu_blit_fs_triangle.vert)
 add_gpu_blit_shader(gpu_blit_color_to_ms_depth gpu_blit_color_to_ms_depth.frag)
 add_gpu_blit_shader(gpu_video_out_overlay gpu_video_out_overlay.frag)
 add_gpu_blit_shader(gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
+set(gpu_fsr1_include_dir "${KYTY_THIRD_PARTY_DIR}/fsr1")
+set(gpu_fsr1_includes "${gpu_fsr1_include_dir}/ffx_a.h" "${gpu_fsr1_include_dir}/ffx_fsr1.h")
+add_gpu_blit_shader(gpu_fsr1_easu gpu_fsr1.frag "-I${gpu_fsr1_include_dir}")
+add_gpu_blit_shader(gpu_fsr1_rcas gpu_fsr1.frag "-I${gpu_fsr1_include_dir}" -DFSR_RCAS=1)
 list(APPEND kyty_emulator_src ${gpu_blit_shader_headers})
 
 list(APPEND kyty_emulator_src
@@ -355,11 +364,58 @@ if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
 
-set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus)
+set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus OpenXR::openxr_loader)
 
-# Linux system libraries.
-if(LINUX)
+option(KYTY_ENABLE_FSR3 "Build experimental FSR 3.1 Vulkan backend (guest guides required)" OFF)
+set(FIDELITYFX_SDK_DIR "" CACHE PATH "FidelityFX SDK 1.1.4 with matching Vulkan libraries")
+if(KYTY_ENABLE_FSR3)
+	if(NOT WIN32)
+		message(FATAL_ERROR "The current FSR3 runtime package supports Windows x64 only")
+	endif()
+	foreach(component backend_vk fsr3upscaler)
+		set(ffx_base "${FIDELITYFX_SDK_DIR}/sdk/bin/ffx_sdk/ffx_${component}_x64")
+		if(NOT EXISTS "${ffx_base}.lib" OR NOT EXISTS "${ffx_base}.dll")
+			message(FATAL_ERROR "Missing matching FSR3 Vulkan library/runtime: ${ffx_base}")
+		endif()
+		list(APPEND kyty_fsr3_libraries "${ffx_base}.lib")
+		list(APPEND kyty_fsr3_dlls "${ffx_base}.dll")
+	endforeach()
+	include_directories(SYSTEM "${FIDELITYFX_SDK_DIR}/sdk/include")
+	add_compile_definitions(KYTY_ENABLE_FSR3=1)
+	list(APPEND kyty_emulator_link_libraries ${kyty_fsr3_libraries})
+	install(FILES ${kyty_fsr3_dlls} DESTINATION .)
+	install(FILES "${FIDELITYFX_SDK_DIR}/sdk/LICENSE.txt" DESTINATION licenses/FidelityFX-SDK)
+endif()
+install(FILES "${KYTY_THIRD_PARTY_DIR}/fsr1/LICENSE.txt" DESTINATION licenses/FSR1)
+option(KYTY_ENABLE_FSR4 "FSR 4 through a D3D12 bridge (Windows; FidelityFX SDK 2.x with its signed DLLs)" OFF)
+set(FIDELITYFX4_SDK_DIR "" CACHE PATH "FidelityFX SDK 2.x root (the folder that holds Kits)")
+if(KYTY_ENABLE_FSR4)
+	if(NOT WIN32)
+		message(FATAL_ERROR "The FSR 4 bridge needs Direct3D 12 (Windows x64 only)")
+	endif()
+	set(ffx4_kit "${FIDELITYFX4_SDK_DIR}/Kits/FidelityFX")
+	foreach(ffx4_dll amd_fidelityfx_loader_dx12 amd_fidelityfx_upscaler_dx12)
+		if(NOT EXISTS "${ffx4_kit}/signedbin/${ffx4_dll}.dll")
+			message(FATAL_ERROR "Missing FSR 4 runtime: ${ffx4_kit}/signedbin/${ffx4_dll}.dll")
+		endif()
+		list(APPEND kyty_fsr4_dlls "${ffx4_kit}/signedbin/${ffx4_dll}.dll")
+	endforeach()
+	if(NOT EXISTS "${ffx4_kit}/api/include/ffx_api.h" OR NOT EXISTS "${ffx4_kit}/upscalers/include/ffx_upscale.h")
+		message(FATAL_ERROR "Missing FSR 4 headers under ${ffx4_kit}")
+	endif()
+	include_directories(SYSTEM "${ffx4_kit}/api/include" "${ffx4_kit}/upscalers/include")
+	add_compile_definitions(KYTY_ENABLE_FSR4=1)
+	install(FILES ${kyty_fsr4_dlls} DESTINATION .)
+	if(EXISTS "${FIDELITYFX4_SDK_DIR}/LICENSE.txt")
+		install(FILES "${FIDELITYFX4_SDK_DIR}/LICENSE.txt" DESTINATION licenses/FidelityFX-SDK-2)
+	endif()
+endif()
+
+# Linux system libraries. Threads is also needed on macOS by experiments_tests.
+if(LINUX OR APPLE)
 	find_package(Threads REQUIRED)
+endif()
+if(LINUX)
 	list(APPEND kyty_emulator_link_libraries m ${CMAKE_DL_LIBS} Threads::Threads)
 endif()
 
@@ -369,7 +425,7 @@ set(inc_headers
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Tools/include
 	${KYTY_THIRD_PARTY_DIR}/SPIRV-Headers/include
 	${KYTY_THIRD_PARTY_DIR}/fmt/include
-	${KYTY_THIRD_PARTY_DIR}/xxhash
+	${KYTY_THIRD_PARTY_DIR}/xxHash
 	${KYTY_THIRD_PARTY_DIR}/cpuinfo/include
 	${KYTY_THIRD_PARTY_DIR}/renderdoc
 	${KYTY_THIRD_PARTY_DIR}/stb
@@ -452,6 +508,14 @@ add_executable(avplayer_file_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(avplayer_file_tests common FFmpeg::ffmpeg ZArchive::zarchive)
 target_include_directories(avplayer_file_tests PRIVATE ${inc_headers})
+
+add_executable(vdecsw_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/VdecswTests.cpp"
+	"${KYTY_SOURCE_DIR}/libs/videoDec2Decoder.cpp"
+	"${KYTY_SOURCE_DIR}/loader/timer.cpp"
+)
+target_link_libraries(vdecsw_tests common FFmpeg::ffmpeg)
+target_include_directories(vdecsw_tests PRIVATE ${inc_headers})
 
 add_executable(bit_array_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/BitArrayTests.cpp"
@@ -564,6 +628,22 @@ add_executable(controller_settings_tests EXCLUDE_FROM_ALL
 )
 target_link_libraries(controller_settings_tests common fmt::fmt SDL3::SDL3-static)
 target_include_directories(controller_settings_tests PRIVATE ${inc_headers})
+
+add_executable(user_service_multi_user_tests EXCLUDE_FROM_ALL
+    "${KYTY_TESTS_DIR}/UserServiceMultiUserTests.cpp"
+)
+target_link_libraries(user_service_multi_user_tests common fmt::fmt)
+target_include_directories(user_service_multi_user_tests PRIVATE ${inc_headers})
+
+add_executable(controller_sdl_integration_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/ControllerSdlIntegrationTests.cpp"
+)
+target_link_libraries(controller_sdl_integration_tests common fmt::fmt SDL3::SDL3-static)
+target_include_directories(controller_sdl_integration_tests PRIVATE ${inc_headers})
+
+add_executable(host_input_tests EXCLUDE_FROM_ALL "${KYTY_TESTS_DIR}/HostInputTests.cpp")
+target_link_libraries(host_input_tests common fmt::fmt SDL3::SDL3-static)
+target_include_directories(host_input_tests PRIVATE ${inc_headers})
 
 add_executable(save_data_memory_tests EXCLUDE_FROM_ALL
 	"${KYTY_TESTS_DIR}/SaveDataMemoryTests.cpp"
@@ -698,6 +778,7 @@ if(BUILD_TESTING)
 	add_test(NAME archive_file COMMAND $<TARGET_FILE:archive_file_tests>)
 	add_test(NAME trophy_system COMMAND $<TARGET_FILE:trophy_system_tests>)
 	add_test(NAME avplayer_file COMMAND $<TARGET_FILE:avplayer_file_tests>)
+	add_test(NAME vdecsw COMMAND $<TARGET_FILE:vdecsw_tests>)
 	add_test(NAME bit_array COMMAND $<TARGET_FILE:bit_array_tests>)
 	add_test(NAME lru_cache COMMAND $<TARGET_FILE:lru_cache_tests>)
 	add_test(NAME shader_vertex_metadata COMMAND $<TARGET_FILE:shader_vertex_metadata_tests>)
@@ -711,12 +792,19 @@ if(BUILD_TESTING)
 	add_test(NAME ngs2_sampler COMMAND $<TARGET_FILE:ngs2_sampler_tests>)
 	add_test(NAME pad_haptics COMMAND $<TARGET_FILE:pad_haptics_tests>)
 	add_test(NAME controller_settings COMMAND $<TARGET_FILE:controller_settings_tests>)
+	add_test(NAME user_service_multi_user COMMAND $<TARGET_FILE:user_service_multi_user_tests>)
+	add_test(NAME controller_sdl_integration COMMAND $<TARGET_FILE:controller_sdl_integration_tests>)
+	add_test(NAME host_input COMMAND $<TARGET_FILE:host_input_tests>)
 	add_test(NAME save_data_memory COMMAND $<TARGET_FILE:save_data_memory_tests>)
 	add_test(NAME png_enc COMMAND $<TARGET_FILE:png_enc_tests>)
 	add_test(NAME ces COMMAND $<TARGET_FILE:ces_tests>)
 	add_test(NAME save_data_dialog COMMAND $<TARGET_FILE:save_data_dialog_tests>)
 	add_test(NAME http_uri_parse COMMAND $<TARGET_FILE:http_uri_parse_tests>)
 	add_test(NAME shader_recompiler_compute COMMAND $<TARGET_FILE:shader_recompiler_compute_tests>)
+	add_test(NAME shader_recompiler_tessellation
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --tessellation-only)
+	add_test(NAME shader_recompiler_float_min_max
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --float-min-max-only)
 	add_test(NAME shader_recompiler_alignbyte
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --alignbyte-only)
 	add_test(NAME graphics_pipeline_rasterization
@@ -733,6 +821,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --stream-buffer-only)
 	add_test(NAME gpu_command_lane
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-command-lane-only)
+	add_test(NAME wait_until_safe_for_rendering
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --wait-until-safe-for-rendering-only)
+	add_test(NAME depth_bits
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --depth-bits-only)
+	add_test(NAME msaa_storage
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --msaa-storage-only)
 	add_test(NAME pm4_context_state
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
@@ -777,6 +871,7 @@ if(BUILD_TESTING)
 		archive_file_tests
 		trophy_system_tests
 		avplayer_file_tests
+		vdecsw_tests
 		bit_array_tests
 		lru_cache_tests
 		shader_vertex_metadata_tests
@@ -792,6 +887,9 @@ if(BUILD_TESTING)
 		ngs2_sampler_tests
 		pad_haptics_tests
 		controller_settings_tests
+		user_service_multi_user_tests
+		controller_sdl_integration_tests
+		host_input_tests
 		save_data_memory_tests
 		png_enc_tests
 		ces_tests
@@ -818,6 +916,23 @@ if(APPLE AND (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR
 endif()
 
 add_executable(kyty_emulator "${KYTY_SOURCE_DIR}/main.cpp" ${kyty_emulator_src})
+
+add_executable(fsr_upscaler_tests EXCLUDE_FROM_ALL
+  "${KYTY_SOURCE_DIR}/graphics/host_gpu/renderer/commandRecorder.cpp"
+	"${KYTY_TESTS_DIR}/FsrUpscalerTests.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/fsr1.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/presentation/fsr/fsr3.cpp"
+	${gpu_blit_shader_headers})
+target_include_directories(fsr_upscaler_tests PRIVATE ${inc_headers})
+target_link_libraries(fsr_upscaler_tests PRIVATE common Vulkan::Headers fmt::fmt ${kyty_fsr3_libraries})
+if(KYTY_ENABLE_FSR3)
+	foreach(target kyty_emulator fsr_upscaler_tests)
+		foreach(dll IN LISTS kyty_fsr3_dlls)
+			add_custom_command(TARGET ${target} POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"${dll}" "$<TARGET_FILE_DIR:${target}>" VERBATIM)
+		endforeach()
+	endforeach()
+endif()
 configure_macos_guest_address_space(kyty_emulator)
 
 set(KYTY_TROPHY_UNLOCK_SOUND "${CMAKE_CURRENT_SOURCE_DIR}/assets/sounds/trophy-unlock.wav")
@@ -828,6 +943,23 @@ add_custom_target(kyty_trophy_sound
 	VERBATIM)
 add_dependencies(kyty_emulator kyty_trophy_sound)
 install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION assets/sounds)
+
+# Build-wide config the launcher reads from the emulator's folder.
+set(KYTY_GLOBAL_CONFIG "${CMAKE_CURRENT_SOURCE_DIR}/assets/cfgGlobal.json")
+add_custom_target(kyty_global_config
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_GLOBAL_CONFIG}"
+		"$<TARGET_FILE_DIR:kyty_emulator>/cfgGlobal.json"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_global_config)
+install(FILES "${KYTY_GLOBAL_CONFIG}" DESTINATION .)
+
+add_custom_target(kyty_touch_cursors
+	COMMAND ${CMAKE_COMMAND} -E copy_directory
+		"${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors"
+		"$<TARGET_FILE_DIR:kyty_emulator>/assets/cursors"
+	VERBATIM)
+add_dependencies(kyty_emulator kyty_touch_cursors)
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/assets/cursors" DESTINATION assets)
 
 target_link_libraries(kyty_emulator ${kyty_emulator_link_libraries})
 if (WIN32)

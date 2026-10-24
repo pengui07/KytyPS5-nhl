@@ -1,9 +1,11 @@
 #include "common/eventTrace.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
+#include "common/runtimeFlags.h"
 #include "common/threads.h"
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
@@ -12,7 +14,10 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/openxrHeadset.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/fsr/fsr1.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -21,7 +26,9 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -329,6 +336,8 @@ private:
 	vk::PipelineLayout             m_overlay_layout      = nullptr;
 	vk::Pipeline                   m_overlay_pipeline    = nullptr;
 	vk::Sampler                    m_overlay_sampler     = nullptr;
+	std::vector<std::unique_ptr<Fsr1>> m_fsr1;
+	std::string m_fsr1_status;
 	uint32_t                       m_image_index         = static_cast<uint32_t>(-1);
 	uint32_t                       m_frame_index         = 0;
 };
@@ -345,6 +354,7 @@ struct Presenter::Impl {
 	void RecoverSwapchain(Swapchain::Status status) {
 		LOGF("Recovering Vulkan swapchain%s\n",
 		     status == Swapchain::Status::SurfaceLost ? " and surface" : "");
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::SwapchainRecreations);
 		swapchain.Recreate(status == Swapchain::Status::SurfaceLost);
 		frames.SetFormat(swapchain.Format());
 	}
@@ -571,6 +581,8 @@ void Swapchain::Destroy() {
 		Common::LockGuard queue_lock(graphics.queue_mutex);
 		RequireVulkanSuccess(graphics.queue.waitIdle(), "wait for swapchain queue");
 	}
+	m_fsr1.clear();
+	m_fsr1_status.clear();
 	if (m_system_overlay != nullptr) {
 		m_system_overlay->ReleaseVulkan();
 	}
@@ -810,6 +822,56 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	auto       vk_command      = command.Handle();
 	const bool draw_overlay    = overlay.frame != nullptr;
 	const bool draw_attachment = draw_overlay || draw_system_overlay;
+	vk::Image blit_source = source ? source->image.image : vk::Image {};
+	vk::Extent2D blit_extent = source ? vk::Extent2D {source->image.extent.width, source->image.extent.height} : vk::Extent2D {};
+	const bool fsr1_enabled = Common::RuntimeFlags::Current().fsr1;
+	if (!fsr1_enabled && !m_fsr1_status.empty()) {
+		std::printf("NHL27FSR version=1 status=disabled\n");
+		std::fflush(stdout);
+		m_fsr1_status.clear();
+	}
+	if (source && fsr1_enabled) {
+		const bool sdr_format = source->image.format == vk::Format::eR8G8B8A8Unorm ||
+		                        source->image.format == vk::Format::eB8G8R8A8Unorm ||
+		                        source->image.format == vk::Format::eA2B10G10R10UnormPack32 ||
+		                        source->image.format == vk::Format::eA2R10G10B10UnormPack32;
+		std::string status = "fallback (HDR, format or downscaling)";
+		if (!source->hdr && !m_hdr_active && !source->blank && sdr_format &&
+		    blit_extent.width <= m_extent.width && blit_extent.height <= m_extent.height) {
+			if (m_fsr1.empty()) m_fsr1.resize(m_images.size());
+			auto& fsr = m_fsr1[m_image_index];
+			if (!fsr) fsr = std::make_unique<Fsr1>(m_window.graphic_ctx.physical_device, m_window.graphic_ctx.device);
+			if (!source->view) {
+				vk::ImageViewCreateInfo view {};
+				view.image = source->image.image;
+				view.viewType = vk::ImageViewType::e2D;
+				view.format = source->image.format;
+				view.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+				RequireVulkanSuccess(m_window.graphic_ctx.device.createImageView(&view, nullptr, &source->view), "create FSR source view");
+			}
+			source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal, vk::AccessFlagBits2::eShaderRead);
+			static const float sharpness = [] {
+				const char* value = std::getenv("KYTY_FSR_SHARPNESS");
+				char* end = nullptr;
+				const float parsed = value ? std::strtof(value, &end) : 0.2f;
+				return value && (end == value || *end || !std::isfinite(parsed)) ? 0.2f : std::clamp(parsed, 0.0f, 1.0f);
+			}();
+			const auto output = fsr->Record(vk_command.Direct(), source->view, blit_extent, m_extent, sharpness);
+			if (output) {
+				status = fmt::format("{} {}x{} -> {}x{} sharpness={:.2f}", blit_extent == m_extent ? "RCAS" : "EASU+RCAS",
+				                     blit_extent.width, blit_extent.height, m_extent.width, m_extent.height, sharpness);
+				blit_source = output;
+				blit_extent = m_extent;
+			} else {
+				status = "fallback (FSR allocation or pipeline unavailable)";
+			}
+		}
+		if (status != m_fsr1_status) {
+			std::printf("NHL27FSR version=1 status=%s\n", status.c_str());
+			std::fflush(stdout);
+			m_fsr1_status = std::move(status);
+		}
+	}
 	if (source != nullptr) {
 		source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
 		                vk::AccessFlagBits2::eTransferRead);
@@ -843,8 +905,8 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		region.srcSubresource.mipLevel       = 0;
 		region.srcSubresource.baseArrayLayer = 0;
 		region.srcSubresource.layerCount     = 1;
-		region.srcOffsets[1].x               = static_cast<int>(source->image.extent.width);
-		region.srcOffsets[1].y               = static_cast<int>(source->image.extent.height);
+		region.srcOffsets[1].x               = static_cast<int>(blit_extent.width);
+		region.srcOffsets[1].y               = static_cast<int>(blit_extent.height);
 		region.srcOffsets[1].z               = 1;
 		region.dstSubresource.aspectMask     = vk::ImageAspectFlagBits::eColor;
 		region.dstSubresource.mipLevel       = 0;
@@ -853,7 +915,7 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		region.dstOffsets[1].x               = static_cast<int>(m_extent.width);
 		region.dstOffsets[1].y               = static_cast<int>(m_extent.height);
 		region.dstOffsets[1].z               = 1;
-		vk_command.blitImage(source->image.image, vk::ImageLayout::eTransferSrcOptimal,
+		vk_command.blitImage(blit_source, vk::ImageLayout::eTransferSrcOptimal,
 		                     m_images[m_image_index], vk::ImageLayout::eTransferDstOptimal, 1,
 		                     &region, vk::Filter::eLinear);
 	} else {
@@ -958,7 +1020,8 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 
 Presenter::~Presenter() = default;
 
-Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr) {
+Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr,
+                                          bool headset) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;
@@ -978,6 +1041,12 @@ Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo
 	frame->Configure(m_impl->window.graphic_ctx,
 	                 {image.backing.extent.width, image.backing.extent.height}, frame_format);
 	frame->CopyFrom(buffer, image);
+	if (headset) {
+		// The frame holds the raw display-encoded pixels the headset needs.
+		frame->Transit(buffer.Handle(), vk::ImageLayout::eTransferSrcOptimal,
+		               vk::AccessFlagBits2::eTransferRead);
+		Vr::OpenXrQueueEyeSource(buffer, frame->image);
+	}
 	return *frame;
 }
 
@@ -988,7 +1057,6 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 	auto*             frame  = m_impl->frames.Acquire({width, height}, format);
 	frame->hdr   = false;
 	frame->blank = true;
-	Common::LockGuard render_lock(m_impl->renderer.GetMutex());
 	frame->Configure(m_impl->window.graphic_ctx, {width, height}, format);
 	vk::ClearColorValue clear {};
 	clear.float32[3] = opaque ? 1.0f : 0.0f;
@@ -996,6 +1064,7 @@ Presenter::Frame& Presenter::PrepareBlankFrame(uint32_t width, uint32_t height, 
 		EXIT_IF(producer->IsInvalid());
 		frame->Clear(*producer, clear);
 	} else {
+		Common::LockGuard lock(m_impl->present_mutex);
 		auto& command = m_impl->present_scheduler.BeginCommand();
 		frame->Clear(command, clear);
 		frame->present_tick = m_impl->present_scheduler.Submit();
@@ -1201,22 +1270,21 @@ void Presenter::Impl::Present() {
 		}
 		PresentCapture capture;
 		uint64_t       submitted = 0;
-		{
-			Common::LockGuard render_lock(renderer.GetMutex());
-			auto&             command = present_scheduler.BeginCommand();
-			const bool        draw_system_overlay =
-			    overlay_visual.active && swapchain.PrepareSystemOverlay();
-			swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
-			                                draw_system_overlay);
-			if (capture_wanted && layers[0].frame != nullptr) {
-				RecordPresentCapture(window.graphic_ctx, command, layers[0].frame->image, capture);
-			}
-			const auto tick = swapchain.Submit(present_scheduler);
-			submitted       = tick;
-			for (const auto& layer: layers) {
-				if (layer.frame != nullptr) {
-					layer.frame->present_tick = tick;
-				}
+		// present_mutex owns the prepared frames and this scheduler. Only queue submission
+		// is shared with rendering, and it has its own queue_mutex.
+		auto&      command = present_scheduler.BeginCommand();
+		const bool draw_system_overlay = (overlay_visual.active || PerformanceOverlayEnabled()) &&
+		                                 swapchain.PrepareSystemOverlay();
+		swapchain.RecordPresentCommands(command, layers[0].frame, layers[1],
+		                                draw_system_overlay);
+		if (capture_wanted && layers[0].frame != nullptr) {
+			RecordPresentCapture(window.graphic_ctx, command, layers[0].frame->image, capture);
+		}
+		const auto tick = swapchain.Submit(present_scheduler);
+		submitted       = tick;
+		for (const auto& layer: layers) {
+			if (layer.frame != nullptr) {
+				layer.frame->present_tick = tick;
 			}
 		}
 		if (capture.buffer != VK_NULL_HANDLE) {
@@ -1235,6 +1303,7 @@ void Presenter::Impl::Present() {
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::DroppedPresents);
 }
 
 void Presenter::Discard(Frame& frame) {

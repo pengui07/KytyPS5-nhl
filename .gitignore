@@ -7,3 +7,4 @@ _Build/
 cmake-build-debug/
 _PipelineCache/
 _Bench/
+CMakeUserPresets.json

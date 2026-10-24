@@ -324,6 +324,31 @@ bool Protect(uint64_t address, uint64_t size, Mode mode) {
 	return true;
 }
 
+bool IsReadable(uint64_t address, uint64_t size) {
+	for (uint64_t current = address; current - address < size;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) == 0 ||
+		    info.State != MEM_COMMIT || (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0 || info.Protect == 0) {
+			return false;
+		}
+		current = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+	}
+	return true;
+}
+
+bool IsWritable(uint64_t address, uint64_t size) {
+	constexpr DWORD Writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+	for (uint64_t current = address; current - address < size;) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(current), &info, sizeof(info)) == 0 ||
+		    info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD) != 0 || (info.Protect & Writable) == 0) {
+			return false;
+		}
+		current = reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize;
+	}
+	return true;
+}
+
 bool FlushInstructionCache(uint64_t address, uint64_t size) {
 	if (::FlushInstructionCache(GetCurrentProcess(),
 	                            reinterpret_cast<LPVOID>(static_cast<uintptr_t>(address)),

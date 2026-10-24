@@ -11,6 +11,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <initializer_list>
 #include <span>
 #include <string>
 #include <string_view>
@@ -262,6 +263,17 @@ inline std::atomic<bool> g_shader_storage_align4 {false};
 // directly instead of emulating the guest's signed-zero ordering and NaN operand selection.
 // NMin/NMax still return the non-NaN operand; only -0/+0 ordering and NaN payloads may differ.
 // Read once per process; off by default.
+// Codegen fix (KYTY_NAN_CLAMP=1, upstream 4f1f3b1b): the clamp output modifier turns NaN into 0
+// like the hardware's DX10 clamp mode; plain FClamp leaves NaN undefined. Off by default:
+// NHL 27 test Oct 22 (together with KYTY_FCE_MATERIALIZE) gave pitch-black ice.
+[[nodiscard]] inline bool ShaderNanClamp() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_NAN_CLAMP");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
 [[nodiscard]] inline bool ShaderFastMinMax() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_FAST_MINMAX");
@@ -335,6 +347,18 @@ inline uint8_t GetDstSel(uint32_t swizzle, uint32_t channel) {
 	return (swizzle >> (channel * 3u)) & 0x7u;
 }
 
+[[nodiscard]] inline bool IsValidImageSwizzle(uint32_t swizzle,
+                                             uint32_t component_count = 4) noexcept {
+	if ((swizzle & ~0xfffu) != 0) {
+		return false;
+	}
+	for (uint32_t channel = 0; channel < 4; channel++) {
+		const auto selector = GetDstSel(swizzle, channel);
+		if (selector > 1 && (selector < 4 || selector >= 4 + component_count)) return false;
+	}
+	return true;
+}
+
 struct ShaderClipSpaceTransform {
 	float scale[2]       = {};
 	float offset[2]      = {};
@@ -387,6 +411,8 @@ struct ShaderTessellationInputInfo {
 	uint32_t output_control_points = 0;
 	uint32_t ls_stride             = 0;
 	uint32_t hs_stride             = 0;
+	uint32_t patch_base            = 0;
+	uint32_t patch_size            = 0;
 	uint32_t domain                = 0;
 	uint32_t partitioning          = 0;
 	uint32_t output_topology       = 0;
@@ -415,7 +441,11 @@ struct ShaderVertexInputInfo {
 	int                     buffers_num         = 0;
 	uint32_t                wave_size           = 64;
 	uint32_t                scratch_size_dwords = 0;
+	// LDS_SIZE of the GS stage a non-NGG vertex shader runs on; usually zero.
+	uint32_t                lds_size_dwords     = 0;
 	uint32_t                pa_cl_vs_out_cntl    = 0;
+	// PA_CL_CLIP_CNTL.UCP_ENA; set only on the last pre-rasterization stage.
+	uint32_t                user_clip_planes     = 0;
 	ShaderClipSpaceTransform clip_space;
 	ShaderMeshInputInfo      mesh;
 	ShaderTessellationInputInfo tess;
@@ -428,6 +458,7 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 	uint8_t            float_mode                 = 0xc0;
 	uint32_t           dispatch_threads_num[3]    = {0, 0, 0};
 	uint32_t           workgroup_counts[3]        = {0, 0, 0};
+	uint64_t           indirect_args_address       = 0;
 	bool               group_id[3]                = {false, false, false};
 	bool               dispatch_thread_dimensions = false;
 	bool               lds_storage                = false;
@@ -453,7 +484,12 @@ struct ShaderPixelInputInfo {
 	uint8_t                                        target_output_mode[8]        = {};
 	uint32_t                                       target_shader_mask           = UINT32_MAX;
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
+	uint8_t                                        target_packed_unorm_mask      = 0;
+	// CB round mode per converted export: zero adds half an LSB, one truncates.
+	uint8_t                                        target_round_mode            = 0;
 	uint32_t                                       scratch_size_dwords          = 0;
+	// EXTRA_LDS_SIZE: LDS reserved beyond the interpolants (VGPR spills to LDS).
+	uint32_t                                       lds_size_dwords              = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
 	bool                                           ps_pos_z                     = false;
@@ -468,6 +504,7 @@ struct ShaderPixelInputInfo {
 	bool                                           ps_sample_mask_export_enable = false;
 	bool                                           ps_sample_shading            = false;
 	bool                                           dual_source_blending         = false;
+	bool                                           object_primitive_id          = false;
 	// Export logical alpha or per-channel source factors through MRT1 after channel swizzling.
 	ShaderAlphaBlendSource                         alpha_blend_source = ShaderAlphaBlendSource::None;
 	bool                                           ps_early_z                   = false;
@@ -594,6 +631,8 @@ struct ShaderMappedData {
 
 void ShaderInit();
 void ShaderMapUserData(uint64_t addr, const ShaderMappedData& data);
+// True when every address is an unset stage (0) or a shader AgcCreateShader registered.
+bool ShaderMapContains(std::initializer_list<uint64_t> addrs);
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);

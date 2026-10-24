@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/file.h"
 #include "common/hostException.h"
@@ -16,6 +17,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/pageManager.h"
+#include "graphics/presentation/fsr/fsr2Constants.h"
 #include "kernel/fileSystem.h"
 #include "kernel/memory.h"
 #include "kernel/pthread.h"
@@ -70,6 +72,23 @@ namespace {
 // renders below its 4K-display preset. The NHL preset applier rewrites both whenever a preset is
 // (re)selected, so the values are re-applied periodically. Offsets come from static analysis of
 // this eboot: the settings pointer slot is at eboot+0xf1ef808, the floats at +0x170 and +0xc0.
+// The eboot image (and some guest heap) is mapped at its guest address without a guest-memory
+// backing, so TryReadBacking/TryWriteBacking refuse it; fall back to the mapping itself once
+// VirtualQuery shows the range is readable (writable for writes).
+bool NhlReadGuest(uint64_t address, void* out, uint64_t size) {
+	if (Libs::LibKernel::Memory::TryReadBacking(address, out, size)) return true;
+	if (!Common::VirtualMemory::IsReadable(address, size)) return false;
+	std::memcpy(out, reinterpret_cast<const void*>(address), size);
+	return true;
+}
+
+bool NhlWriteGuest(uint64_t address, const void* data, uint64_t size) {
+	if (Libs::LibKernel::Memory::TryWriteBacking(address, data, size)) return true;
+	if (!Common::VirtualMemory::IsWritable(address, size)) return false;
+	std::memcpy(reinterpret_cast<void*>(address), data, size);
+	return true;
+}
+
 void StartNhlResolutionScale(uint64_t eboot_base) {
 	const char* env = std::getenv("KYTY_NHL_RES_SCALE");
 	if (env == nullptr || eboot_base == 0) {
@@ -89,16 +108,16 @@ void StartNhlResolutionScale(uint64_t eboot_base) {
 		for (;;) {
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			uint64_t settings = 0;
-			if (!Libs::LibKernel::Memory::TryReadBacking(eboot_base + SlotOffset, &settings,
+			if (!NhlReadGuest(eboot_base + SlotOffset, &settings,
 			                                            sizeof(settings)) ||
 			    settings == 0 || (settings & 0xfu) != 0) {
 				continue;
 			}
 			float current = 0.0f;
 			float current_min = 0.0f;
-			if (!Libs::LibKernel::Memory::TryReadBacking(settings + ScaleOffset, &current,
+			if (!NhlReadGuest(settings + ScaleOffset, &current,
 			                                            sizeof(current)) ||
-			    !Libs::LibKernel::Memory::TryReadBacking(settings + ScaleMinOffset, &current_min,
+			    !NhlReadGuest(settings + ScaleMinOffset, &current_min,
 			                                            sizeof(current_min))) {
 				continue;
 			}
@@ -117,19 +136,17 @@ void StartNhlResolutionScale(uint64_t eboot_base) {
 			if (announced != settings) {
 				announced = settings;
 				uint8_t drs = 0;
-				(void)Libs::LibKernel::Memory::TryReadBacking(settings + 0x211, &drs, 1);
+				(void)NhlReadGuest(settings + 0x211, &drs, 1);
 				::printf("NHL27RES: settings at 0x%016llx scale=%g min=%g drs=%u -> %g\n",
 				         static_cast<unsigned long long>(settings), current, current_min,
 				         static_cast<unsigned>(drs), scale);
 			}
 			if (current != scale || current_min != scale) {
-				(void)Libs::LibKernel::Memory::TryWriteBacking(settings + ScaleOffset, &scale,
-				                                              sizeof(scale));
-				(void)Libs::LibKernel::Memory::TryWriteBacking(settings + ScaleMinOffset, &scale,
-				                                              sizeof(scale));
+				const bool wrote = NhlWriteGuest(settings + ScaleOffset, &scale, sizeof(scale)) &&
+				                   NhlWriteGuest(settings + ScaleMinOffset, &scale, sizeof(scale));
 				if (++writes <= 8) {
-					::printf("NHL27RES: applied scale %g (was %g, min %g)\n", scale, current,
-					         current_min);
+					::printf("NHL27RES: %s scale %g (was %g, min %g)\n", wrote ? "applied" : "FAILED to write",
+					         scale, current, current_min);
 				}
 			}
 		}
@@ -273,6 +290,7 @@ static uint64_t RegisterStubbedImport(uint32_t index, const Program* program,
 }
 
 static KYTY_SYSV_ABI uint64_t UnresolvedImportStub(uint64_t record_id) {
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::UnresolvedImportCalls);
 	const auto log_index = g_unresolved_stub_call_log_count.fetch_add(1);
 	if (log_index < 1024) {
 		if (record_id < g_stubbed_imports.size()) {
@@ -932,6 +950,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 
 	if (info->type == Common::HostException::ExceptionType::IllegalInstruction &&
 	    Loader::X64InstructionEmulator::TryEmulate(info->native_context)) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::EmulatedInstructions);
 		return true;
 	}
 
@@ -1052,6 +1071,7 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 			GpuFaultStacks::Record(gpu_sample, gpu_result, gpu_elapsed());
 		}
 		if (handled) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
 			return true;
 		}
 	}
@@ -1103,6 +1123,54 @@ static bool KytyExceptionHandler(const Common::HostException::ExceptionInfo& exc
 				std::printf("%s%02x", (i % 16 == 0) ? "\n " : " ", code[i]);
 			}
 			std::printf("\n");
+		}
+		{
+			// NHL27CODE: larger guest code windows for offline disassembly: the code before the fault,
+			// the functions called directly just before it, and the code before each guest return
+			// address on the stack.
+			const auto dump = [](const char* what, uint64_t addr, uint64_t len) {
+				if (!IsReadableRange(addr, len)) {
+					return;
+				}
+				const auto* code = reinterpret_cast<const uint8_t*>(addr);
+				std::printf("NHL27CODE %s addr=0x%016" PRIx64 " len=0x%" PRIx64, what, addr, len);
+				for (uint64_t i = 0; i < len; i++) {
+					std::printf("%s%02x", (i % 32 == 0) ? "\n " : "", code[i]);
+				}
+				std::printf("\n");
+			};
+			const uint64_t pc = info->exception_address;
+			dump("fault", pc - 0x400, 0x500);
+			uint64_t targets[16] = {};
+			size_t   target_count = 0;
+			if (IsReadableRange(pc - 0x100, 0x100)) {
+				const auto* code = reinterpret_cast<const uint8_t*>(pc - 0x100);
+				for (uint64_t i = 0; i + 5 <= 0x100 && target_count < 16; i++) {
+					if (code[i] != 0xe8) {
+						continue;
+					}
+					int32_t rel = 0;
+					std::memcpy(&rel, code + i + 1, sizeof(rel));
+					const uint64_t target = pc - 0x100 + i + 5 + static_cast<uint64_t>(static_cast<int64_t>(rel));
+					if (rel > -0x20000000 && rel < 0x20000000 &&
+					    std::find(targets, targets + target_count, target) == targets + target_count) {
+						targets[target_count++] = target;
+					}
+				}
+			}
+			for (size_t i = 0; i < target_count; i++) {
+				dump("callee", targets[i], 0x300);
+			}
+			if (IsReadableRange(info->rsp, 64 * sizeof(uint64_t))) {
+				const auto* stack  = reinterpret_cast<const uint64_t*>(info->rsp);
+				int         callers = 0;
+				for (int i = 0; i < 64 && callers < 8; i++) {
+					if (stack[i] >= 0x800000000ull && stack[i] < 0x1000000000ull) {
+						dump("caller", stack[i] - 0x200, 0x220);
+						callers++;
+					}
+				}
+			}
 		}
 		if (IsReadableRange(info->rsp, 32 * sizeof(uint64_t))) {
 			const auto* stack = reinterpret_cast<const uint64_t*>(info->rsp);
@@ -1713,6 +1781,7 @@ void RuntimeLinker::Execute(const std::filesystem::path& game_patch) {
 		}
 	}
 	StartNhlResolutionScale(m_programs.empty() ? 0 : m_programs.front()->base_vaddr);
+	Libs::Graphics::Fsr2Capture::SetEbootBase(m_programs.empty() ? 0 : m_programs.front()->base_vaddr);
 	if (libc != nullptr && libc->dynamic_info->init_vaddr != 0) {
 		StartModule(libc, 0, nullptr, nullptr);
 	}

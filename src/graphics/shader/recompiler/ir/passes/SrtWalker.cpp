@@ -13,7 +13,9 @@
 #include <xbyak/xbyak.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -522,11 +524,9 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::BitFieldSExtract:
 		case ValueOpcode::IAdd32:
 		case ValueOpcode::IAdd64:
-		case ValueOpcode::IAddCarry32:
 		case ValueOpcode::ISub32:
 		case ValueOpcode::ISub64:
 		case ValueOpcode::IMul32:
-		case ValueOpcode::IMul64:
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
 		case ValueOpcode::ShiftLeftLogical32:
@@ -652,9 +652,7 @@ private:
 			}
 			return finish(Validate(inst->Arg(1)));
 		}
-		if (op == ValueOpcode::UndefU1 || op == ValueOpcode::UndefU8 ||
-		    op == ValueOpcode::UndefU16 || op == ValueOpcode::UndefU32 ||
-		    op == ValueOpcode::UndefU64 || op == ValueOpcode::Void) {
+		if (op == ValueOpcode::UndefU1 || op == ValueOpcode::UndefU32 || op == ValueOpcode::Void) {
 			return finish(false);
 		}
 		if (op == ValueOpcode::GetUserData) {
@@ -729,8 +727,7 @@ private:
 			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
 			    index.U32() >= 2u ||
-			    (source->GetOpcode() != ValueOpcode::CompositeConstructU32x2 &&
-			     source->GetOpcode() != ValueOpcode::IAddCarry32)) {
+			    source->GetOpcode() != ValueOpcode::CompositeConstructU32x2) {
 				return finish(false);
 			}
 		}
@@ -1032,18 +1029,6 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
 		return EvaluateWide(source->Arg(component), result);
 	}
-	if (source->GetOpcode() == ValueOpcode::IAddCarry32) {
-		uint64_t lhs = 0;
-		uint64_t rhs = 0;
-		if (!Arg(*source, 0, lhs) || !Arg(*source, 1, rhs)) {
-			return false;
-		}
-		const auto sum =
-		    static_cast<uint64_t>(static_cast<uint32_t>(lhs)) + static_cast<uint32_t>(rhs);
-		result =
-		    component == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
-		return true;
-	}
 	return false;
 }
 
@@ -1332,12 +1317,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
-		case ValueOpcode::IMul64:
-			if (binary()) {
-				result = a * b;
-				return true;
-			}
-			return false;
 		case ValueOpcode::UMulHi:
 			if (binary()) {
 				result = (static_cast<uint64_t>(static_cast<uint32_t>(a)) * static_cast<uint32_t>(b)) >> 32u;
@@ -1607,10 +1586,7 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			}
 			return false;
 		case ValueOpcode::UndefU1:
-		case ValueOpcode::UndefU8:
-		case ValueOpcode::UndefU16:
-		case ValueOpcode::UndefU32:
-		case ValueOpcode::UndefU64: return false;
+		case ValueOpcode::UndefU32: return false;
 		default: break;
 	}
 	return false;
@@ -1649,13 +1625,11 @@ bool IsPureReuseOpcode(ValueOpcode opcode) {
 		case ValueOpcode::CompositeConstructU32x2:
 		case ValueOpcode::CompositeExtractU64:
 		case ValueOpcode::CompositeExtractU32x2:
-		case ValueOpcode::IAddCarry32:
 		case ValueOpcode::IAdd32:
 		case ValueOpcode::IAdd64:
 		case ValueOpcode::ISub32:
 		case ValueOpcode::ISub64:
 		case ValueOpcode::IMul32:
-		case ValueOpcode::IMul64:
 		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
 		case ValueOpcode::FPMul32:
@@ -2421,10 +2395,7 @@ bool CollectConditionLeaves(const ResourcePlan& program, Value root,
 			case ValueOpcode::ReadConstBuffer:
 			case ValueOpcode::LoadBufferU32:
 			case ValueOpcode::UndefU1:
-			case ValueOpcode::UndefU8:
-			case ValueOpcode::UndefU16:
-			case ValueOpcode::UndefU32:
-			case ValueOpcode::UndefU64: return false;
+			case ValueOpcode::UndefU32: return false;
 			default:
 				for (size_t i = 0; i < inst->NumArgs(); ++i) {
 					if (!push(inst->Arg(i))) return false;
@@ -3413,7 +3384,6 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 			case ValueOpcode::ISub32:
 			case ValueOpcode::ISub64:
 			case ValueOpcode::IMul32:
-			case ValueOpcode::IMul64:
 			case ValueOpcode::UMulHi:
 			case ValueOpcode::UMin32:
 			case ValueOpcode::FPMul32:
@@ -3470,17 +3440,6 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 					op.dependency_count = 1;
 					break;
 				}
-				if (src->GetOpcode() == ValueOpcode::IAddCarry32) {
-					int a = emit_val(src->Arg(0), is_clean);
-					int b = emit_val(src->Arg(1), is_clean);
-					if (a < 0 || b < 0) return -1;
-					op.kind = ResourcePlan::SrtTape::Kind::Inst;
-					op.args[0] = static_cast<uint32_t>(a);
-					op.args[1] = static_cast<uint32_t>(b);
-					op.imm = comp;
-					op.dependency_count = 2;
-					break;
-				}
 				return -1;
 			}
 			case ValueOpcode::BitFieldUExtract:
@@ -3535,10 +3494,7 @@ bool BuildTapeForPlan(const ResourcePlan& plan, bool with_clean,
 		if (inst == nullptr) return false;
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::UndefU1:
-			case ValueOpcode::UndefU8:
-			case ValueOpcode::UndefU16:
-			case ValueOpcode::UndefU32:
-			case ValueOpcode::UndefU64: return true;
+			case ValueOpcode::UndefU32: return true;
 			case ValueOpcode::LogicalAnd: {
 				uint64_t imm = 0;
 				return (get_value_u64(inst->Arg(1), imm) && imm != 0u && always_fails(inst->Arg(0))) ||
@@ -4199,19 +4155,11 @@ inline bool TapeAlu(ValueOpcode opcode, const std::array<uint32_t, 5>& args, uin
 		case ValueOpcode::CompositeExtractU64:
 			result = static_cast<uint32_t>(a >> (imm * 32u));
 			break;
-		case ValueOpcode::CompositeExtractU32x2: { // used for IAddCarry32
-			const auto sum = static_cast<uint64_t>(static_cast<uint32_t>(a)) +
-			                 static_cast<uint32_t>(b);
-			result = imm == 0u ? static_cast<uint32_t>(sum)
-			                      : static_cast<uint32_t>(sum >> 32u);
-			break;
-		}
 		case ValueOpcode::IAdd32: result = static_cast<uint32_t>(a + b); break;
 		case ValueOpcode::IAdd64: result = a + b; break;
 		case ValueOpcode::ISub32: result = static_cast<uint32_t>(a - b); break;
 		case ValueOpcode::ISub64: result = a - b; break;
 		case ValueOpcode::IMul32: result = static_cast<uint32_t>(a * b); break;
-		case ValueOpcode::IMul64: result = a * b; break;
 		case ValueOpcode::UMulHi:
 			result = (static_cast<uint64_t>(static_cast<uint32_t>(a)) * static_cast<uint32_t>(b)) >> 32u;
 			break;

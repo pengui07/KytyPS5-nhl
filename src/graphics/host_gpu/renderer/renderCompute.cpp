@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/experiments.h"
 #include "common/file.h"
@@ -8,6 +9,7 @@
 #include "common/runtimeFlags.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
+#include "common/virtualMemory.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -25,6 +27,8 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
+#include "graphics/presentation/fsr/fsr2Constants.h"
+#include "graphics/presentation/fsr/nhl27Fsr3.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
@@ -45,7 +49,9 @@
 #include <mutex>
 #include <tuple>
 #include <span>
+#include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -118,14 +124,78 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	return false;
 }
 
+// Experiment FillPatterns: a proven fill (resources.uniform_pattern) whose element words differ.
+// Formatted stores write only the components of the V#'s format, at the V#'s stride: the written
+// bytes are the first min(words, components) words at the start of every record. Returns the
+// written range, its stride and the written words.
+static bool ResolveComputeBufferPattern(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                        uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                        uint64_t& address, uint64_t& size, uint32_t& stride,
+                                        uint32_t& written_words, const char*& why) {
+	const auto& resources = *input.stage.resources;
+	const auto& fill      = resources.uniform_pattern;
+	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer || fill.words < 2 ||
+	    fill.words > 4 || fill.resource >= resources.buffers.size()) {
+		why = "no-pattern";
+		return false;
+	}
+	const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[fill.resource]);
+	constexpr std::array formats {
+	    Prospero::BufferFormat::k32UInt, Prospero::BufferFormat::k32_32UInt,
+	    Prospero::BufferFormat::k32_32_32UInt, Prospero::BufferFormat::k32_32_32_32UInt};
+	const auto format = std::ranges::find(formats, descriptor.Format());
+	if (format == formats.end()) {
+		why = "format";
+		return false;
+	}
+	written_words = std::min<uint32_t>(fill.words, static_cast<uint32_t>(format - formats.begin()) + 1u);
+	if (descriptor.Stride() < written_words * 4u || (descriptor.Stride() & 3u) != 0 ||
+	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
+	    descriptor.Base48() == 0 || (descriptor.Base48() & 3u) != 0) {
+		why = "descriptor-shape";
+		return false;
+	}
+	if (input.threads_num[0] == 0 || input.threads_num[0] != fill.group_stride[0] ||
+	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
+	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
+		why = "dispatch-shape";
+		return false;
+	}
+	const uint64_t invocations = input.dispatch_thread_dimensions
+	                                 ? group_x
+	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
+	const uint64_t bytes = descriptor.GetSize();
+	if (invocations != descriptor.NumRecords() || bytes == 0 || bytes > UINT32_MAX ||
+	    (input.dispatch_thread_dimensions &&
+	     (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
+	      input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1))) {
+		why = "invocations-vs-records";
+		return false;
+	}
+	if (!FillSourcesDisjoint(resources.buffers, {descriptor.Base48(), bytes}, fill.resource)) {
+		why = "sources-overlap";
+		return false;
+	}
+	address = descriptor.Base48();
+	size    = bytes;
+	stride  = descriptor.Stride();
+	return true;
+}
+
+// why (optional, KYTY_DBG_FILL_DIAG): the first check that failed.
 bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                               uint32_t group_y, uint32_t group_z, uint32_t mode,
                               ShaderBufferResource& resolved_descriptor, uint32_t& resolved_clear,
-                              uint64_t& resolved_size) {
+                              uint64_t& resolved_size, const char** why) {
+	const auto fail = [why](const char* reason) {
+		if (why != nullptr) *why = reason;
+		return false;
+	};
 	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
 	if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer) {
-		return false;
+		return fail(fill.kind == ShaderRecompiler::IR::UniformFillKind::Image ? "image-fill"
+		                                                                       : "no-fill-pattern");
 	}
 	const auto element_size = fill.words * sizeof(uint32_t);
 	const auto descriptor =
@@ -133,32 +203,82 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	constexpr std::array formats {
 	    Prospero::BufferFormat::k32UInt, Prospero::BufferFormat::k32_32UInt,
 	    Prospero::BufferFormat::k32_32_32UInt, Prospero::BufferFormat::k32_32_32_32UInt};
+	// Offset-or-swizzle bounds do not describe the element range proved by the shader.
 	if (descriptor.Stride() != element_size || descriptor.Format() != formats[fill.words - 1] ||
 	    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid() ||
-	    descriptor.Base48() == 0) {
-		return false;
+	    descriptor.OutOfBounds() == 3 || descriptor.Base48() == 0) {
+		return fail("descriptor-shape");
 	}
 	if (input.threads_num[0] == 0 || input.threads_num[0] != fill.group_stride[0] ||
 	    input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 || group_y != 1 ||
 	    group_z != 1 || mode != (input.dispatch_thread_dimensions ? 0x61u : 0x41u)) {
-		return false;
+		return fail("dispatch-shape");
 	}
 	const uint64_t invocations = input.dispatch_thread_dimensions
 	                                 ? group_x
 	                                 : static_cast<uint64_t>(group_x) * input.threads_num[0];
 	const auto     size        = descriptor.GetSize();
-	if (invocations != descriptor.NumRecords() || size == 0 || size > UINT32_MAX ||
+	const auto elements = descriptor.NumRecords();
+	const bool covered = fill.bounded_elements != 0
+	                         ? fill.bounded_elements == elements && invocations >= elements
+	                         : invocations == elements;
+	if (!covered || invocations > uint64_t {UINT32_MAX} + 1 || size == 0 || size > UINT32_MAX ||
 	    (input.dispatch_thread_dimensions &&
 	     (group_x % input.threads_num[0] != 0 || input.dispatch_threads_num[0] != group_x ||
 	      input.dispatch_threads_num[1] != 1 || input.dispatch_threads_num[2] != 1))) {
-		return false;
+		return fail("invocations-vs-records");
 	}
 	if (!FillSourcesDisjoint(resources.buffers, {descriptor.Base48(), size}, fill.resource))
-		return false;
+		return fail("sources-overlap");
 	resolved_descriptor = descriptor;
 	resolved_clear      = fill.value;
 	resolved_size       = size;
 	return true;
+}
+
+// KYTY_DBG_FILL_DIAG=1: why a compute dispatch that writes memory is not taken as a uniform fill.
+// NHL 27 clears DCC/CMASK metadata with compute shaders; color-clear decoding then reads the
+// metadata back (a full GPU drain) unless the fill was recognized. NHL27FILLDIAG, once per shader,
+// path and verdict (at most 512 lines).
+static bool FillDiagEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_FILL_DIAG");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+static void FillDiag(const ShaderComputeInputInfo& input, const char* path, uint32_t group_x,
+                     uint32_t group_y, uint32_t group_z, uint32_t mode, const char* verdict) {
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	uint32_t    written_buffers = 0;
+	uint32_t    written_images  = 0;
+	for (const auto& buffer: program.info.buffers) written_buffers += buffer.written ? 1u : 0u;
+	for (const auto& image: program.info.images) written_images += image.written ? 1u : 0u;
+	if (written_buffers == 0 && written_images == 0) {
+		return;
+	}
+	static std::mutex                      mutex;
+	static std::unordered_set<std::string> seen;
+	char                                   key[160];
+	std::snprintf(key, sizeof(key), "%016llx %s %s", static_cast<unsigned long long>(program.shader_hash),
+	              path, verdict);
+	{
+		std::scoped_lock lock {mutex};
+		if (seen.size() >= 512 || !seen.insert(key).second) {
+			return;
+		}
+	}
+	std::printf("NHL27FILLDIAG: shader=0x%016llx path=%s verdict=%s fill_kind=%d words=%u spec_reads=%zu "
+	            "buffers=%zu written_buffers=%u images=%zu written_images=%u groups=%ux%ux%u "
+	            "threads=%ux%ux%u mode=0x%x\n",
+	            static_cast<unsigned long long>(program.shader_hash), path, verdict,
+	            static_cast<int>(resources.uniform_fill.kind), resources.uniform_fill.words,
+	            resources.specialization_reads.size(), program.info.buffers.size(), written_buffers,
+	            program.info.images.size(), written_images, group_x, group_y, group_z, input.threads_num[0],
+	            input.threads_num[1], input.threads_num[2], mode);
+	std::fflush(stdout);
 }
 
 // KYTY_CPU_COPY_FORWARD=1: a proven dst[i] = src[i] copy dispatch (UniformCopy) over contiguous,
@@ -214,9 +334,9 @@ static bool ResolveComputeBufferCopy(const ShaderComputeInputInfo& input, uint32
 	return true;
 }
 
-bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-                                                CommandBuffer& command, uint32_t group_x,
-                                                uint32_t group_y, uint32_t group_z, uint32_t mode) {
+bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
+                                          CommandBuffer& command, uint32_t group_x,
+                                          uint32_t group_y, uint32_t group_z, uint32_t mode) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
@@ -272,24 +392,28 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	                              size)) {
 		return false;
 	}
-	if (!cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear)) {
-		// A uniform fill of memory no image covers is performed like a DMA fill: on the CPU while
-		// the GPU does not own the range. DCC metadata cleared this way is read by fast-clear
-		// discovery without draining the GPU first.
+	const bool image_clear =
+	    cache.ClearImageFromBuffer(command, descriptor.Base48(), size, packed_clear);
+	if (!image_clear) {
+		// CPU fills invalidate overlapping cached images. Preserve the native dispatch for
+		// partial or ambiguous image backings, including pooled metadata aliases.
 		// Larger fills stay on the GPU: a CPU fill would also have to be uploaded again.
 		constexpr uint64_t MaxBufferFill = uint64_t {1} << 20u;
-		if (((descriptor.Base48() | size) & 3u) != 0 || size > MaxBufferFill ||
-		    cache.HasImagesInRegion(descriptor.Base48(), size)) {
+		if ((descriptor.Base48() & 3u) != 0 || size > MaxBufferFill ||
+		    !m_context.IsMapped(descriptor.Base48(), size) ||
+		    cache.IsRegionRegistered(descriptor.Base48(), size)) {
 			return false;
 		}
+		// Metadata need not have an image backing yet. Keep proven fills in guest memory
+		// when CPU-owned, so color-clear discovery can read them without a GPU download.
 		m_context.GetBufferCache().FillBuffer(descriptor.Base48(), size, packed_clear, false);
-		return true;
 	}
 	static std::atomic<uint32_t> logged_clears {0};
 	if (logged_clears.fetch_add(1, std::memory_order_relaxed) < 32) {
-		LOGF("GraphicsRenderDispatchDirect: compute image clear shader=0x%016" PRIx64
+		LOGF("GraphicsRenderDispatchDirect: compute %s shader=0x%016" PRIx64
 		     " addr=0x%016" PRIx64 " size=0x%016" PRIx64 " value=0x%08" PRIx32 "\n",
-		     input.stage.program->shader_hash, descriptor.Base48(), size, packed_clear);
+		     image_clear ? "image clear" : "buffer fill", input.stage.program->shader_hash,
+		     descriptor.Base48(), size, packed_clear);
 	}
 	return true;
 }
@@ -396,6 +520,345 @@ void RenderExecutor::PrefetchResolvedDispatch(const ResolvedDispatch* resolved, 
 	resolved->programs.Prefetch(step);
 }
 
+// Diagnostic only (KYTY_FSR2_CAPTURE=1): finds the dispatches of NHL's AMD FSR2 passes by
+// comparing their bound buffers with the guest's own copy of cbFSR2 (see Fsr2Capture), then
+// prints the raw block, decoded fields, shader and every bound image. The emulator's GPU thread
+// may run behind the guest CPU, so frame-varying fields (frame index, jitter, exposure, delta
+// time) are only required to be close; the sizes and sequence length must be equal.
+namespace {
+
+struct Fsr2CaptureState {
+	bool     checked  = false;
+	bool     valid    = false;
+	uint64_t base     = 0;
+	uint64_t dispatches = 0;
+	uint64_t matches  = 0;
+	uint64_t blob_resident = 0;
+	uint64_t printed  = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> per_hash; // shader hash -> matches
+};
+
+// The eboot image is mapped at its guest address but has no guest-memory backing, so
+// TryReadBacking refuses it; fall back to the mapping itself once it is known to be readable.
+bool Fsr2ReadEboot(uint64_t address, void* out, uint64_t size) {
+	if (LibKernel::Memory::TryReadBacking(address, out, size)) return true;
+	if (!Common::VirtualMemory::IsReadable(address, size)) return false;
+	std::memcpy(out, reinterpret_cast<const void*>(address), size);
+	return true;
+}
+
+bool Fsr2CaptureEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FSR2_CAPTURE");
+		return value && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+const char* Fsr2RoleGuess(const ImageInfo& image, bool written, const Fsr2ConstantsCandidate& c) {
+	const uint32_t w = image.extent.width, h = image.extent.height;
+	const bool     render  = w == c.words[0] && h == c.words[1];
+	const bool     display = w == c.words[4] && h == c.words[5];
+	const bool     input   = w == c.words[6] && h == c.words[7];
+	switch (image.pixel_format) {
+		case vk::Format::eD32Sfloat:
+		case vk::Format::eD32SfloatS8Uint:
+		case vk::Format::eX8D24UnormPack32:
+		case vk::Format::eD24UnormS8Uint:
+		case vk::Format::eD16Unorm: return "depth?";
+		default: break;
+	}
+	if (w == 1 && h == 1) return "exposure?";
+	if (written && display) return "output?";
+	if (image.pixel_format == vk::Format::eR16G16Sfloat && (render || display || input)) return "motion-vectors?";
+	if (image.pixel_format == vk::Format::eR32Sfloat && (render || input)) return written ? "dilated-depth?" : "depth?";
+	if (image.pixel_format == vk::Format::eR8Unorm && (render || input)) return "reactive/transparency-mask?";
+	if (!written && (render || input)) return "color?";
+	return "-";
+}
+
+template <typename Program>
+void Fsr2CaptureDispatch(const Program& program, const PreparedBindings& bindings, uint64_t cs_addr,
+                         uint32_t gx, uint32_t gy, uint32_t gz) {
+	static Fsr2CaptureState s;
+	if (!s.checked) {
+		s.base = Fsr2Capture::g_eboot_base.load(std::memory_order_acquire);
+		if (s.base == 0) return;
+		// The name is in the eboot's read-only segment, which may have no backing to read; only a
+		// successful read that differs rules the build out. The size word is in .data and must
+		// read back as 31; until it can be read at all, retry on later dispatches.
+		char       name[7] {};
+		uint32_t   size      = 0;
+		const bool name_read = Fsr2ReadEboot(s.base + Fsr2Capture::CbNameOffset, name, sizeof(name));
+		const bool name_ok   = !name_read || std::memcmp(name, "cbFSR2", sizeof(name)) == 0;
+		const bool size_read = Fsr2ReadEboot(s.base + Fsr2Capture::GlobalConstantsOffset, &size, 4);
+		if (name_ok && !size_read && ++s.dispatches < 65536) return;
+		s.checked    = true;
+		s.valid      = name_ok && size_read && size == 31;
+		s.dispatches = 0;
+		std::printf("NHL27FSR2CAP %s eboot=0x%" PRIx64 " global=0x%" PRIx64 " name_read=%d size_read=%d size=%u\n",
+		            s.valid ? "enabled" : "disabled: eboot signature mismatch", s.base,
+		            s.base + Fsr2Capture::GlobalConstantsOffset, name_read ? 1 : 0, size_read ? 1 : 0, size);
+		std::fflush(stdout);
+	}
+	if (!s.valid) return;
+	++s.dispatches;
+
+	// Guest copy: { uint32Size, data[31] } -> decoder words 0..30 (word 31 is padding).
+	std::array<uint32_t, 32> global_raw {};
+	Fsr2ConstantsCandidate   guest;
+	if (Fsr2ReadEboot(s.base + Fsr2Capture::GlobalConstantsOffset, global_raw.data(), 128)) {
+		std::copy(global_raw.begin() + 1, global_raw.end(), guest.words.begin());
+	}
+	const bool guest_active = guest.words[0] != 0 && guest.words[1] != 0;
+
+	const bool blob_shader = cs_addr >= s.base + Fsr2Capture::BlobRangeBegin && cs_addr < s.base + Fsr2Capture::BlobRangeEnd;
+	if (blob_shader) ++s.blob_resident;
+
+	if ((s.dispatches % 8192) == 0) {
+		std::printf("NHL27FSR2CAP status dispatches=%" PRIu64 " matches=%" PRIu64 " blob_resident=%" PRIu64
+		            " guest_active=%d guest_frame=%u guest_render=%ux%u guest_display=%ux%u\n",
+		            s.dispatches, s.matches, s.blob_resident, guest_active ? 1 : 0, guest.words[11], guest.words[0],
+		            guest.words[1], guest.words[4], guest.words[5]);
+		std::fflush(stdout);
+	}
+	if (!guest_active && !blob_shader) return;
+
+	auto close = [](float a, float b, float tolerance) { return std::abs(a - b) <= tolerance; };
+	for (size_t slot = 0; slot < bindings.buffer_sources.size(); ++slot) {
+		const auto& source = bindings.buffer_sources[slot];
+		if (!source.address || source.size < 124) continue;
+		Fsr2ConstantsCandidate gpu;
+		const uint64_t         read_size = std::min<uint64_t>(source.size, 128);
+		const char*            backing   = "clean";
+		if (!LibKernel::Memory::TryReadCleanBufferBacking(source.address, gpu.words.data(), read_size)) {
+			if (!LibKernel::Memory::TryReadBacking(source.address, gpu.words.data(), read_size)) continue;
+			backing = "dirty-backing";
+		}
+		bool match = guest_active;
+		for (unsigned i = 0; match && i < 11; ++i) match = gpu.words[i] == guest.words[i];
+		match = match && gpu.words[27] == guest.words[27] &&
+		        (gpu.words[11] - guest.words[11] + 8u) <= 16u && close(gpu.Float(104), guest.Float(104), 1e-3f);
+		// Without a guest match, a blob-resident shader still gets its first cb-sized buffer logged.
+		if (!match && !(blob_shader && !guest_active && gpu.Plausible())) continue;
+
+		++s.matches;
+		auto it = std::find_if(s.per_hash.begin(), s.per_hash.end(), [&](const auto& p) { return p.first == program.shader_hash; });
+		if (it == s.per_hash.end()) it = s.per_hash.insert(s.per_hash.end(), {program.shader_hash, 0});
+		const uint64_t n = ++it->second;
+		if (!(n <= 3 || (n % 600) == 0) || s.printed >= 2000) break;
+		++s.printed;
+
+		const auto& c = gpu;
+		std::printf("NHL27FSR2CAP dispatch=%" PRIu64 " match=%" PRIu64 " hash_seen=%" PRIu64 " cs_hash=%016" PRIx64
+		            " cs_addr=0x%" PRIx64 "%s groups=%ux%ux%u cb_slot=%zu cb_addr=0x%" PRIx64 " cb_size=%" PRIu64
+		            " read=%s guest_frame=%u gpu_frame=%u exact_guest=%d\n",
+		            s.dispatches, s.matches, n, program.shader_hash, cs_addr, blob_shader ? " (eboot FSR2 blob)" : "",
+		            gx, gy, gz, slot, source.address, source.size, backing, guest.words[11], c.words[11],
+		            std::memcmp(c.words.data(), guest.words.data(), 124) == 0 ? 1 : 0);
+		std::printf("NHL27FSR2CAP raw:");
+		for (size_t i = 0; i < read_size / 4; ++i) std::printf(" %08x", c.words[i]);
+		std::printf("\n");
+		std::printf("NHL27FSR2CAP sizes frame=%u render=%ux%u max_render=%ux%u display=%ux%u input_color=%ux%u"
+		            " luma_mip=%ux%u luma_mip_level=%u\n",
+		            c.words[11], c.words[0], c.words[1], c.words[2], c.words[3], c.words[4], c.words[5], c.words[6],
+		            c.words[7], c.words[8], c.words[9], c.words[10]);
+		std::printf("NHL27FSR2CAP temporal jitter=%.9g,%.9g motion_vector_scale=%.9g,%.9g downscale=%.9g,%.9g"
+		            " jitter_cancellation=%.9g,%.9g jitter_sequence_length=%.9g dynamic_res_change=%.9g\n",
+		            c.Float(64), c.Float(68), c.Float(72), c.Float(76), c.Float(80), c.Float(84), c.Float(88),
+		            c.Float(92), c.Float(108), c.Float(116));
+		std::printf("NHL27FSR2CAP camera device_to_view_depth=%.9g,%.9g,%.9g,%.9g tan_half_fov_horizontal=%.9g"
+		            " pre_exposure=%.9g previous_pre_exposure=%.9g delta_time_s=%.9g view_space_to_meters=%.9g\n",
+		            c.Float(48), c.Float(52), c.Float(56), c.Float(60), c.Float(104), c.Float(96), c.Float(100),
+		            c.Float(112), c.Float(120));
+		for (size_t b = 0; b < bindings.buffer_sources.size(); ++b) {
+			const auto& other = bindings.buffer_sources[b];
+			const bool  w     = b < program.info.buffers.size() && program.info.buffers[b].written;
+			std::printf("NHL27FSR2CAP buffer slot=%zu addr=0x%" PRIx64 " size=%" PRIu64 " %s\n", b, other.address,
+			            other.size, w ? "rw" : "r");
+		}
+		for (size_t i = 0; i < bindings.images.size(); ++i) {
+			const auto& image   = bindings.images[i].desc.info;
+			const bool  has_res = i < program.info.images.size();
+			const bool  written = has_res && program.info.images[i].written;
+			const bool  storage = has_res && program.info.images[i].resource_class ==
+			                                     ShaderRecompiler::IR::ImageResourceClass::Storage;
+			std::printf("NHL27FSR2CAP image slot=%zu src=%u desc=%u %s%s addr=0x%" PRIx64 " size=0x%" PRIx64
+			            " dims=%ux%ux%u mips=%u format=%s role=%s\n",
+			            i, has_res ? program.info.images[i].source : 0u,
+			            has_res ? program.info.images[i].descriptor_index : 0u, storage ? "storage" : "sampled",
+			            written ? "+written" : "", image.data.address, image.data.size, image.extent.width,
+			            image.extent.height, image.extent.depth, image.resources.levels,
+			            vk::to_string(image.pixel_format).c_str(), Fsr2RoleGuess(image, written, c));
+		}
+		if (!bindings.table_images.empty()) {
+			std::printf("NHL27FSR2CAP bindless_images=%zu (not listed)\n", bindings.table_images.size());
+		}
+		std::fflush(stdout);
+		break;
+	}
+}
+
+// KYTY_FSR3_CAPTURE=1: NHL 27 upscales with Frostbite's own Fsr3Upsampler (shader programs
+// PrepareInputs, PrepareReactivity, LumaChange, Accumulation; IDA: names at eboot+0x2775700),
+// not the linked but unreached AMD FSR2 SDK, so there is no guest copy of the constants to match.
+// Discovery instead: a dispatch that reads a color image and writes a larger image of the same
+// aspect is an upscale candidate and teaches the render/display sizes; every dispatch whose
+// small constant buffer holds both size pairs is then logged with its raw words and images.
+bool Fsr3CaptureEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FSR3_CAPTURE");
+		return value && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
+}
+
+struct Fsr3SizePair {
+	uint32_t render_w, render_h, display_w, display_h;
+};
+
+struct Fsr3CaptureState {
+	// Every upscale-shaped pair seen (bloom upsamples qualify too); the constant buffer filter
+	// below is what separates the upscaler.
+	std::vector<Fsr3SizePair> pairs;
+	uint64_t                  dispatches = 0, matches = 0, printed = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> per_hash;
+};
+
+template <typename Program>
+void Fsr3CaptureDispatch(const Program& program, const PreparedBindings& bindings, uint64_t cs_addr,
+                         uint32_t gx, uint32_t gy, uint32_t gz) {
+	static Fsr3CaptureState s;
+	++s.dispatches;
+	if ((s.dispatches % 16384) == 0) {
+		std::printf("NHL27FSR3CAP status dispatches=%" PRIu64 " size_pairs=%zu matches=%" PRIu64 "\n", s.dispatches,
+		            s.pairs.size(), s.matches);
+		std::fflush(stdout);
+	}
+
+	// Learn sizes from an upscale-shaped dispatch: written image larger than a read 2D image by the
+	// same factor (1.05..4) on both axes.
+	const size_t image_count = bindings.images.size();
+	for (size_t wi = 0; wi < image_count; ++wi) {
+		if (wi >= program.info.images.size() || !program.info.images[wi].written) continue;
+		const auto& out = bindings.images[wi].desc.info.extent;
+		if (out.width < 640 || out.height < 360 || out.depth != 1) continue;
+		for (size_t ri = 0; ri < image_count; ++ri) {
+			if (ri == wi || (ri < program.info.images.size() && program.info.images[ri].written)) continue;
+			const auto& in = bindings.images[ri].desc.info.extent;
+			if (in.width < 320 || in.height < 180 || in.depth != 1) continue;
+			const float fx = float(out.width) / float(in.width), fy = float(out.height) / float(in.height);
+			if (fx < 1.05f || fx > 4.0f || std::abs(fx - fy) > 0.03f * fx) continue;
+			const bool known = std::any_of(s.pairs.begin(), s.pairs.end(), [&](const Fsr3SizePair& p) {
+				return p.render_w == in.width && p.render_h == in.height && p.display_w == out.width &&
+				       p.display_h == out.height;
+			});
+			if (!known && s.pairs.size() < 32) {
+				s.pairs.push_back({in.width, in.height, out.width, out.height});
+				std::printf("NHL27FSR3CAP sizes cs_hash=%016" PRIx64 " render=%ux%u display=%ux%u (image slots r%zu w%zu)\n",
+				            program.shader_hash, in.width, in.height, out.width, out.height, ri, wi);
+				std::fflush(stdout);
+			}
+			wi = image_count;
+			break;
+		}
+	}
+	if (s.pairs.empty()) return;
+
+	auto find_pair = [](const uint32_t* w, size_t n, uint32_t a, uint32_t b) -> int {
+		for (size_t i = 0; i + 1 < n; ++i)
+			if (w[i] == a && w[i + 1] == b) return int(i);
+		return -1;
+	};
+	for (size_t slot = 0; slot < bindings.buffer_sources.size(); ++slot) {
+		const auto& source = bindings.buffer_sources[slot];
+		if (!source.address || source.size < 16 || source.size > 4096) continue;
+		std::array<uint32_t, 128> words {};
+		const uint64_t read_size = std::min<uint64_t>(source.size, sizeof(words)) & ~uint64_t {3};
+		const char*    backing   = "clean";
+		if (!LibKernel::Memory::TryReadCleanBufferBacking(source.address, words.data(), read_size)) {
+			if (!LibKernel::Memory::TryReadBacking(source.address, words.data(), read_size)) continue;
+			backing = "dirty-backing";
+		}
+		const size_t n  = read_size / 4;
+		int                 ro = -1, display_off = -1;
+		const Fsr3SizePair* pair = nullptr;
+		for (const auto& p : s.pairs) {
+			ro          = find_pair(words.data(), n, p.render_w, p.render_h);
+			display_off = ro < 0 ? -1 : find_pair(words.data(), n, p.display_w, p.display_h);
+			if (ro >= 0 && display_off >= 0) {
+				pair = &p;
+				break;
+			}
+		}
+		if (pair == nullptr) continue;
+
+		++s.matches;
+		auto it = std::find_if(s.per_hash.begin(), s.per_hash.end(), [&](const auto& p) { return p.first == program.shader_hash; });
+		if (it == s.per_hash.end()) it = s.per_hash.insert(s.per_hash.end(), {program.shader_hash, 0});
+		const uint64_t hits = ++it->second;
+		if (!(hits <= 3 || (hits % 600) == 0) || s.printed >= 2000) break;
+		++s.printed;
+
+		std::printf("NHL27FSR3CAP dispatch=%" PRIu64 " hash_seen=%" PRIu64 " cs_hash=%016" PRIx64 " cs_addr=0x%" PRIx64
+		            " groups=%ux%ux%u cb_slot=%zu cb_addr=0x%" PRIx64 " cb_size=%" PRIu64 " read=%s render=%ux%u@w%d"
+		            " display=%ux%u@w%d\n",
+		            s.dispatches, hits, program.shader_hash, cs_addr, gx, gy, gz, slot, source.address, source.size,
+		            backing, pair->render_w, pair->render_h, ro, pair->display_w, pair->display_h, display_off);
+		std::printf("NHL27FSR3CAP raw:");
+		for (size_t i = 0; i < n; ++i) std::printf(" %08x", words[i]);
+		std::printf("\n");
+		// Layout read off the 208-byte cb shared by all four Fsr3Upsampler passes (Oct 18 run, two
+		// consecutive frames): FSR-style fDeviceToViewDepth (w3 = tan(fovY/2), w2 = aspect * w3),
+		// int sizes, float sizes and reciprocals, then per-frame values. Jitter is in render pixels,
+		// Halton(2,3) at frame_index + 1 with x negated. w40..w48 are tuning constants whose names
+		// (Fsr3UpsamplerRenderSettings: ShadingChange*, LumaInstabilityMask*, Lock*) are not mapped.
+		if (source.size == 208 && ro == 4 && display_off == 8) {
+			const auto f = [&](unsigned i) { return std::bit_cast<float>(words[i]); };
+			std::printf("NHL27FSR3CAP fields frame=%u render=%ux%u max_render=%ux%u display=%ux%u max_display=%ux%u"
+			            " jitter=%.9g,%.9g prev_jitter=%.9g,%.9g motion_vector_scale=%.9g,%.9g downscale=%.9g,%.9g"
+			            " device_to_view_depth=%.9g,%.9g,%.9g,%.9g tan_half_fov_y=%.9g delta_time_s=%.9g"
+			            " pre_exposure=%.9g previous_pre_exposure=%.9g tuning=%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g\n",
+			            words[39], words[4], words[5], words[6], words[7], words[8], words[9], words[10], words[11],
+			            f(28), f(29), f(30), f(31), f(32), f(33), f(34), f(35), f(0), f(1), f(2), f(3), f(3), f(36),
+			            f(37), f(38), f(40), f(41), f(42), f(43), f(44), f(45), f(46), f(47), f(48));
+		}
+		// Word index, hex and float view, eight per line, for reading the layout off the log.
+		for (size_t i = 0; i < n; i += 8) {
+			std::printf("NHL27FSR3CAP w%03zu:", i);
+			for (size_t j = i; j < std::min(n, i + 8); ++j) std::printf(" %u/%.6g", words[j], std::bit_cast<float>(words[j]));
+			std::printf("\n");
+		}
+		for (size_t b = 0; b < bindings.buffer_sources.size(); ++b) {
+			const auto& other = bindings.buffer_sources[b];
+			const bool  w     = b < program.info.buffers.size() && program.info.buffers[b].written;
+			std::printf("NHL27FSR3CAP buffer slot=%zu addr=0x%" PRIx64 " size=%" PRIu64 " %s\n", b, other.address,
+			            other.size, w ? "rw" : "r");
+		}
+		for (size_t i = 0; i < image_count; ++i) {
+			const auto& image   = bindings.images[i].desc.info;
+			const bool  has_res = i < program.info.images.size();
+			const bool  written = has_res && program.info.images[i].written;
+			const bool  storage = has_res && program.info.images[i].resource_class ==
+			                                     ShaderRecompiler::IR::ImageResourceClass::Storage;
+			std::printf("NHL27FSR3CAP image slot=%zu src=%u desc=%u %s%s addr=0x%" PRIx64 " size=0x%" PRIx64
+			            " dims=%ux%ux%u mips=%u format=%s\n",
+			            i, has_res ? program.info.images[i].source : 0u,
+			            has_res ? program.info.images[i].descriptor_index : 0u, storage ? "storage" : "sampled",
+			            written ? "+written" : "", image.data.address, image.data.size, image.extent.width,
+			            image.extent.height, image.extent.depth, image.resources.levels,
+			            vk::to_string(image.pixel_format).c_str());
+		}
+		if (!bindings.table_images.empty()) {
+			std::printf("NHL27FSR3CAP bindless_images=%zu (not listed)\n", bindings.table_images.size());
+		}
+		std::fflush(stdout);
+		break;
+	}
+}
+
+} // namespace
+
 // As for draws: more resolutions than operations can wait between the two threads.
 struct RenderExecutor::ResolvedDispatchRing {
 	static constexpr size_t Size = 320;
@@ -448,7 +911,10 @@ RenderExecutor::ResolvedDispatch* RenderExecutor::ResolveDispatchAhead(const HW:
                                                                        bool async_compute, bool indirect) {
 	if ((!indirect && (thread_group_x == 0 || thread_group_y == 0 || thread_group_z == 0)) ||
 	    shaders.GetCs().cs_regs.data_addr == 0 ||
-	    (indirect && (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0)) {
+	    (indirect && (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) ||
+	    // Resolving ahead must not reach a shader the guest has not registered yet; the
+	    // execution thread looks it up in order.
+	    !ShaderMapContains({shaders.GetCs().cs_regs.data_addr})) {
 		return nullptr;
 	}
 	Common::RuntimeFlags::EvaluationScope flags_scope;
@@ -537,11 +1003,6 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 
-	if (sh_ctx.GetCs().cs_regs.data_addr == 0) {
-		return;
-	}
-
-	constexpr uint32_t DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS = 1u << 5u;
 	constexpr uint32_t DISPATCH_INITIATOR_BASE_BITS             = 0x41u;
 	constexpr uint32_t DISPATCH_INITIATOR_MODIFIER_BITS         = 0xa038u;
 	constexpr uint32_t DISPATCH_INITIATOR_KNOWN_MASK =
@@ -566,6 +1027,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	PrepareComputeInputInfo(sh_ctx, thread_group_x, thread_group_y, thread_group_z, mode, async_compute, input_info);
 	const bool use_thread_dimensions = input_info.dispatch_thread_dimensions;
 	BufferCache::PerfTimerScope program_timer(BufferCache::PerfTimer::DispatchProgram);
+	m_context.GetImageHeap().BeginDraw();
 	// Experiment DispatchAhead: the resolve thread may have resolved the program already; it
 	// holds when the guest memory it read still has the same bytes.
 	const auto compute_program = [&] {
@@ -609,10 +1071,23 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	const auto& program   = *input_info.stage.program;
 	const auto& resources = *input_info.stage.resources;
+	if (FillDiagEnabled()) {
+		const char*          why = "fill";
+		ShaderBufferResource diag_descriptor;
+		uint32_t             diag_value = 0;
+		uint64_t             diag_size  = 0;
+		if (!resources.specialization_reads.empty()) {
+			why = "specialization-reads";
+		} else {
+			(void)ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z, mode,
+			                               diag_descriptor, diag_value, diag_size, &why);
+		}
+		FillDiag(input_info, "direct", thread_group_x, thread_group_y, thread_group_z, mode, why);
+	}
 	if (resources.specialization_reads.empty() &&
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
-	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
-	                                 thread_group_z, mode))) {
+	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
+	                           thread_group_z, mode))) {
 		ResetBindings();
 		return;
 	}
@@ -626,6 +1101,49 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		if (ResolveComputeBufferFill(input_info, thread_group_x, thread_group_y, thread_group_z,
 		                             mode, fill_descriptor, known_fill_value, known_fill_size)) {
 			known_fill_address = fill_descriptor.Base48();
+		}
+	}
+	uint64_t known_pattern_address = 0;
+	uint64_t known_pattern_size    = 0;
+	uint32_t known_pattern_stride  = 0;
+	uint32_t known_pattern_words   = 0;
+	if (known_fill_size == 0 && BufferCache::PerfNoSyncReadback() &&
+	    resources.specialization_reads.empty() &&
+	    resources.uniform_pattern.kind == ShaderRecompiler::IR::UniformFillKind::Buffer &&
+	    Common::Experiments::EnvEnabled(Common::Experiments::EnvBit::FillPatterns)) {
+		const char* pattern_why = "ok";
+		if (ResolveComputeBufferPattern(input_info, thread_group_x, thread_group_y, thread_group_z,
+		                                mode, known_pattern_address, known_pattern_size,
+		                                known_pattern_stride, known_pattern_words, pattern_why)) {
+		} else {
+			known_pattern_size = 0;
+			if (FrameBreakdown::Enabled()) {
+				// NHL27PATTERN reject: once per shader and reason (at most 64 lines).
+				static std::mutex                      reject_mutex;
+				static std::unordered_set<std::string> seen;
+				char key[128];
+				std::snprintf(key, sizeof(key), "%016llx %s",
+				              static_cast<unsigned long long>(program.shader_hash), pattern_why);
+				bool first = false;
+				{
+					std::scoped_lock lock {reject_mutex};
+					first = seen.size() < 64 && seen.insert(key).second;
+				}
+				if (first) {
+					const auto d = resources.uniform_pattern.resource < resources.buffers.size()
+					                   ? DecodeNativeDescriptor<ShaderBufferResource>(
+					                         resources.buffers[resources.uniform_pattern.resource])
+					                   : ShaderBufferResource {};
+					std::printf("NHL27PATTERN: reject shader=0x%016llx why=%s groups=%ux%ux%u threads=%ux%ux%u mode=0x%x "
+					            "words=%u stride=%u records=%u format=%u\n",
+					            static_cast<unsigned long long>(program.shader_hash), pattern_why,
+					            thread_group_x, thread_group_y, thread_group_z, input_info.threads_num[0],
+					            input_info.threads_num[1], input_info.threads_num[2], mode,
+					            resources.uniform_pattern.words, d.Stride(), d.NumRecords(),
+					            static_cast<unsigned>(d.Format()));
+					std::fflush(stdout);
+				}
+			}
 		}
 	}
 	uint64_t copy_source      = 0;
@@ -708,6 +1226,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 			m_context.PrepareBda();
 		}
 	}
+	if (program.info.uses_image_heap) {
+		m_context.GetImageHeap().Rebind(*this);
+	}
 	{
 		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dc_textures_ns);
 		RebindImages(bindings);
@@ -749,11 +1270,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		    });
 		const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
 		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
-		     " hash=0x%016" PRIx64 " tick=%" PRIu64
+		     " hash=0x%016" PRIx64 " tick=%" PRIu64 " completed_tick=%" PRIu64
 		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
 		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
 		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, program.shader_hash,
 		     m_context.GetCommandScheduler().CurrentTick(),
+		     m_context.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick(),
 		     thread_group_x, thread_group_y, thread_group_z, mode,
 		     input_info.threads_num[0], input_info.threads_num[1],
 		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size(),
@@ -874,15 +1396,94 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	                                       thread_group_z);
 	FrameBreakdown::Add(FrameBreakdown::g_counters.dispatches);
 	FrameBreakdown::Add(FrameBreakdown::g_counters.dc_handled);
-	vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+	// The NHL27 FSR3 present path overwrites the game's accumulation output, so it can drop it.
+	if (!Nhl27Fsr3::Enabled() || !m_nhl27_fsr3 ||
+	    !m_nhl27_fsr3->ReplacesDispatch(m_context, buffer, program.shader_hash, bindings)) {
+		constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
+		const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
+		                                   std::max(input_info.threads_num[1], 1u) *
+		                                   std::max(input_info.threads_num[2], 1u);
+		if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
+		    group_threads <= input_info.wave_size && !input_info.lds_storage) {
+			// A single guest wave per group can run in launch order without a device-wide
+			// spinlock. Keep the guest workgroup IDs when splitting the dispatch.
+			for (uint32_t z = 0; z < thread_group_z; ++z) {
+				for (uint32_t y = 0; y < thread_group_y; ++y) {
+					for (uint32_t x = 0; x < thread_group_x; ++x) {
+						if ((x | y | z) != 0u) {
+							ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+						}
+						vk_buffer.RecordExternal([x, y, z](vk::CommandBuffer c) {
+							c.dispatchBase(x, y, z, 1, 1, 1);
+						});
+					}
+				}
+			}
+		} else {
+			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		}
+	}
 	BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
 	m_context.GetTextureCache().FlushStorageShadows();
 	record_timer.Stop();
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	if (!BufferCache::GuestSyncOnly()) {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		BufferCache::PerfCount(BufferCache::PerfEvent::AutoDispatchBarrier);
+	}
+	// Diagnostic only: inspect already-clean constant-buffer backing without GPU waits or
+	// protected guest reads. A plausible cbFSR2 match never enables reconstruction by itself.
+	static const bool fsr2_probe = [] {
+		const char* value = std::getenv("KYTY_FSR2_PROBE");
+		return value && std::strcmp(value, "1") == 0;
+	}();
+	if (Fsr2CaptureEnabled()) {
+		Fsr2CaptureDispatch(program, bindings, sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y,
+		                    thread_group_z);
+	}
+	if (Fsr3CaptureEnabled()) {
+		Fsr3CaptureDispatch(program, bindings, sh_ctx.GetCs().cs_regs.data_addr, thread_group_x, thread_group_y,
+		                    thread_group_z);
+	}
+	if (fsr2_probe) {
+		static uint64_t dispatches = 0, clean = 0, refused = 0, candidates = 0;
+		++dispatches;
+		for (size_t slot = 0; slot < bindings.buffer_sources.size(); ++slot) {
+			const auto& source = bindings.buffer_sources[slot];
+			if (!source.address || source.size < 128) continue;
+			Fsr2ConstantsCandidate constants;
+			if (!LibKernel::Memory::TryReadCleanBufferBacking(source.address, constants.words.data(), 128)) {
+				++refused;
+				continue;
+			}
+			++clean;
+			if (!constants.Plausible()) continue;
+			if (++candidates > 64) continue;
+			std::printf("NHL27FSR2 candidate=%" PRIu64 " cs=%016" PRIx64 " buf=%zu addr=%" PRIx64
+			            " render=%ux%u display=%ux%u frame=%u jitter=%g,%g motion_scale=%g,%g tan_half_horizontal_fov=%g delta_seconds=%g\n",
+			            candidates, program.shader_hash, slot, source.address, constants.words[0], constants.words[1],
+			            constants.words[4], constants.words[5], constants.words[11], constants.Float(64), constants.Float(68),
+			            constants.Float(72), constants.Float(76), constants.Float(104), constants.Float(112));
+			std::printf("NHL27FSR2 words:");
+			for (auto word: constants.words) std::printf(" %08x", word);
+			std::printf("\n");
+			for (size_t i = 0; i < bindings.images.size(); ++i) {
+				const auto& image = bindings.images[i].desc.info;
+				std::printf("NHL27FSR2 img=%zu addr=%" PRIx64 " size=%ux%u format=%s written=%d\n",
+				            i, image.data.address, image.extent.width, image.extent.height,
+				            vk::to_string(image.pixel_format).c_str(),
+				            i < program.info.images.size() && program.info.images[i].written);
+			}
+			std::fflush(stdout);
+		}
+		if ((dispatches % 4096) == 0) {
+			std::printf("NHL27FSR2 probe dispatches=%" PRIu64 " clean=%" PRIu64 " refused=%" PRIu64 " candidates=%" PRIu64 "\n",
+			            dispatches, clean, refused, candidates);
+			std::fflush(stdout);
+		}
 	}
 	if (FrameDump::TraceEnabled()) {
 		for (size_t i = 0; i < bindings.images.size() && i < program.info.images.size(); i++) {
@@ -914,6 +1515,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		// Recorded after the bindings marked the range GPU-written, which clears older records.
 		m_context.GetBufferCache().RecordGpuFill(known_fill_address, known_fill_size,
 		                                         known_fill_value);
+	}
+	if (known_pattern_size != 0) {
+		m_context.GetBufferCache().RecordGpuFillPattern(
+		    known_pattern_address, known_pattern_size, known_pattern_stride,
+		    std::span(resources.uniform_pattern_values).first(known_pattern_words));
 	}
 	if (copy_size != 0) {
 		auto& cache = m_context.GetBufferCache();
@@ -948,6 +1554,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		            gds_before[3], gds_after[0], gds_after[1], gds_after[2], gds_after[3]);
 		std::fflush(stdout);
 	}
+	if (Nhl27Fsr3::Enabled()) {
+		if (!m_nhl27_fsr3)
+			m_nhl27_fsr3 = std::make_shared<Nhl27Fsr3>(m_context.GetGraphics());
+		m_nhl27_fsr3->OnDispatch(m_context, buffer, program.shader_hash, bindings);
+	}
 	ResetBindings();
 }
 
@@ -963,6 +1574,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 	Common::LockGuard lock(m_context.GetMutex());
 	FrameBreakdown::Timer total_timer(FrameBreakdown::g_counters.dc_total_ns);
+	vk::DispatchIndirectCommand args {};
+	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
+	    (args.x == 0 || args.y == 0 || args.z == 0)) {
+		return;
+	}
+
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
@@ -970,6 +1588,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	ShaderComputeInputInfo input_info {};
 	BufferCache::PerfTimerScope program_timer(BufferCache::PerfTimer::DispatchProgram);
 	input_info.async_compute = async_compute;
+	input_info.indirect_args_address = args_addr;
+	m_context.GetImageHeap().BeginDraw();
 	// As for direct dispatches: the resolve thread may have resolved the program already (it
 	// holds while the guest memory it read has the same bytes).
 	const auto compute_program = [&] {
@@ -985,6 +1605,13 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		// NHL debugging: the shader failed to build (KYTY_DBG_SKIP_BAD_SHADERS=1); skip the dispatch.
 		ResetBindings();
 		return;
+	}
+	if (FillDiagEnabled()) {
+		// Indirect dispatches are never taken as fills: their group counts are GPU data.
+		FillDiag(input_info, "indirect", 0, 0, 0, mode,
+		         input_info.stage.resources->uniform_fill.kind == ShaderRecompiler::IR::UniformFillKind::None
+		             ? "no-fill-pattern"
+		             : "fill-pattern-but-indirect");
 	}
 	buffer.EndRendering();
 	FrameBreakdown::Timer pipeline_timer(FrameBreakdown::g_counters.dc_pipeline_ns);
@@ -1011,10 +1638,14 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 		BindSharedMemory(m_context, input_info, bindings, args_addr);
 	}
+	if (program.info.uses_image_heap) {
+		m_context.GetImageHeap().Rebind(*this);
+	}
 	{
 		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dc_textures_ns);
 		RebindImages(bindings);
 	}
+
 	// Acquiring arguments can merge cache buffers; finalize shader bindings afterward.
 	FrameBreakdown::Timer args_timer(FrameBreakdown::g_counters.dc_buffers_ns);
 	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
@@ -1087,6 +1718,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		BufferCache::PerfCount(BufferCache::PerfEvent::AutoDispatchBarrier);
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+
 	ResetBindings();
 }
 

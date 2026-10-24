@@ -5,6 +5,7 @@
 #include "common/abi.h"
 #include "common/assert.h"
 #include "common/common.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/lightingTrace.h"
 #include "common/logging/log.h"
@@ -20,10 +21,12 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/performanceOverlay.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/renderDoc.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#include "libs/hmd2.h"
 #include "libs/libs.h"
 #include "loader/systemContent.h"
 
@@ -54,6 +57,7 @@ constexpr int      VIDEO_OUT_FALSE                                      = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_MAIN                              = 0;
 constexpr int      VIDEO_OUT_BUS_TYPE_OVERLAY                           = 1;
 constexpr int      VIDEO_OUT_BUS_TYPE_SUB                               = 2;
+constexpr int      VIDEO_OUT_BUS_TYPE_HMD2_MAIN                          = 32;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC                            = 1;
 constexpr int      VIDEO_OUT_FLIP_MODE_VSYNC_MULTI                      = 4;
 constexpr int      VIDEO_OUT_FLIP_MODE_SLAVE                            = 8;
@@ -69,6 +73,7 @@ constexpr uint64_t VIDEO_OUT_REFRESH_RATE_59_94HZ                       = 3;
 constexpr uint64_t VIDEO_OUT_REFRESH_RATE_119_88HZ                      = 13;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED     = 0;
 constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED       = 1;
+constexpr int      VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HMD2              = 0x10;
 constexpr uint64_t VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_STRICT_COLORIMETRY = 8;
 constexpr uint64_t VIDEO_OUT_BUFFER_ATTRIBUTE_OPTION_ALPHA_PREMULTIPLIED = 32;
 
@@ -150,6 +155,7 @@ struct VideoOutOutputStatus {
 	uint64_t flags        = 0;
 	uint64_t reserved[3]  = {};
 };
+static_assert(sizeof(VideoOutOutputStatus) == 0x30); // Also used by VideoOutVrrStatus.
 
 struct VideoOutOutputOptions {
 	uint32_t internalData[16] = {};
@@ -222,7 +228,7 @@ public:
 	void WaitForSubmitSlot(VideoOutConfig& cfg);
 	bool Flip(uint32_t micros);
 	void GetFlipStatus(VideoOutConfig& cfg, VideoOutFlipStatus& out);
-	void Wait(VideoOutConfig& cfg, int index);
+	bool IsSafeForRendering(VideoOutConfig& cfg, int index);
 
 private:
 	enum class RequestState { Reserved, Recording, Ready, Presenting };
@@ -241,6 +247,7 @@ private:
 		Graphics::Presenter::Frame* frame;
 		bool                        premultiplied_alpha;
 	};
+	void SignalDoneLocked();
 
 	Graphics::Presenter& m_presenter;
 	Common::Mutex        m_mutex;
@@ -251,13 +258,15 @@ private:
 	std::list<Request>   m_cpu_requests;
 	std::list<Request>   m_cancelled_requests;
 	bool                 m_processing      = false;
+	bool                 m_gpu_waiting     = false;
 	uint64_t             m_next_request_id = 1;
 };
 
 struct VideoOutDriver::Impl {
 public:
-	static constexpr std::array VIDEO_OUT_BUSES {
-	    VIDEO_OUT_BUS_TYPE_MAIN, VIDEO_OUT_BUS_TYPE_OVERLAY, VIDEO_OUT_BUS_TYPE_SUB};
+	static constexpr std::array VIDEO_OUT_BUSES {VIDEO_OUT_BUS_TYPE_MAIN,
+	                                             VIDEO_OUT_BUS_TYPE_OVERLAY, VIDEO_OUT_BUS_TYPE_SUB,
+	                                             VIDEO_OUT_BUS_TYPE_HMD2_MAIN};
 	static constexpr int VIDEO_OUT_NUM_MAX = VIDEO_OUT_BUSES.size() + 1;
 
 	Impl(uint32_t width, uint32_t height, Graphics::Presenter& presenter)
@@ -525,6 +534,10 @@ static bool IsValidFlipMode(int mode) {
 	       mode == VIDEO_OUT_FLIP_MODE_SLAVE || mode == VIDEO_OUT_FLIP_MODE_MASTER;
 }
 
+// Set once the headset port shows eye images. The window then shows them instead of the main port,
+// so the picture is visible without a headset.
+static std::atomic<bool> g_headset_mirror {false};
+
 static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int index, int flip_mode,
                               int64_t flip_arg, FlipRequestSource source, uint64_t& request_id) {
 	auto* video_out = driver.Get(handle);
@@ -545,8 +558,10 @@ static int ReserveFlipRequest(VideoOutDriver::Impl& driver, int handle, int inde
 	    (video_out->slave_count != 0) != (flip_mode == VIDEO_OUT_FLIP_MODE_MASTER)) {
 		return VIDEO_OUT_ERROR_INVALID_FLIP_MODE;
 	}
+	// The headset port can flip before its reprojection buffers are registered; those show blank.
 	if (video_out->closing ||
-	    (!IsSpecialBufferIndex(index) && !video_out->buffers[index].Occupied())) {
+	    (!IsSpecialBufferIndex(index) && !video_out->buffers[index].Occupied() &&
+	     video_out->bus != VIDEO_OUT_BUS_TYPE_HMD2_MAIN)) {
 		return VIDEO_OUT_ERROR_INVALID_INDEX;
 	}
 	if (!driver.GetFlipQueue().Reserve(*video_out, index, flip_arg, source, request_id)) {
@@ -755,6 +770,9 @@ bool VideoOutDriver::Impl::Close(int handle) {
 		master->slave_count--;
 	}
 	m_flip_queue.Cancel(config);
+	if (config.bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN) {
+		g_headset_mirror = false;
+	}
 	m_presenter.ClearLayer(config.bus);
 	DeleteVideoOutEvents(flip_events, VideoOutEventKind::Flip);
 	DeleteVideoOutEvents(pre_vblank_events, VideoOutEventKind::PreVblankStart);
@@ -971,6 +989,9 @@ void VideoOutDriver::Impl::PresentThread(std::stop_token token) {
 
 		const auto frame_end = Common::Timer::QueryPerformanceCounter();
 		total_wait += static_cast<int64_t>(period) - static_cast<int64_t>(frame_end - frame_begin);
+		if (total_wait < 0) {
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::LateVblanks);
+		}
 	}
 }
 
@@ -997,9 +1018,10 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 				}
 			}
 		}
-		m_done_cond_var.SignalAll();
+		SignalDoneLocked();
 	}
 	if (cfg.flip_status.flipPendingNum >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) {
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRejected);
 		return false;
 	}
 	auto& pending = source == FlipRequestSource::GpuEop ? m_requests : m_cpu_requests;
@@ -1027,6 +1049,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 
 	pending.push_back(r);
 	request_id = r.id;
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRequested);
 
 	cfg.flip_status.flipPendingNum++;
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
@@ -1075,7 +1098,7 @@ void FlipQueue::Cancel(VideoOutConfig& cfg) {
 			it = queue->erase(it);
 		}
 	}
-	m_done_cond_var.SignalAll();
+	SignalDoneLocked();
 	m_submit_slot_cond_var.SignalAll();
 	m_submit_cond_var.SignalAll();
 	m_mutex.Unlock();
@@ -1121,16 +1144,19 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		index          = request->index;
 	}
 
-	const bool          special = IsSpecialBufferIndex(index);
+	bool                special = IsSpecialBufferIndex(index);
 	Graphics::ImageInfo source_info;
 	uint32_t            width   = 0;
 	uint32_t            height  = 0;
 	bool                current = false;
 	bool                premultiplied_alpha = false;
 	bool                hdr                 = false;
+	bool                headset             = false;
 	{
 		Common::LockGuard lock(cfg->mutex);
 		current = cfg->opened && !cfg->closing && cfg->generation == generation;
+		headset = cfg->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN;
+		special = special || (headset && !cfg->buffers[index].Occupied());
 		if (current && special) {
 			width  = cfg->width;
 			height = cfg->height;
@@ -1175,7 +1201,10 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
 	} else {
-		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr);
+		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr, headset);
+		if (headset) {
+			g_headset_mirror = true;
+		}
 	}
 
 	Common::LockGuard lock(m_mutex);
@@ -1243,21 +1272,24 @@ void FlipQueue::WaitForSubmitSlot(VideoOutConfig& cfg) {
 	}
 }
 
-void FlipQueue::Wait(VideoOutConfig& cfg, int index) {
-	Common::LockGuard lock(m_mutex);
-
-	auto has_request = [this, &cfg, index] {
-		auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
-		return std::any_of(m_requests.begin(), m_requests.end(), matches) ||
-		       std::any_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
-	};
-	if (has_request()) {
-		Common::Timeline::Mark("flip-wait", static_cast<uint64_t>(index));
-		while (has_request()) {
-			m_done_cond_var.Wait(&m_mutex);
-		}
-		Common::Timeline::Mark("flip-wait-done", static_cast<uint64_t>(index));
+void FlipQueue::SignalDoneLocked() {
+	m_done_cond_var.SignalAll();
+	// A stalled GPU cannot drain and shut down without re-checking under m_mutex, so it is alive here.
+	if (m_gpu_waiting) {
+		m_gpu_waiting = false;
+		m_presenter.Renderer().GetGpu().Wake();
 	}
+}
+
+// A display buffer is safe for rendering once it is neither displayed nor waiting to be.
+bool FlipQueue::IsSafeForRendering(VideoOutConfig& cfg, int index) {
+	Common::LockGuard lock(m_mutex);
+	auto matches = [&cfg, index](const auto& r) { return r.cfg == &cfg && r.index == index; };
+	const bool safe = cfg.flip_status.currentBuffer != index &&
+	                  std::none_of(m_requests.begin(), m_requests.end(), matches) &&
+	                  std::none_of(m_cpu_requests.begin(), m_cpu_requests.end(), matches);
+	m_gpu_waiting = !safe;
+	return safe;
 }
 
 bool FlipQueue::Flip(uint32_t micros) {
@@ -1318,17 +1350,34 @@ bool FlipQueue::Flip(uint32_t micros) {
 	};
 	bool due = lock_ports();
 	std::array<Graphics::Presenter::Layer, VideoOutDriver::Impl::VIDEO_OUT_BUSES.size()> layers {};
+	size_t                      layer_count = 0;
+	Graphics::Presenter::Frame* hidden      = nullptr; // The main port behind the headset image.
 	for (size_t i = 0; i < count; i++) {
 		auto& r = requests[i];
 		if (r.id == group) {
 			due &= IsFlipDueLocked(*r.cfg, r.generation);
 		}
-		layers[i] = {r.frame, r.cfg->bus, r.premultiplied_alpha};
+		if (r.cfg->bus == VIDEO_OUT_BUS_TYPE_MAIN &&
+		    g_headset_mirror.load(std::memory_order_relaxed)) {
+			hidden = r.frame;
+		} else {
+			const bool headset    = r.cfg->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN;
+			layers[layer_count++] = {r.frame, headset ? VIDEO_OUT_BUS_TYPE_MAIN : r.cfg->bus,
+			                         r.premultiplied_alpha};
+		}
 	}
 	if (due) {
 		unlock_ports();
 		Common::Timeline::Mark("flip-present", static_cast<uint64_t>(requests[0].index));
-		m_presenter.Present(std::span(layers.data(), count));
+		if (hidden != nullptr) {
+			m_presenter.Discard(*hidden);
+		}
+		if (layer_count != 0) {
+			m_presenter.Present(std::span(layers.data(), layer_count));
+		}
+		if (requests[0].cfg->bus == 0) {
+			Graphics::PerformanceOverlayRecordFlip(requests[0].cfg->width, requests[0].cfg->height);
+		}
 		Common::Timeline::Mark("flip-presented", static_cast<uint64_t>(requests[0].index));
 		due = lock_ports();
 	}
@@ -1356,7 +1405,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		it = m_requests.erase(it);
 	}
 	m_processing = false;
-	m_done_cond_var.SignalAll();
+	SignalDoneLocked();
 	m_submit_slot_cond_var.SignalAll();
 	m_mutex.Unlock();
 	unlock_ports();
@@ -1574,6 +1623,33 @@ KYTY_SYSV_ABI int VideoOutRegisterBuffers2(int handle, int set_index, int buffer
 	if (option != nullptr) {
 		return VIDEO_OUT_ERROR_INVALID_OPTION;
 	}
+	// The headset port takes reprojection buffers with a zeroed attribute. Each names its eye
+	// texture, which is registered and flipped like a regular surface.
+	const bool headset = ctx->bus == VIDEO_OUT_BUS_TYPE_HMD2_MAIN;
+	if (headset != (category == VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_HMD2)) {
+		return VIDEO_OUT_ERROR_INVALID_CATEGORY;
+	}
+	VideoOutBufferAttribute2                              headset_attribute {};
+	std::array<VideoOutBuffers, VIDEO_OUT_BUFFER_NUM_MAX> headset_buffers {};
+	if (headset) {
+		for (int i = 0; i < buffer_num; i++) {
+			Hmd2::ReprojectionSurface surface {};
+			if (buffers[i].metadata != nullptr ||
+			    !Hmd2::GetReprojectionSurface(buffers[i].data, surface) ||
+			    (i != 0 && (surface.width != headset_attribute.width ||
+			                surface.height != headset_attribute.height ||
+			                surface.pixel_format != headset_attribute.pixel_format))) {
+				return VIDEO_OUT_ERROR_INVALID_VALUE;
+			}
+			headset_attribute.pixel_format = surface.pixel_format;
+			headset_attribute.width        = surface.width;
+			headset_attribute.height       = surface.height;
+			headset_buffers[i].data        = reinterpret_cast<const void*>(surface.address);
+		}
+		attribute = &headset_attribute;
+		buffers   = headset_buffers.data();
+		category  = VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED;
+	}
 	if (category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED &&
 	    category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED) {
 		return VIDEO_OUT_ERROR_INVALID_CATEGORY;
@@ -1747,12 +1823,12 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
 	m_impl->GetFlipQueue().WaitForSubmitSlot(*cfg);
 }
 
-void VideoOutDriver::WaitFlipDone(int handle, int index) {
+bool VideoOutDriver::IsSafeForRendering(int handle, int index) {
 	auto* ctx = m_impl->Get(handle);
 	EXIT_IF(ctx == nullptr);
 
 	EXIT_NOT_IMPLEMENTED(!IsValidBufferIndex(index));
-	m_impl->GetFlipQueue().Wait(*ctx, index);
+	return m_impl->GetFlipQueue().IsSafeForRendering(*ctx, index);
 }
 
 KYTY_SYSV_ABI int VideoOutGetFlipStatus(int handle, VideoOutFlipStatus* status) {
@@ -1922,16 +1998,34 @@ KYTY_SYSV_ABI int VideoOutGetOutputStatus(int handle, VideoOutOutputStatus* stat
 		const char* value = std::getenv("KYTY_VIDEO_OUT_1080P");
 		return value != nullptr && value[0] == '1';
 	}();
+	// KYTY_VIDEO_OUT_4K_CALLS=N (with KYTY_VIDEO_OUT_1080P=1): the first N status queries still
+	// report 4K. NHL 27 picks its platform settings profile once from the first query; its 1080p
+	// profile has no entries and the game crashes, so it must see 4K there and 1080p afterwards.
+	static const int fake_4k_calls = [] {
+		const char* value = std::getenv("KYTY_VIDEO_OUT_4K_CALLS");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	static std::atomic<int> status_calls {0};
+	const bool fake_4k = status_calls.fetch_add(1, std::memory_order_relaxed) < fake_4k_calls;
 	ctx->mutex.Lock();
-	// Primary output reports 4K unless param.json Video-out Info enables resolution detection.
-	// KYTY_OUTPUT_1080P=1 reports a 1080p output to the game whatever it declares (NHL 27 then
-	// picks its own display buffers and render resolution).
+	// NHL 27 probes and closes the primary port before reopening it for output.
+	// Its packaged render profiles contain PS5_4K but not PS5_BASE. Keep that
+	// initial hardware probe native; the reopened output port can use 1080p.
+	static const bool nhl27 = [] {
+		std::string title_id;
+		return Loader::SystemContentParamSfoGetString("TITLE_ID", &title_id) && title_id == "PPSA34063";
+	}();
+	// The newer override also applies with a 4K host window.
 	static const bool output_1080p = [] {
 		const char* value = std::getenv("KYTY_OUTPUT_1080P");
 		return value != nullptr && value[0] == '1';
 	}();
+	const bool preserve_profile_probe = (force_1080p || output_1080p) && nhl27 && (attribute3 & 4) == 0 &&
+	                                    ctx->bus == VIDEO_OUT_BUS_TYPE_MAIN && ctx->generation == 1;
 	status->resolution =
-	    (output_1080p || ((force_1080p || (attribute3 & 4) != 0) && ctx->width < 3840 && ctx->height < 2160) ? 1u : 2u);
+	    (!fake_4k && !preserve_profile_probe &&
+	             (output_1080p || ((force_1080p || (attribute3 & 4) != 0) &&
+	                              ctx->width < 3840 && ctx->height < 2160)) ? 1u : 2u);
 	static std::atomic<int> reported {0};
 	if (reported.fetch_add(1, std::memory_order_relaxed) < 4) {
 		std::printf("NHL27VIDEO: output status resolution=%u attribute3=0x%x force_1080p=%d window=%ux%u\n",
@@ -2006,7 +2100,8 @@ static int ValidateOutputConfig(int handle, uint64_t mode, const VideoOutOutputO
 		}
 	}
 
-	if (mode != VIDEO_OUT_OUTPUT_MODE_DEFAULT && mode != VIDEO_OUT_OUTPUT_MODE_119_88HZ) {
+	if (mode != VIDEO_OUT_OUTPUT_MODE_DEFAULT && mode != VIDEO_OUT_OUTPUT_MODE_119_88HZ &&
+	    mode != Hmd2::OUTPUT_MODE_89_91HZ && mode != Hmd2::OUTPUT_MODE_119_88HZ) {
 		return VIDEO_OUT_ERROR_UNSUPPORTED_OUTPUT_MODE;
 	}
 

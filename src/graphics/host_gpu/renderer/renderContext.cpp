@@ -28,9 +28,10 @@ RenderContext::RenderContext(GraphicContext& graphics)
       m_command_scheduler(*this, graphics,
                           (Config::GpuPipelineStages() & Config::GPU_PIPELINE_RECORDING) != 0),
       m_descriptor_heap(graphics, m_command_scheduler.GetMasterSemaphore()),
-      m_pipeline_cache(graphics), m_sampler_cache(graphics),
+      m_pipeline_cache(graphics, &m_image_heap), m_sampler_cache(graphics),
       m_buffer_cache(graphics, m_command_scheduler, m_page_manager, m_texture_cache),
-      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache) {
+      m_texture_cache(graphics, m_command_scheduler, m_page_manager, m_buffer_cache),
+      m_image_heap(*this, m_page_manager) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	// Experiment FaultPageReads: resource-table reads of a page the GPU thread took a read fault on
 	// (the GPU wrote other bytes of it) read clean bytes through the backing instead of faulting
@@ -187,6 +188,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 				m_buffer_cache.MarkCpuDirtyAhead(next, kAheadBytes);
 			}
 		}
+		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 	} else {
 		FrameBreakdown::FaultTimer t(FrameBreakdown::g_fault_cost.rd_readmem_ns);
 		if (GuestGpu::IsGpuThread()) {
@@ -217,6 +219,7 @@ bool RenderContext::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	}
 	m_buffer_cache.InvalidateMemory(vaddr, size);
 	m_texture_cache.InvalidateMemory(vaddr, size);
+	m_image_heap.InvalidateMemory(vaddr, size);
 	return true;
 }
 
@@ -294,9 +297,21 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		const bool gpu     = active && m_buffer_cache.IsRegionGpuModified(vaddr, size);
 		const bool images  = active && !gpu && m_texture_cache.HasImagesInRegion(vaddr, size);
 		const bool pending = active && !gpu && !images && m_command_scheduler.HasPendingGuestOperations(vaddr, size);
-		const bool drain   = gpu || images ||
+		bool       drain   = gpu || images ||
 		                   (pending && Common::Experiments::Enabled(Common::Experiments::AbPending));
+		// Experiment UnmapBufferWait: when only GPU-written buffer bytes are in the range, the
+		// write-back below downloads them, and a download already waits for the submission that
+		// last wrote the buffer (or flushes and waits when the writer is still being recorded).
+		// Draining the whole GPU first only adds the latency of the work queued after it.
+		const bool buffer_wait = gpu && Common::Experiments::EnvEnabled(Common::Experiments::EnvBit::UnmapBufferWait) &&
+		                         !m_texture_cache.HasImagesInRegion(vaddr, size) &&
+		                         !m_command_scheduler.HasPendingGuestOperations(vaddr, size);
+		if (buffer_wait) {
+			drain = false;
+		}
 		const auto start   = CpReadDebugEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+		const auto unmap_start = FrameBreakdown::Enabled() ? std::chrono::steady_clock::now()
+		                                                   : std::chrono::steady_clock::time_point {};
 		if (drain) {
 			const auto tick = m_command_scheduler.CurrentTick();
 			m_command_scheduler.Finish();
@@ -326,12 +341,38 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		}
 		BufferCache::WriteTagScope tag(BufferCache::WriteTag::Unmap);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
+		if (FrameBreakdown::Enabled()) {
+			// NHL27UNMAP (stats only): unmaps by kind, with the time of the drain plus write-back.
+			static std::atomic<uint64_t> counts[3] {}, ns[3] {};
+			static std::atomic<int64_t>  last_print {0};
+			const size_t kind = drain ? 0 : buffer_wait ? 1 : 2;
+			counts[kind].fetch_add(1, std::memory_order_relaxed);
+			ns[kind].fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                       std::chrono::steady_clock::now() - unmap_start).count()),
+			                   std::memory_order_relaxed);
+			const int64_t now  = std::chrono::duration_cast<std::chrono::milliseconds>(
+			                        std::chrono::steady_clock::now().time_since_epoch()).count();
+			int64_t       last = last_print.load(std::memory_order_relaxed);
+			if (now - last >= 5000 && last_print.compare_exchange_strong(last, now)) {
+				const auto take = [](std::atomic<uint64_t>& v) { return v.exchange(0, std::memory_order_relaxed); };
+				const uint64_t dn = take(counts[0]), bn = take(counts[1]), cn = take(counts[2]);
+				const double   dm = static_cast<double>(take(ns[0])) / 1e6;
+				const double   bm = static_cast<double>(take(ns[1])) / 1e6;
+				const double   cm = static_cast<double>(take(ns[2])) / 1e6;
+				std::printf("NHL27UNMAP: 5s drain=%llu (%.1f ms) buffer_wait=%llu (%.1f ms) clean=%llu (%.1f ms)\n",
+				            static_cast<unsigned long long>(dn), dm, static_cast<unsigned long long>(bn), bm,
+				            static_cast<unsigned long long>(cn), cm);
+				std::fflush(stdout);
+			}
+		}
 		m_texture_cache.UnmapMemory(vaddr, size);
 		{
 			std::lock_guard log_lock(m_unmap_log_mutex);
 			m_unmap_log[m_unmap_sequence % m_unmap_log.size()] = {m_unmap_sequence, vaddr, vaddr + size};
 			m_unmap_sequence++;
 		}
+		m_image_heap.UnmapMemory(vaddr, size);
+
 		std::lock_guard lock(m_mapped_ranges_mutex);
 		m_mapped_ranges.Subtract(vaddr, size);
 		m_bda_new_ranges.Subtract(vaddr, size);
@@ -518,7 +559,6 @@ void RenderContext::PrepareBda() {
 	}
 	m_bda_batch_synced = true;
 	total_timer.Stop();
-	// Lazy BDA faults still need processing even when uploads were unchanged.
 	m_fault_process_pending = true;
 	if (stats_enabled && ((m_bda_stats.scans + m_bda_stats.reused) & 4095u) == 0) {
 		static auto last = std::chrono::steady_clock::now();

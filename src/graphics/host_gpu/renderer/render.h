@@ -136,6 +136,13 @@ inline void NoteFixApplied() {
 }
 
 } // namespace InstanceZeroDiag
+// Nonzero address: the GPU reads count Vulkan indirect draw records, stride bytes apart.
+struct DrawIndirectArgs {
+	uint64_t address = 0;
+	uint32_t count   = 0;
+	uint32_t stride  = 0;
+};
+
 
 struct DrawIndexArgs {
 	uint32_t         index_count                = 0;
@@ -149,6 +156,8 @@ struct DrawIndexArgs {
 	// Diagnostics only: see InstanceZeroDiag.
 	uint8_t  instance_source     = InstanceZeroDiag::kSourceExplicit;
 	uint64_t instance_args_addr  = 0;
+	// With indirect records, index_count is INDEX_BUFFER_SIZE.
+	DrawIndirectArgs indirect;
 };
 
 class Buffer;
@@ -172,6 +181,7 @@ struct NativeIndirectDraw {
 	[[nodiscard]] uint64_t ArgsSize() const {
 		return static_cast<uint64_t>(max_count - 1u) * stride + RecordSize();
 	}
+
 };
 
 struct DrawAutoArgs {
@@ -184,6 +194,8 @@ struct DrawAutoArgs {
 	// Diagnostics only: see InstanceZeroDiag.
 	uint8_t  instance_source    = InstanceZeroDiag::kSourceExplicit;
 	uint64_t instance_args_addr = 0;
+	DrawIndirectArgs indirect;
+
 };
 
 struct SubmitInfo {
@@ -273,6 +285,8 @@ private:
 class NativeIndirectPrep;
 };
 
+class Nhl27Fsr3;
+
 class RenderExecutor {
 public:
 	explicit RenderExecutor(RenderContext& context): m_context(context) {}
@@ -331,11 +345,21 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	// table_candidate rejects (EXIT) a texture whose guest memory cannot be read, for tables
+	// that keep T#s of freed textures, and declines depth/color conversions. examined receives
+	// the guest range before the lookup depends on the texture cache: a failure without it
+	// depends only on the T# and the guest backing.
+	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource&   resource,
+	                                            const ShaderRecompiler::IR::DescriptorValue& value,
+	                                            bool        table_candidate = false,
+	                                            GuestRange* examined        = nullptr);
 
 private:
-	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
-	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	// False, with nothing drawn, when the draw's indirect records need CPU counts.
+	bool DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
+	bool DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
 	bool DrawAutoIndirect(uint64_t submit_id, CommandBuffer& buffer, NativeIndirectDraw& source);
+
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -434,18 +458,11 @@ private:
 	};
 	std::array<SamplerMemoEntry, 256> m_sampler_memo {};
 
-	// table_candidate rejects (EXIT) a texture whose guest memory cannot be read, for tables
-	// that keep T#s of freed textures, and declines depth/color conversions. examined receives
-	// the guest range before the lookup depends on the texture cache: a failure without it
-	// depends only on the T# and the guest backing.
-	[[nodiscard]] TextureBinding ResolveTexture(const ShaderRecompiler::IR::ImageResource& resource,
-	                                            const ShaderRecompiler::IR::DescriptorValue& value,
-	                                            bool        table_candidate = false,
-	                                            GuestRange* examined        = nullptr);
 	[[nodiscard]] TextureBinding
 	ResolveTableTexture(const ShaderRecompiler::IR::ImageResource&   root,
 	                    const ShaderRecompiler::IR::DescriptorValue& value,
 	                    GuestRange*                                  examined = nullptr);
+
 	void PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
 	                             std::span<RenderColorInfo> colors);
 	void ResolveRenderColorTarget(CommandBuffer& buffer, RenderColorInfo& target,
@@ -490,6 +507,8 @@ private:
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
 	                                               std::span<PreparedBindings* const> stages = {});
+	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer,
+	                                                        uint32_t render_target_slice_offset);
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer,
 	                                              uint32_t render_target_slice_offset);
 	void                      BindImage(ImageId id, bool storage);
@@ -497,14 +516,15 @@ private:
 	void                      ResetBindings();
 	[[nodiscard]] bool        TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
 	                                                     const CommandBuffer&          buffer);
-	[[nodiscard]] bool TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-	                                              CommandBuffer& command, uint32_t group_x,
-	                                              uint32_t group_y, uint32_t group_z, uint32_t mode);
+	[[nodiscard]] bool TryConsumeComputeFill(const ShaderComputeInputInfo& input,
+	                                        CommandBuffer& command, uint32_t group_x,
+	                                        uint32_t group_y, uint32_t group_z, uint32_t mode);
 
 	RenderContext&                        m_context;
 	GraphicsBindings                     m_graphics_bindings;
 	std::shared_ptr<NativeIndirectPrep> m_native_indirect_prep;
 	std::shared_ptr<DispatchArgsGuard>   m_dispatch_guard;
+	std::shared_ptr<Nhl27Fsr3>           m_nhl27_fsr3;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
 	// ResolveTexture: memoized pure descriptor -> ImageDesc decode (direct-mapped).
@@ -603,7 +623,8 @@ private:
 [[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource& descriptor,
-                                            uint32_t& packed_clear, uint64_t& size);
+                                            uint32_t& packed_clear, uint64_t& size,
+                                            const char** why = nullptr);
 
 } // namespace Libs::Graphics
 

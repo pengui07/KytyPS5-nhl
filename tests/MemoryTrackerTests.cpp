@@ -214,6 +214,12 @@ struct ProtectionCall {
 std::vector<ProtectionCall> g_protection_log;
 std::mutex g_protection_log_mutex;
 
+struct ProtectionGate {
+  std::binary_semaphore entered{0};
+  std::binary_semaphore resume{0};
+};
+ProtectionGate *g_protection_gate = nullptr;
+
 void ResetProtectionLog() {
   g_protection_calls = 0;
   g_protection_log.clear();
@@ -221,6 +227,10 @@ void ResetProtectionLog() {
 
 bool ProtectAddressSpace(uint64_t vaddr, uint64_t size,
                          Common::VirtualMemory::Mode mode) {
+  if (g_protection_gate != nullptr && mode == Common::VirtualMemory::Mode::ReadWrite) {
+    g_protection_gate->entered.release();
+    g_protection_gate->resume.acquire();
+  }
   uint32_t protection = PAGE_NOACCESS;
   if (mode == Common::VirtualMemory::Mode::Read) {
     protection = PAGE_READONLY;

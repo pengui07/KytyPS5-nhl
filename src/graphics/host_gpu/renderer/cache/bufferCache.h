@@ -13,7 +13,9 @@
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
+
 #include <map>
 #include <atomic>
 #include <mutex>
@@ -191,6 +193,14 @@ public:
 	// Remembers that the GPU filled [vaddr, vaddr + size) with one repeated dword. The record
 	// lives only until any other write, download or invalidation touches the range.
 	void RecordGpuFill(uint64_t vaddr, uint64_t size, uint32_t value);
+	// Experiment FillPatterns: the GPU wrote `words` at the start of every `stride` bytes of
+	// [vaddr, vaddr + size) (the bytes between are unknown).
+	void RecordGpuFillPattern(uint64_t vaddr, uint64_t size, uint32_t stride,
+	                          std::span<const uint32_t> words);
+	// Whether one recorded pattern covers [vaddr, vaddr + size), the range holds at least one whole
+	// written element, and that element's bytes are not all equal: the range cannot be one repeated
+	// byte (a uniform metadata clear).
+	[[nodiscard]] bool GpuFillCoversNonUniform(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool TryGetGpuFill(uint64_t vaddr, uint64_t size, uint32_t& value) const;
 	// Drops GPU ownership of whole pages without a download. The caller must be about to
 	// overwrite the CPU backing of the range and mark it CPU-modified.
@@ -275,6 +285,9 @@ public:
 	// waiting. A copy of the GPU's bytes is compared once the GPU gets there; a mismatch ends the
 	// guess for that address until its downloads are steady again.
 	[[nodiscard]] bool TrySpeculativeRead(uint64_t vaddr, void* data, uint64_t size);
+	// True for bytes strict guessing refuses (seen changing twice or guessed wrong): their reads
+	// always download. KYTY_SRT_UNION_DIRTY skips only these.
+	[[nodiscard]] bool IsStrictRefused(uint64_t vaddr, uint64_t size);
 	// After a real download for such a read: whether the GPU changed the bytes, and the wait.
 	void NoteDirtyRead(uint64_t vaddr, uint64_t size, bool changed, const void* value, uint64_t wait_ns);
 	// Changes whenever new GPU-dirty bytes are recorded (GPU thread).
@@ -282,6 +295,11 @@ public:
 	[[nodiscard]] bool IsRegionCpuModified(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t vaddr, uint64_t size);
 	void               PrepareFaultBuffer() { m_fault_manager.PrepareFaultBuffer(); }
+	// Color metadata the GPU found free of the clear keys in `keys` (bits of code >> 5) stays so
+	// until a GPU write or download.
+	void               MarkColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys);
+	[[nodiscard]] bool IsColorMetadataChecked(uint64_t vaddr, uint64_t size, uint32_t keys) const;
+
 	void               ProcessFaultBuffer();
 	void ProcessWriteBuffer(FaultManager::PagesHandler&& handler) {
 		m_fault_manager.ProcessWriteBuffer(std::move(handler));
@@ -395,6 +413,8 @@ private:
 	void RebuildPendingReadRanges();
 	[[nodiscard]] bool OverlapsPendingGuestRead(uint64_t vaddr, uint64_t size) const;
 	[[nodiscard]] bool OverlapsPendingGuestBytes(uint64_t vaddr, uint64_t size) const;
+	void               ForgetColorMetadataChecks(uint64_t vaddr, uint64_t size);
+
 
 	// Experiment EarlySubmitWriters: GPU-written ranges strict resource reads downloaded (oldest
 	// replaced first), and whether a write to one of them asks for a submit.
@@ -427,6 +447,9 @@ private:
 	uint64_t                                          m_gpu_dirty_generation = 0;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
+	// One per TileManager::ColorClearSlots key slot.
+	std::array<RangeSet, 8>                           m_checked_color_metadata;
+
 	MemoryTracker                                     m_memory_tracker;
 	uint64_t                                           m_gpu_write_generation = 0;
 	StreamBuffer                                      m_staging_buffer;
@@ -438,12 +461,30 @@ private:
 	vk::Fence                                         m_readback_fence[3] {};
 	bool ReadbackOnSecondQueue(const Buffer& source, const Buffer& destination,
 	                           std::span<const vk::BufferCopy> copies, uint64_t wait_tick);
+	// Experiment AsyncReadback (KYTY_ASYNC_READBACK, measured slower, not wired since the Oct 18 sync with
+	// nhl27-eadb): the bookkeeping of downloads waited for by the requesting thread.
+	struct AsyncReadback;
+	struct AsyncSlot {
+		vk::CommandBuffer command = nullptr;
+		vk::Fence         fence   = nullptr;
+	};
+	void NoteAsyncReadbackWrite(uint64_t vaddr, uint64_t size);
+	void WaitAsyncReadbacksOf(BufferId id);
+	std::mutex                                        m_async_mutex;
+	std::vector<AsyncReadback*>                       m_async_readbacks;
+	std::atomic<uint32_t>                             m_async_count {0};
+	vk::CommandPool                                   m_async_pool = nullptr;
+	std::vector<AsyncSlot>                            m_async_free;
 	StreamBuffer                                      m_device_buffer;
 	TextureCache&                                     m_texture_cache;
 	struct GpuFill {
-		uint64_t begin;
-		uint64_t end;
-		uint32_t value;
+		uint64_t                begin;
+		uint64_t                end;
+		uint32_t                value;
+		uint32_t                words  = 1; // pattern: the written words of each element
+		uint32_t                stride = 0; // pattern: element stride (0 = uniform dword fill)
+		bool                    non_uniform = false; // pattern bytes are not all equal
+		std::array<uint32_t, 4> pattern {};
 	};
 	// The GPU thread records fills while guest write faults drop them, so the list is locked;
 	// m_gpu_fill_count lets the common no-fill case skip the lock.

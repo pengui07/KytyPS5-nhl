@@ -19,7 +19,12 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <array>
 #include <cinttypes>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace Common::Experiments {
 
@@ -234,6 +239,28 @@ bool FalseShareReads() noexcept {
 	return enabled;
 }
 
+bool DirectGpuReadsMemory() noexcept {
+	static const bool enabled = EnvSwitch("KYTY_DIRECT_GPU_READS", false);
+	return enabled;
+}
+
+bool SrtUnionDirty() noexcept {
+	static const bool enabled = EnvSwitch("KYTY_SRT_UNION_DIRTY", false);
+	return enabled;
+}
+
+bool EnvEnabled(EnvBit bit) noexcept {
+	static const std::array<bool, 6> enabled = {
+	    EnvSwitch("KYTY_PROGRAM_LOCK_SPLIT", false),
+	    EnvSwitch("KYTY_FILL_PATTERNS", false),
+	    EnvSwitch("KYTY_UNMAP_BUFFER_WAIT", false),
+	    EnvSwitch("KYTY_DIRECT_GPU_READS", false),
+	    EnvSwitch("KYTY_ASYNC_READBACK", false),
+	    EnvSwitch("KYTY_SPECULATE_STRICT", false),
+	};
+	return enabled[static_cast<size_t>(bit)];
+}
+
 namespace Detail {
 constinit std::atomic<uint64_t> g_mask {Uninitialized};
 
@@ -350,3 +377,173 @@ void Mark(const char* what, uint64_t value) noexcept {
 }
 
 } // namespace Common::Timeline
+
+namespace Common::Sampler {
+
+#if defined(_WIN32) && defined(_M_X64) || defined(_WIN32) && defined(__x86_64__)
+namespace {
+
+constexpr int MaxThreads = 8;
+constexpr int MaxFrames  = 24;
+
+struct Target {
+	HANDLE      handle = nullptr;
+	const char* name   = nullptr;
+};
+
+struct SamplerState {
+	std::mutex                  lock;
+	std::array<Target, MaxThreads> targets {};
+	int                         count   = 0;
+	bool                        started = false;
+};
+
+SamplerState& GetSampler() {
+	static SamplerState state;
+	return state;
+}
+
+bool SamplingEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_PERF_SAMPLE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// Walks the suspended thread's stack with the x64 unwind tables. Nothing here may allocate or
+// take a lock the target could hold (heap, CRT): the target is suspended meanwhile.
+int Unwind(CONTEXT context, uint64_t* functions) {
+	int depth = 0;
+	for (int i = 0; i < MaxFrames && context.Rip != 0; i++) {
+		DWORD64 image_base = 0;
+		auto*   entry      = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+		if (entry == nullptr) {
+			// Leaf function or code without unwind data (guest or generated code).
+			functions[depth++] = context.Rip | 1u;  // odd = raw address, not a function start
+			if (i != 0) break;
+			context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
+			context.Rsp += 8;
+			continue;
+		}
+		functions[depth++] = image_base + entry->BeginAddress;
+		void*   handler_data = nullptr;
+		DWORD64 establisher  = 0;
+		RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, entry, &context, &handler_data,
+		                 &establisher, nullptr);
+	}
+	return depth;
+}
+
+void Run() {
+	struct Counts {
+		std::unordered_map<uint64_t, uint64_t> self;
+		std::unordered_map<uint64_t, uint64_t> incl;
+		// Caller -> callee pairs on the sampled stacks (each pair once per sample), so a function's
+		// time can be split by who called it.
+		struct Edge {
+			uint64_t from  = 0;
+			uint64_t to    = 0;
+			uint64_t count = 0;
+		};
+		std::unordered_map<uint64_t, Edge>     edges;
+		uint64_t                               samples = 0;
+	};
+	std::array<Counts, MaxThreads> counts {};
+	auto last = std::chrono::steady_clock::now();
+	for (;;) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		std::array<Target, MaxThreads> targets {};
+		int                            n = 0;
+		{
+			auto&            s = GetSampler();
+			std::scoped_lock guard(s.lock);
+			targets = s.targets;
+			n       = s.count;
+		}
+		for (int t = 0; t < n; t++) {
+			uint64_t functions[MaxFrames] {};
+			int      depth = 0;
+			if (SuspendThread(targets[t].handle) == static_cast<DWORD>(-1)) continue;
+			CONTEXT context {};
+			context.ContextFlags = CONTEXT_FULL;
+			if (GetThreadContext(targets[t].handle, &context) != 0) {
+				depth = Unwind(context, functions);
+			}
+			ResumeThread(targets[t].handle);
+			if (depth == 0) continue;
+			auto& c = counts[t];
+			c.samples++;
+			c.self[functions[0]]++;
+			std::unordered_set<uint64_t> seen;
+			for (int i = 0; i < depth; i++) {
+				if (seen.insert(functions[i]).second) c.incl[functions[i]]++;
+			}
+			std::unordered_set<uint64_t> seen_edges;
+			for (int i = 0; i + 1 < depth; i++) {
+				const uint64_t key = functions[i + 1] ^ (functions[i] * 0x9E3779B97F4A7C15ull);
+				if (!seen_edges.insert(key).second) continue;
+				auto& e = c.edges[key];
+				e.from  = functions[i + 1];
+				e.to    = functions[i];
+				e.count++;
+			}
+		}
+		const auto now = std::chrono::steady_clock::now();
+		if (now - last < std::chrono::seconds(10)) continue;
+		last = now;
+		for (int t = 0; t < n; t++) {
+			auto& c = counts[t];
+			if (c.samples == 0) continue;
+			const auto print = [&](const char* kind, const std::unordered_map<uint64_t, uint64_t>& map, size_t top) {
+				std::vector<std::pair<uint64_t, uint64_t>> sorted(map.begin(), map.end());
+				std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+				for (size_t i = 0; i < sorted.size() && i < top; i++) {
+					std::printf("NHL27SAMPLE: thread=%s %s %.1f%% addr=0x%" PRIx64 "\n", targets[t].name, kind,
+					            100.0 * static_cast<double>(sorted[i].second) / static_cast<double>(c.samples),
+					            sorted[i].first);
+				}
+			};
+			std::printf("NHL27SAMPLE: thread=%s samples=%" PRIu64 "\n", targets[t].name, c.samples);
+			print("self", c.self, 30);
+			print("incl", c.incl, 80);
+			{
+				std::vector<const Counts::Edge*> sorted;
+				sorted.reserve(c.edges.size());
+				for (const auto& [key, e]: c.edges) sorted.push_back(&e);
+				std::sort(sorted.begin(), sorted.end(), [](const auto* a, const auto* b) { return a->count > b->count; });
+				for (size_t i = 0; i < sorted.size() && i < 150; i++) {
+					std::printf("NHL27SAMPLE: thread=%s edge %.1f%% from=0x%" PRIx64 " to=0x%" PRIx64 "\n", targets[t].name,
+					            100.0 * static_cast<double>(sorted[i]->count) / static_cast<double>(c.samples),
+					            sorted[i]->from, sorted[i]->to);
+				}
+			}
+			c = Counts {};
+		}
+		std::fflush(stdout);
+	}
+}
+
+} // namespace
+
+void RegisterCurrentThread(const char* name) noexcept {
+	if (!SamplingEnabled()) return;
+	HANDLE handle = nullptr;
+	if (DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle,
+	                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, 0) == 0) {
+		return;
+	}
+	auto&            s = GetSampler();
+	std::scoped_lock guard(s.lock);
+	if (s.count == MaxThreads) return;
+	s.targets[static_cast<size_t>(s.count++)] = {handle, name};
+	if (!s.started) {
+		s.started = true;
+		std::thread(Run).detach();
+	}
+}
+#else
+void RegisterCurrentThread(const char*) noexcept {}
+#endif
+
+} // namespace Common::Sampler

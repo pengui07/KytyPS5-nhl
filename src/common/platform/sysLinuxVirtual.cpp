@@ -549,6 +549,14 @@ bool Protect(uint64_t address, uint64_t size, Mode mode) {
 	                get_protection_flag(mode)) == 0;
 }
 
+bool IsReadable(uint64_t /*address*/, uint64_t /*size*/) {
+	return false;
+}
+
+bool IsWritable(uint64_t /*address*/, uint64_t /*size*/) {
+	return false;
+}
+
 bool FlushInstructionCache(uint64_t /*address*/, uint64_t /*size*/) {
 	return true;
 }

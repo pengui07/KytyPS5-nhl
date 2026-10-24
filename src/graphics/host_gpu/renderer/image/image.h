@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <atomic>
 #include <compare>
 #include <limits>
 #include <memory>
@@ -85,40 +86,27 @@ public:
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
-	void InvalidateCpuWrite(uint64_t vaddr, uint64_t size) {
-		if (ImageRangeOverlaps(info.data.address, info.data.size, vaddr, size)) {
-			m_cpu_dirty        = true;
-			m_maybe_cpu_dirty  = false;
-			m_maybe_hash_valid = false;
-		} else if (ImagePageRangesOverlap(info.data.address, info.data.size, vaddr, size)) {
-			m_maybe_cpu_dirty = true;
-		}
+	void MarkCpuDirty() {
+		m_cpu_dirty       = true;
+		m_maybe_cpu_dirty = false;
+		HeapChanged();
 	}
 
 	[[nodiscard]] bool IsCpuDirty() const { return m_cpu_dirty || m_maybe_cpu_dirty; }
 	[[nodiscard]] bool IsDefinitelyCpuDirty() const { return m_cpu_dirty; }
 	[[nodiscard]] bool IsMaybeCpuDirty() const { return m_maybe_cpu_dirty; }
 	void               MarkMaybeCpuDirty() {
-		if (!m_cpu_dirty) {
+		if (!IsCpuDirty()) {
+			m_maybe_cpu_hash  = HashGuestEdges();
 			m_maybe_cpu_dirty = true;
+			HeapChanged();
 		}
-	}
-	[[nodiscard]] bool NeedsMaybeCpuHash() const {
-		return m_maybe_cpu_dirty && !m_maybe_hash_valid;
-	}
-	void SetMaybeCpuHash(uint64_t hash) {
-		if (!NeedsMaybeCpuHash()) {
-			EXIT("image cannot initialize maybe-dirty hash\n");
-		}
-		m_maybe_cpu_hash   = hash;
-		m_maybe_hash_valid = true;
 	}
 	[[nodiscard]] bool ResolveMaybeCpuHash(uint64_t hash) {
-		if (!m_maybe_cpu_dirty || !m_maybe_hash_valid || m_cpu_dirty) {
+		if (!m_maybe_cpu_dirty || m_cpu_dirty) {
 			EXIT("image cannot resolve maybe-dirty hash\n");
 		}
-		m_maybe_cpu_dirty  = false;
-		m_maybe_hash_valid = false;
+		m_maybe_cpu_dirty = false;
 		m_cpu_dirty |= hash != m_maybe_cpu_hash;
 		return m_cpu_dirty;
 	}
@@ -127,9 +115,8 @@ public:
 		if (!IsCpuDirty()) {
 			EXIT("clean image cannot complete a refresh\n");
 		}
-		m_cpu_dirty        = false;
-		m_maybe_cpu_dirty  = false;
-		m_maybe_hash_valid = false;
+		m_cpu_dirty       = false;
+		m_maybe_cpu_dirty = false;
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
@@ -137,7 +124,10 @@ public:
 	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	void               MarkBufferModified() noexcept { m_buffer_modified = true; }
+	void               MarkBufferModified() noexcept {
+		m_buffer_modified = true;
+		HeapChanged();
+	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
@@ -153,6 +143,19 @@ public:
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
+	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
+		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
+	}
+	// Resident image heaps sample an image without rediscovering it until one changes its
+	// contents, tracking, identity or layout.
+	void HeapChanged() const noexcept {
+		if (heap_refs.load(std::memory_order_relaxed) != 0u) {
+			heap_epoch.fetch_add(1u, std::memory_order_relaxed);
+		}
+	}
+
+	static inline std::atomic<uint64_t> heap_epoch {0};
 
 	ImageInfo        info;
 	VulkanImage      backing;
@@ -166,11 +169,15 @@ public:
 	ImageId          depth_id {};
 	// A stencil plane image was associated with this depth image (its depth_id names this one).
 	bool             stencil_associated = false;
+	// Stencil associations that refer to this depth image.
+	std::vector<ImageId> stencil_ids;
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
 	size_t           lru_id             = 0;
 	uint64_t         lru_tick           = ~uint64_t {0}; // GC tick of the last LRU touch
+	// Resident image heap elements that select this image.
+	std::atomic<uint32_t> heap_refs {0};
 
 private:
 	friend struct ImageTestAccess;
@@ -200,12 +207,11 @@ private:
 
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
-	uint64_t          m_maybe_cpu_hash   = 0;
-	bool              m_cpu_dirty        = false;
-	bool              m_maybe_cpu_dirty  = false;
-	bool              m_maybe_hash_valid = false;
-	bool              m_gpu_modified     = false;
-	bool              m_buffer_modified  = false;
+	uint64_t          m_maybe_cpu_hash  = 0;
+	bool              m_cpu_dirty       = false;
+	bool              m_maybe_cpu_dirty = false;
+	bool              m_gpu_modified    = false;
+	bool              m_buffer_modified = false;
 	std::unique_ptr<StorageShadow> m_shadow;
 };
 

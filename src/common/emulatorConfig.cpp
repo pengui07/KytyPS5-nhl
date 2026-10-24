@@ -1,7 +1,9 @@
 #include "common/emulatorConfig.h"
 
 #include "common/assert.h"
+#include "common/experiments.h"
 #include "common/threads.h"
+#include "common/debugCounters.h"
 
 #include <algorithm>
 #include <array>
@@ -21,6 +23,7 @@ void Initialize() {
 }
 
 void Shutdown() {
+	Common::DebugCounters::SetEnabled(false);
 	g_config.reset();
 }
 
@@ -29,8 +32,10 @@ void Load(const ConfigOptions& cfg) {
 	EXIT_IF(cfg.user_name.empty() || cfg.user_name.size() > MAX_USER_NAME_LENGTH);
 	EXIT_IF(!IsConfiguredUserIdValid(cfg.user_id));
 	EXIT_IF(cfg.controller_speaker_volume > 100 || cfg.controller_vibration_intensity > 100);
+	EXIT_IF(cfg.keyboard_player > static_cast<uint32_t>(MAX_PLAYERS));
 
 	*g_config = cfg;
+	Common::DebugCounters::SetEnabled(cfg.perf_overlay_enabled);
 }
 
 uint32_t GetScreenWidth() {
@@ -63,6 +68,27 @@ uint32_t GetControllerSpeakerVolume() {
 
 uint32_t GetControllerVibrationIntensity() {
 	return g_config->controller_vibration_intensity;
+}
+
+uint32_t GetKeyboardPlayer() {
+	return g_config->keyboard_player;
+}
+
+int32_t GetPlayerUserId(int player) {
+	return g_config->user_id + player * PLAYER_USER_ID_STEP;
+}
+
+int GetPlayerFromUserId(int32_t user_id) {
+	for (int player = 0; player < MAX_PLAYERS; player++) {
+		if (user_id == GetPlayerUserId(player)) {
+			return player;
+		}
+	}
+	return -1;
+}
+
+bool IsGuestUserId(int32_t user_id) {
+	return GetPlayerFromUserId(user_id) > 0;
 }
 
 PresentMode GetPresentMode() {
@@ -175,6 +201,10 @@ bool ReadbackLinearImagesEnabled() {
 	return g_config->readback_linear_images;
 }
 
+bool ReadbackTiledImagesEnabled() {
+	return g_config->readback_tiled_images;
+}
+
 bool SyncRawImageBuffersEnabled() {
 	return g_config->sync_raw_image_buffers;
 }
@@ -185,6 +215,10 @@ bool TessellationEnabled() {
 
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
+}
+
+uint32_t GetTrophyDurationSeconds() {
+	return std::clamp(g_config->trophy_duration_seconds, 5u, 10u);
 }
 
 bool PlayGoHackEnabled() {
@@ -211,6 +245,9 @@ int GpuStageCpu(GpuStageThread stage) {
 }
 
 void ConfigureGpuStageThread(GpuStageThread stage) {
+	// KYTY_PERF_SAMPLE=1: sample this GPU stage thread (NHL27SAMPLE lines).
+	static constexpr const char* stage_names[] = {"cp", "exec", "record", "resolve", "hostcopy"};
+	Common::Sampler::RegisterCurrentThread(stage_names[static_cast<uint32_t>(stage) % 5u]);
 	const auto& cpus = GpuStageCpus();
 	static const bool high_priority = [] {
 		const char* value = std::getenv("KYTY_GPU_THREAD_PRIORITY");

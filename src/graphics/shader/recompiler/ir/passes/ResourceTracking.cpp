@@ -2422,7 +2422,7 @@ private:
 				return i;
 			}
 		}
-		if (m_info.buffers.size() >= ShaderInfo::MaxBuffers) {
+		if (m_info.buffers.size() >= ShaderInfo::MaxBufferRoots) {
 			return UINT32_MAX;
 		}
 		BufferResource resource;
@@ -2768,7 +2768,7 @@ private:
 } // namespace
 
 void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
-                    bool gpu_scalar_data) {
+                    bool gpu_scalar_data, ShaderStageInputInfo /*input*/) {
 	Tracker(program, decoded, native_cfg, gpu_scalar_data).Run();
 }
 

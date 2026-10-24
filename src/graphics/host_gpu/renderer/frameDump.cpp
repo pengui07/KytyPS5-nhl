@@ -196,7 +196,8 @@ void QueueBuffer(vk::Buffer buf, uint64_t offset, uint64_t range, uint64_t addr,
 }
 
 // Logs the shader-visible resource tables of one draw and queues GPU copies of the bound buffers.
-void CaptureBindings(const PreparedBindings& b, uint32_t seq, uint64_t ps_hash) {
+void CaptureBindings(const PreparedBindings& b, uint32_t seq, uint64_t ps_hash,
+                     bool constants_only = false) {
 	char line[512];
 	std::snprintf(line, sizeof(line), "== #%05u ps=0x%016" PRIx64 " ==\n", seq, ps_hash);
 	g_buflog += line;
@@ -222,7 +223,7 @@ void CaptureBindings(const PreparedBindings& b, uint32_t seq, uint64_t ps_hash) 
 		for (const auto& [addr, size] : r.specialization_reads) {
 			std::snprintf(line, sizeof(line), "    addr=0x%" PRIx64 " size=%" PRIu64 "\n", addr, size);
 			g_buflog += line;
-			if (addr != 0 && size > 0 && size <= 4096) {
+			if (!constants_only && addr != 0 && size > 0 && size <= 4096) {
 				g_buflog += WordsText(reinterpret_cast<const uint8_t*>(addr),
 				                      static_cast<size_t>(std::min<uint64_t>(size, 256)));
 			}
@@ -284,6 +285,9 @@ void CaptureBindings(const PreparedBindings& b, uint32_t seq, uint64_t ps_hash) 
 		              static_cast<uint64_t>(b.buffers[i].offset), static_cast<uint64_t>(b.buffers[i].range));
 		g_buflog += line;
 		if (src.address == 0) continue;
+		// The opt-in compute survey copies only small GPU buffers, avoiding large
+		// geometry/indirect allocations and protected guest-memory reads.
+		if (constants_only && (src.size > 4096 || b.buffers[i].range > 4096)) continue;
 		QueueBuffer(b.buffers[i].buffer, b.buffers[i].offset, b.buffers[i].range, src.address, src.size, seq,
 		            "buf" + std::to_string(i));
 	}
@@ -1296,9 +1300,14 @@ void OnDispatch(RenderContext& context, CommandBuffer& buffer, uint64_t cs_hash,
 	char b[256];
 	std::snprintf(b, sizeof(b), "#%05u dispatch cs=0x%016" PRIx64 " groups=%ux%ux%u%s\n", seq, cs_hash, gx,
 	              gy, gz, indirect ? " INDIRECT" : "");
-	if (bindings != nullptr && TraceCsEnabled(cs_hash)) {
+	static const bool capture_constants = [] {
+		const char* value = std::getenv("KYTY_DBG_FRAME_DUMP_CS_CONSTANTS");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	const bool trace_cs = TraceCsEnabled(cs_hash);
+	if (bindings != nullptr && (trace_cs || capture_constants)) {
 		g_buflog += "# compute bindings captured AFTER dispatch\n";
-		CaptureBindings(*bindings, seq, cs_hash);
+		CaptureBindings(*bindings, seq, cs_hash, capture_constants && !trace_cs);
 	}
 	FlushRequests(buffer.GetGraphics(), buffer.Handle());
 	std::string s = b;

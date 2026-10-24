@@ -2,8 +2,10 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/emulatorConfig.h"
+#include "common/experiments.h"
 #include "common/profiler.h"
 #include "common/runtimeFlags.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -1501,7 +1503,7 @@ void CommandScheduler::CheckActive() const {
 }
 
 CommandBuffer& CommandScheduler::Current() {
-	CheckActive();
+	EXIT_IF(m_command.IsInvalid());
 	return m_command;
 }
 
@@ -1542,6 +1544,17 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	if (m_trace_slot != 0) {
 		m_command.EndRendering(); // Idempotent; keeps the end timestamp after the last pass.
 		GpuTraceEnd(m_command.Handle(), m_trace_slot);
+	}
+	if (Common::Experiments::DirectGpuReadsMemory()) {
+		// Experiment DirectGpuReads: this submission's writes become visible to the CPU once its
+		// tick is reached, so the buffer cache can read finished results from mapped game buffers.
+		m_command.EndRendering();
+		vk::MemoryBarrier host {};
+		host.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+		host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+		m_command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                                   vk::PipelineStageFlagBits::eHost, {}, 1, &host, 0, nullptr, 0,
+		                                   nullptr);
 	}
 	m_command.End();
 
@@ -1617,6 +1630,7 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
 	m_submitted_tick.store(tick, std::memory_order_release);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result == vk::Result::eErrorDeviceLost) {
 		DumpDeviceFault(graphics.device);

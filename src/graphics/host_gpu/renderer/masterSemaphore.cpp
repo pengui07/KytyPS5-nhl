@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/experiments.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "common/debugCounters.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
@@ -130,6 +131,8 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	                                   : std::chrono::steady_clock::time_point {};
 	Common::Timeline::Mark("host-wait", tick);
 	Common::Timeline::MarkStack();
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
+	                                         Common::DebugCounters::Counter::GpuWaitNs);
 	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	Common::Timeline::Mark("host-done", tick);
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);

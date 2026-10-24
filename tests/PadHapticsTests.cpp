@@ -56,6 +56,7 @@ std::binary_semaphore                 write_started {0}, allow_write {0};
 SDL_AudioStream*                      default_stream      = nullptr;
 bool                                  fail_default_resume = false;
 int                                   active_controller   = 1;
+int                                   second_controller   = 3;
 float                                 speaker_scale = 1.0f, vibration_scale = 1.0f;
 } // namespace
 
@@ -143,13 +144,13 @@ void DestroyAudioStream(SDL_AudioStream* stream) {
 SDL_AudioDeviceID GetAudioStreamDevice(SDL_AudioStream*) {
 	return 999;
 }
-// Pads 1 and 3 are DualSenses.
+// Pads 1 and 3 are DualSenses; pad 2 only supports rumble.
 SDL_GamepadType GetGamepadTypeForID(SDL_JoystickID id) {
 	return id == 1 || id == 3 ? SDL_GAMEPAD_TYPE_PS5 : SDL_GAMEPAD_TYPE_UNKNOWN;
 }
 SDL_Gamepad* GetGamepadFromID(SDL_JoystickID id) {
-	return id == 1 || id == 3 ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
-	                          : nullptr;
+	return id >= 1 && id <= 3 ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
+	                         : nullptr;
 }
 SDL_GamepadType GetGamepadType(SDL_Gamepad* pad) {
 	return GetGamepadTypeForID(static_cast<SDL_JoystickID>(reinterpret_cast<uintptr_t>(pad)));
@@ -323,8 +324,9 @@ bool SendGamepadEffect(SDL_Gamepad* pad, const void* data, int size) {
 #undef SDL_GetGamepadConnectionState
 
 namespace Libs::Controller {
-int GetActiveControllerId() {
-	return active_controller;
+// Users 1000 and 1001 own the first and second host controller.
+int GetPlayerControllerIdForUser(int32_t user_id) {
+	return user_id == 1000 ? active_controller : user_id == 1001 ? second_controller : -1;
 }
 float GetSettingScale(Setting setting) {
 	return setting == Setting::SpeakerVolume ? speaker_scale : vibration_scale;
@@ -368,6 +370,7 @@ struct Fixture {
 		default_stream      = nullptr;
 		fail_default_resume = false;
 		active_controller   = 1;
+		second_controller   = 3;
 		speaker_scale = vibration_scale = 1.0f;
 		now                 = 1000;
 		opens = rumble_calls = 0;
@@ -458,6 +461,47 @@ void TestDiscoveryAndHotplug() {
 	Check(streams.empty(), "disconnected endpoint retained its stream");
 }
 
+void TestRumbleFallbackGains() {
+	Fixture f;
+	auto    port = Open();
+	const auto queue = [&](std::array<float, 2> gains) {
+		Check(Haptics::Queue(port.get(), 2, pcm.data(), 2, 2, true, unity.data(), 1.0f,
+		                     gains.data()) == 2 * 1000000 / 48000,
+		      "rumble fallback playback time is wrong");
+	};
+	queue({0.0f, 0.25f});
+	Check(pad_rumble[2].large == 0 && pad_rumble[2].small == 16383,
+	      "rumble fallback ignored per-channel gains");
+	queue({0.5f, 0.0f});
+	Check(pad_rumble[2].large == 32767 && pad_rumble[2].small == 0,
+	      "rumble fallback swapped per-channel gains");
+	queue({0.0f, 0.0f});
+	Check(pad_rumble[2].large == 0 && pad_rumble[2].small == 0,
+	      "muted fallback channels still rumbled");
+	Check(streams.empty() && hid_opens == 0, "rumble fallback opened an audio device");
+}
+
+void TestRumbleFallbackSwitch() {
+	for (bool bluetooth: {false, true}) {
+		Fixture f;
+		wireless = hid_available = bluetooth;
+		auto port = Open();
+		Queue(port, pcm.data());
+		Check(bluetooth ? Haptics::UsesBluetooth(port.get()) : streams.size() == 1,
+		      "DualSense transport did not open before fallback");
+		Haptics::Queue(port.get(), 2, pcm.data(), 2, 2, true, unity.data());
+		Check(streams.empty() && !Haptics::UsesBluetooth(port.get()) &&
+		          (!bluetooth || hid_closes == 1),
+		      "switching to rumble retained the DualSense transport");
+		Check(pad_rumble[2].large == 65535 && pad_rumble[2].small == 65535,
+		      "switching from DualSense did not start rumble fallback");
+		Queue(port, pcm.data());
+		Check(bluetooth ? Haptics::UsesBluetooth(port.get()) && hid_opens == 2
+		                : streams.size() == 1 && opens == 2,
+		      "switching back delayed reopening the DualSense transport");
+	}
+}
+
 void TestSpeaker() {
 	Fixture f;
 	devices      = {{10, "DualSense Wireless Controller", 2}};
@@ -482,10 +526,11 @@ void TestSpeaker() {
 	auto other     = Open(true);
 	connected_pads = {3};
 	Haptics::Queue(other.get(), 3, pcm.data(), 2, 2, true, unity.data());
-	Check(effects[1][0] == 0x80 && effects[1][1] == 0 && effects[1][7] == 0 && effects[3] == routed,
-	      "switching pads left the old speaker routed");
+	Check(effects[1] == routed && effects[3] == routed,
+	      "a second controller's speaker unrouted the first");
 	speaker.reset();
-	Check(effects[3] == routed, "closing one speaker port unrouted the other");
+	Check(effects[1][0] == 0x80 && effects[1][1] == 0 && effects[1][7] == 0 && effects[3] == routed,
+	      "closing a controller's last speaker port left it routed or unrouted another");
 	other.reset();
 	Check(effects[3][0] == 0x80 && effects[3][7] == 0,
 	      "closing the last speaker port left it routed");
@@ -608,7 +653,7 @@ void TestScaledRumbleDuration() {
 	}
 }
 
-void TestSwitchStopsOldRumble() {
+void TestSecondControllerRumbleLeavesMutedPadAlone() {
 	Fixture f;
 	auto    port = Open();
 	Haptics::SetVibration(1, 100, 50);
@@ -616,7 +661,7 @@ void TestSwitchStopsOldRumble() {
 	Check(pad_rumble[1].large == 0, "haptics did not suppress rumble");
 	Haptics::SetVibration(3, 10, 10);
 	Check(pad_rumble[1].large == 0 && pad_rumble[1].small == 0,
-	      "switching controllers restarted the old pad's rumble");
+	      "rumble on another controller restarted the muted pad");
 	Check(pad_rumble[3].large == 10 * 0x101, "new pad did not rumble");
 }
 
@@ -1117,17 +1162,20 @@ void TestUsbAndBluetoothFeatureParity() {
 	          opened_hid_pad == 3,
 	      "wired pad disabled the Bluetooth speaker");
 	Check(Haptics::Queue(wired_speaker.get(), 1, sound.data(), 1024, 2, true, unity.data()) != 0 &&
-	          effects[1][7] == 0x30 && effects[3][7] == 0,
-	      "returning to the wired speaker left Bluetooth routing active");
+	          effects[1][7] == 0x30 && effects[3][7] == 0x30,
+	      "returning to the wired speaker changed the Bluetooth controller's routing");
 	wireless_speaker.reset();
+	Check(effects[3][7] == 0 && effects[1][7] == 0x30,
+	      "closing the Bluetooth speaker changed the wired controller's routing");
 	wired_speaker.reset();
+	Check(effects[1][7] == 0, "closing the wired speaker left it routed");
 }
 
 void TestAudioSpeakerFallback() {
 	Fixture f;
 	Libs::Audio::Audio audio;
 	active_controller = 2; // A different controller is active while a USB DualSense is attached.
-	const auto port = audio.AudioOutOpen(4, 2, 48000, Libs::Audio::Audio::Format::FloatStereo);
+	const auto port = audio.AudioOutOpen(1000, 4, 2, 48000, Libs::Audio::Audio::Format::FloatStereo);
 	Check(port.IsValid() && default_stream != nullptr, "pad speaker fallback did not open");
 	Libs::Audio::Audio::OutputParam output {port, pcm.data()};
 	Check(audio.AudioOutOutputs(&output, 1, false) == 2, "pad speaker output count is wrong");
@@ -1142,7 +1190,7 @@ void TestAudioSpeakerFallback() {
 void TestAudioSpeakerRouting() {
 	Fixture f;
 	Libs::Audio::Audio audio;
-	const auto port = audio.AudioOutOpen(4, 2, 48000, Libs::Audio::Audio::Format::FloatStereo);
+	const auto port = audio.AudioOutOpen(1000, 4, 2, 48000, Libs::Audio::Audio::Format::FloatStereo);
 	Check(port.IsValid() && default_stream != nullptr, "pad speaker port did not open");
 	Libs::Audio::Audio::OutputParam output {port, pcm.data()};
 	audio.AudioOutOutputs(&output, 1, false);
@@ -1179,7 +1227,7 @@ void TestAudioFallbackGain() {
 		                              : Libs::Audio::Audio::Format::Signed16bitStereo;
 		const void* data   = is_float ? static_cast<const void*>(pcm.data()) : integer_pcm.data();
 		for (int type: {0, 4}) {
-			const auto               port = audio.AudioOutOpen(type, 2, 48000, format);
+			const auto               port = audio.AudioOutOpen(1000, type, 2, 48000, format);
 			const std::array<int, 2> volume {16384, 16384};
 			audio.AudioOutSetVolume(port, 3, volume.data());
 			Libs::Audio::Audio::OutputParam output {port, data};
@@ -1214,7 +1262,7 @@ void TestAudioVibrationGain() {
 		vibration_scale = 0.5f;
 		speaker_scale   = 0.0f;
 		const auto port =
-		    audio.AudioOutOpen(10, 1024, 48000, Libs::Audio::Audio::Format::FloatStereo);
+		    audio.AudioOutOpen(1000, 10, 1024, 48000, Libs::Audio::Audio::Format::FloatStereo);
 		std::vector<float>              sound(2048, 0.5f);
 		Libs::Audio::Audio::OutputParam output {port, sound.data()};
 		audio.AudioOutOutputs(&output, 1, false);
@@ -1236,7 +1284,7 @@ void TestBluetoothAudioSpeakerRouting() {
 	wireless = hid_available = true;
 	devices.clear();
 	Libs::Audio::Audio audio;
-	const auto port = audio.AudioOutOpen(4, 1024, 48000, Libs::Audio::Audio::Format::FloatStereo);
+	const auto port = audio.AudioOutOpen(1000, 4, 1024, 48000, Libs::Audio::Audio::Format::FloatStereo);
 	Check(port.IsValid() && default_stream != nullptr, "Bluetooth pad speaker port did not open");
 	std::vector<float> sound(2048, 0.25f);
 	speaker_scale = 2.0f;
@@ -1258,7 +1306,7 @@ void TestAudioDefaultResumeFailure() {
 	Fixture f;
 	Libs::Audio::Audio audio;
 	fail_default_resume = true;
-	const auto port = audio.AudioOutOpen(4, 2, 48000, Libs::Audio::Audio::Format::FloatStereo);
+	const auto port = audio.AudioOutOpen(1000, 4, 2, 48000, Libs::Audio::Audio::Format::FloatStereo);
 	Check(port.IsValid() && opens == 1 && default_stream == nullptr,
 	      "default-output resume failure was not exercised");
 	Libs::Audio::Audio::OutputParam output {port, pcm.data()};
@@ -1266,6 +1314,123 @@ void TestAudioDefaultResumeFailure() {
 	Check(streams.size() == 1 && opened_device == 10,
 	      "default-output resume failure disabled the DualSense speaker");
 	ExpectPcm({0.5f, 0.5f, 0, 0, 0.5f, 0.5f, 0, 0});
+}
+
+// The output-path byte of the last raw report sent to a pad, 0 when it never got one.
+uint8_t SpeakerRoute(int pad) {
+	return effects[pad].size() > 7 ? effects[pad][7] : 0;
+}
+
+void TestIndependentControllerRumbleAndSpeakerState() {
+	Fixture f;
+	connected_pads = {1, 3};
+	wireless_pad3 = hid_available = true; // Pad 1 is the wired USB DualSense, pad 3 is Bluetooth.
+	auto               haptics_one = Open(), haptics_three = Open();
+	std::vector<float> haptic(2048, 0.5f), silence(2048, 0.0f), sound(2048, 0.25f);
+
+	Check(Haptics::SetVibration(1, 100, 80) && Haptics::SetVibration(3, 10, 20) &&
+	          pad_rumble[1].large == 100 * 0x101 && pad_rumble[3].large == 10 * 0x101,
+	      "each controller did not keep its own rumble");
+
+	// Vibration audio on controller 1 mutes controller 1 only.
+	Check(Haptics::Queue(haptics_one.get(), 1, haptic.data(), 1024, 2, true, unity.data()) != 0,
+	      "controller 1 haptics did not play");
+	Check(pad_rumble[1].large == 0 && pad_rumble[3].large == 10 * 0x101 &&
+	          pad_rumble[3].small == 20 * 0x101,
+	      "haptics on one controller muted another controller's rumble");
+
+	// A silent stream on controller 3 starts no lease and does not disturb controller 1.
+	Check(Haptics::Queue(haptics_three.get(), 3, silence.data(), 1024, 2, true, unity.data()) != 0,
+	      "controller 3 silent stream did not open");
+	Check(pad_rumble[3].large == 10 * 0x101 && pad_rumble[1].large == 0,
+	      "a silent stream muted its controller or restored another's");
+
+	// Rumble requested on controller 3 while controller 1 plays haptics reaches only controller 3.
+	Check(Haptics::SetVibration(3, 30, 40) && pad_rumble[3].large == 30 * 0x101 &&
+	          pad_rumble[3].small == 40 * 0x101 && pad_rumble[1].large == 0,
+	      "rumble on one controller was muted by or restarted another's haptics");
+
+	// Controller 1's lease expires on its own clock and leaves controller 3 as it was.
+	now += 300;
+	Pull();
+	Check(pad_rumble[1].large == 100 * 0x101 && pad_rumble[1].small == 80 * 0x101 &&
+	          pad_rumble[3].large == 30 * 0x101,
+	      "expiring one controller's haptics changed another's rumble");
+
+	// Haptics on controller 3 now mute it while controller 1 keeps rumbling.
+	Check(Haptics::Queue(haptics_three.get(), 3, haptic.data(), 1024, 2, true, unity.data()) != 0 &&
+	          pad_rumble[3].large == 0 && pad_rumble[1].large == 100 * 0x101,
+	      "controller 3 haptics muted controller 1");
+	now += 300;
+	Haptics::UpdateBluetoothRumble();
+	Check(pad_rumble[3].large == 30 * 0x101 && pad_rumble[1].large == 100 * 0x101,
+	      "controller 3 did not recover its rumble independently");
+
+	// Closing controller 1's only haptics stream restores only controller 1.
+	Check(Haptics::Queue(haptics_one.get(), 1, haptic.data(), 1024, 2, true, unity.data()) != 0 &&
+	          pad_rumble[1].large == 0 && pad_rumble[3].large == 30 * 0x101,
+	      "controller 1 haptics muted controller 3");
+	haptics_one.reset();
+	Check(pad_rumble[1].large == 100 * 0x101 && pad_rumble[3].large == 30 * 0x101,
+	      "closing one controller's stream disturbed another's rumble");
+	haptics_three.reset();
+
+	// Speaker routing is on and off per controller; one controller's port never unroutes another.
+	auto speaker_one = Open(true), speaker_three = Open(true);
+	Check(Haptics::Queue(speaker_one.get(), 1, sound.data(), 1024, 2, true, unity.data()) != 0 &&
+	          SpeakerRoute(1) == 0x30 && SpeakerRoute(3) == 0,
+	      "controller 1 speaker was not routed alone");
+	Check(Haptics::Queue(speaker_three.get(), 3, sound.data(), 1024, 2, true, unity.data()) != 0 &&
+	          SpeakerRoute(3) == 0x30 && SpeakerRoute(1) == 0x30,
+	      "routing controller 3 unrouted controller 1");
+	Check(Haptics::Queue(speaker_one.get(), 1, sound.data(), 1024, 2, true, unity.data()) != 0 &&
+	          SpeakerRoute(3) == 0x30,
+	      "controller 1 audio changed controller 3's route");
+	speaker_one.reset();
+	Check(SpeakerRoute(1) == 0 && SpeakerRoute(3) == 0x30,
+	      "closing controller 1's speaker changed controller 3's route");
+	speaker_three.reset();
+	Check(SpeakerRoute(3) == 0, "closing controller 3's speaker left it routed");
+}
+
+// Pad audio plays on the controller of the user that opened the port, never on another's.
+void TestPadAudioFollowsOwningUser() {
+	Fixture f;
+	connected_pads = {1, 3};
+	wireless_pad3 = hid_available = true;
+	Libs::Audio::Audio audio;
+	const auto first  = audio.AudioOutOpen(1000, 4, 1024, 48000, Libs::Audio::Audio::Format::FloatStereo);
+	const auto second = audio.AudioOutOpen(1001, 4, 1024, 48000, Libs::Audio::Audio::Format::FloatStereo);
+	Check(first.IsValid() && second.IsValid(), "per-user pad speaker ports did not open");
+	std::vector<float> sound(2048, 0.25f), silence(2048, 0.0f);
+
+	// Only the first user plays; the second user's silent port must not mute or reroute it.
+	Libs::Audio::Audio::OutputParam only_first[] {{first, sound.data()}, {second, silence.data()}};
+	audio.AudioOutOutputs(only_first, 2, false);
+	Check(SpeakerRoute(1) == 0x30 && SpeakerRoute(3) == 0x30 && opened_device == 10 && hid_opens == 1 &&
+	          opened_hid_pad == 3,
+	      "each user's pad speaker did not open its own controller");
+
+	// Swapping which user is silent does not swap the controllers.
+	Libs::Audio::Audio::OutputParam only_second[] {{first, silence.data()}, {second, sound.data()}};
+	audio.AudioOutOutputs(only_second, 2, false);
+	Check(SpeakerRoute(1) == 0x30 && SpeakerRoute(3) == 0x30 && hid_opens == 1,
+	      "a silent user port rerouted or reopened a controller");
+
+	// A user without a controller never borrows another user's controller.
+	const auto stranger = audio.AudioOutOpen(1002, 4, 1024, 48000, Libs::Audio::Audio::Format::FloatStereo);
+	const auto opens_before = hid_opens;
+	Libs::Audio::Audio::OutputParam third[] {{stranger, sound.data()}};
+	audio.AudioOutOutputs(third, 1, false);
+	Check(hid_opens == opens_before && SpeakerRoute(1) == 0x30 && SpeakerRoute(3) == 0x30,
+	      "a user with no controller played on another user's controller");
+
+	audio.AudioOutClose(first);
+	Check(SpeakerRoute(1) == 0 && SpeakerRoute(3) == 0x30,
+	      "closing one user's port changed the other user's controller");
+	audio.AudioOutClose(second);
+	audio.AudioOutClose(stranger);
+	Check(SpeakerRoute(3) == 0, "closing the last pad speaker port left it routed");
 }
 } // namespace
 
@@ -1279,6 +1444,8 @@ int main() {
 	TestAudioDefaultResumeFailure();
 	TestFormatsAndVolume();
 	TestDiscoveryAndHotplug();
+	TestRumbleFallbackGains();
+	TestRumbleFallbackSwitch();
 	TestSpeaker();
 	TestSpeakerUnplug();
 	TestSpeakerSwitchAndFailures();
@@ -1305,7 +1472,9 @@ int main() {
 	TestFailuresAndBoundedQueue();
 	TestRumbleLeaseAndDuration();
 	TestScaledRumbleDuration();
-	TestSwitchStopsOldRumble();
+	TestSecondControllerRumbleLeavesMutedPadAlone();
 	TestCloseRestoresRumble();
+	TestIndependentControllerRumbleAndSpeakerState();
+	TestPadAudioFollowsOwningUser();
 	std::printf("PadHapticsTests: all cases passed\n");
 }

@@ -14,7 +14,7 @@
 
 namespace Common::RuntimeFlags {
 inline constexpr int64_t kIntervalMs = 250;
-inline constexpr unsigned kRevisionShift = 36;
+inline constexpr unsigned kRevisionShift = 37;
 inline constexpr uint64_t kFlagMask = (uint64_t{1} << kRevisionShift) - 1;
 inline constexpr uint64_t kUnpinnedBits = uint64_t{1} << kRevisionShift;
 static_assert(kRevisionShift <= 48, "flag bits and the unpinned sentinel must fit uint64_t and leave revision bits");
@@ -57,6 +57,7 @@ struct FlagSet {
  bool write_cover_skip = false;
  bool aged_writeback = false;
  bool compute_resolve_ahead = false;
+ bool fsr1 = false;
 };
 inline constexpr const char* kSwitchableFlags[] = {
  "KYTY_RESOURCE_DYNAMIC_DEPS",
@@ -94,7 +95,8 @@ inline constexpr const char* kSwitchableFlags[] = {
  "KYTY_SPARSE_BUFFER_GC",
  "KYTY_WRITE_COVER_SKIP",
  "KYTY_AGED_WRITEBACK",
- "KYTY_COMPUTE_RESOLVE_AHEAD"
+ "KYTY_COMPUTE_RESOLVE_AHEAD",
+ "KYTY_FSR1"
 };
 static_assert(sizeof(kSwitchableFlags) / sizeof(kSwitchableFlags[0]) == kRevisionShift, "one bit per switchable flag");
 inline constexpr uint64_t Bits(const FlagSet& f) {
@@ -133,7 +135,8 @@ inline constexpr uint64_t Bits(const FlagSet& f) {
   (uint64_t(f.sparse_buffer_gc)<<32) |
   (uint64_t(f.write_cover_skip)<<33) |
   (uint64_t(f.aged_writeback)<<34) |
-  (uint64_t(f.compute_resolve_ahead)<<35);
+  (uint64_t(f.compute_resolve_ahead)<<35) |
+  (uint64_t(f.fsr1)<<36);
 }
 // Bit positions for the few call sites that test g_published directly without decoding a FlagSet.
 inline constexpr unsigned kBitIdleTrace = 15;
@@ -220,6 +223,7 @@ inline FlagSet Current() {
  f.write_cover_skip=(bits>>33&1u)!=0;
  f.aged_writeback=(bits>>34&1u)!=0;
  f.compute_resolve_ahead=(bits>>35&1u)!=0;
+ f.fsr1=(bits>>36&1u)!=0;
  return f;
 }
 inline uint64_t Revision() { return g_published.load(std::memory_order_relaxed)>>kRevisionShift; }
@@ -271,6 +275,7 @@ inline bool* FieldFor(FlagSet& f,const char* name) {
  if (!std::strcmp(name,kSwitchableFlags[33])) return &f.write_cover_skip;
  if (!std::strcmp(name,kSwitchableFlags[34])) return &f.aged_writeback;
  if (!std::strcmp(name,kSwitchableFlags[35])) return &f.compute_resolve_ahead;
+ if (!std::strcmp(name,kSwitchableFlags[36])) return &f.fsr1;
  return nullptr;
 }
 inline void Trim(std::string& s) {

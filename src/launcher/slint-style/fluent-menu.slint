@@ -1,0 +1,90 @@
+// Copyright © SixtyFPS GmbH <info@slint.dev>
+// SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
+
+// The launcher's copy of Slint's fluent/menu.slint (v1.18.1), copied over the fetched one by
+// CMakeLists.txt: Slint has no per-app menu styling. The menu bar shares the toolbar's #303030
+// so the whole top reads one uniform colour (app.slint keeps a same-colour backing behind it,
+// since MenuBar exposes no background of its own); the popup menus are shaped like the shadPS4
+// launcher's: near-square corners, rows highlighted edge to edge in the accent colour, a slim frame.
+
+import { FluentPalette, FluentFontSettings } from "styling.slint";
+import { MenuBarItemBase, MenuBarBase, MenuItemBase } from "../common/menu-base.slint";
+
+export component MenuBarItem {
+    in property <MenuEntry> entry <=> base.entry;
+
+    callback clicked <=> base.clicked;
+    callback hovered <=> base.hovered;
+
+    min-width: base.min-width;
+    min-height: base.min-height;
+
+    base := MenuBarItemBase {
+        horizontal-padding: 11px;
+        top-padding: 2px;
+        bottom-padding: 3px;
+        default-foreground: FluentPalette.foreground;
+        hover-foreground: FluentPalette.foreground;
+        pressed-foreground: FluentPalette.text-secondary;
+        hover-background: FluentPalette.subtle-secondary;
+        pressed-background: FluentPalette.control-alt-tertiary;
+        border-radius: 3px;
+    }
+}
+
+export component MenuBar inherits MenuBarBase {
+    spacing: 10px;
+    min-layout-height: 28px;
+    background: #303030;
+}
+
+// Padding only above and below, so the highlighted row reaches both edges.
+export component MenuFrame inherits Rectangle {
+    background: #1b1f27;
+    border-radius: 2px;
+    border-width: 1px;
+    border-color: #2e3542;
+    drop-shadow-color: #00000090;
+    drop-shadow-offset-y: 4px;
+    drop-shadow-blur: 10px;
+    clip: true;
+    min-width: max(200px, layout.min-width);
+
+    layout := VerticalLayout {
+        padding-top: 4px;
+        padding-bottom: 4px;
+        padding-left: 1px;
+        padding-right: 1px;
+        @children
+    }
+}
+
+export component MenuItem {
+    in property <bool> is-current <=> base.is-current;
+    in property <MenuEntry> entry <=> base.entry;
+
+    callback set-current <=> base.set-current;
+    callback clear-current <=> base.clear-current;
+    callback activate <=> base.activate;
+
+    min-height: entry.is-separator ? 9px : max(28px, base.min-height);
+    max-height: entry.is-separator ? 9px : base.max-height;
+
+    HorizontalLayout {
+        padding-top: entry.is-separator ? 4px : 0px;
+        padding-bottom: entry.is-separator ? 4px : 0px;
+
+        base := MenuItemBase {
+            default-foreground: FluentPalette.foreground;
+            alternate-foreground: FluentPalette.text-secondary;
+            current-foreground: #ffffff;
+            current-background: #3d8bfd;
+            separator-color: #2e3542;
+            border-radius: 0px;
+            horizontal-padding: 12px;
+            spacing: 8px;
+            sub-menu-icon: @image-url("_arrow_forward.svg");
+            icon-size: 12px;
+        }
+    }
+}

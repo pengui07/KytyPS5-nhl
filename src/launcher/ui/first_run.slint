@@ -1,0 +1,201 @@
+// First launch: where the launcher keeps its data, where the saves go, and whether to bring over the Qt launcher's
+// settings. Shown before the main window exists (see run_first_run_setup in main.cpp); nothing is written until
+// Continue, and closing the window keeps the choices it shows.
+// Options are short labels; what each one means (and the folder it uses) shows in the panel at the bottom on hover.
+// The path defaults below are only sample data for the live preview: C++ sets every property before showing it.
+
+import { Theme, AppButton, Card } from "common.slint";
+
+// One option: a radio dot (or a check box when `check` is set) and its label. Reports hover with its help text.
+component ChoiceRow inherits Rectangle {
+    in property <string> title;
+    in property <string> help;
+    in property <bool> selected: false;
+    in property <bool> enabled: true;
+    in property <bool> check: false;
+    callback picked();
+    callback hover(string /* help, or "" on leave */, string /* own help, to clear only its own */);
+
+    height: 26px;
+    opacity: root.enabled ? 1 : 0.5;
+
+    HorizontalLayout {
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 14px;
+                height: 14px;
+                border-radius: root.check ? 3px : 7px;
+                // A thick accent ring reads as a filled radio dot; a check box fills instead.
+                border-width: root.check ? (root.selected ? 0px : 1.5px) : (root.selected ? 4px : 1.5px);
+                border-color: root.selected ? Theme.accent : Theme.faint;
+                background: root.check && root.selected ? Theme.accent : transparent;
+                if root.check && root.selected: Text {
+                    text: "✓";
+                    color: Theme.bg;
+                    font-size: 11px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        Text {
+            text: root.title;
+            color: Theme.text;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: root.enabled ? pointer : default;
+        changed has-hover => {
+            root.hover(self.has-hover ? root.help : "", root.help);
+        }
+        clicked => {
+            if (root.enabled) {
+                root.picked();
+            }
+        }
+    }
+}
+
+export component FirstRunWindow inherits Window {
+    title: "KytyPS5 Launcher - first start";
+    icon: @image-url("icons/app-icon.png");
+    preferred-width: 560px;
+    min-width: 480px;
+    background: Theme.bg;
+    default-font-size: 13px;
+
+    // The per-user root: configs, versions, cache and logs unless the portable one is chosen.
+    in property <string> app-data-root: "C:\\Users\\you\\AppData\\Local\\KytyPS5";
+    // The launcher's own folder (the .app bundle's parent on macOS): the portable root, where portable.txt goes.
+    in property <string> portable-root: "D:\\Games\\KytyPS5 Launcher";
+    in property <bool> portable-enabled: true;
+    in property <string> portable-disabled-reason; // a read-only folder, say: why the portable choice is off
+    in-out property <bool> portable-selected: false;
+    // <root>\run for each data root: the saves folder that goes with the choice above.
+    in property <string> app-data-run-dir: "C:\\Users\\you\\AppData\\Local\\KytyPS5\\run";
+    in property <string> portable-run-dir: "D:\\Games\\KytyPS5 Launcher\\run";
+    out property <string> default-run-dir: root.portable-selected ? root.portable-run-dir : root.app-data-run-dir;
+    // The Qt launcher, when one of its settings files was found.
+    in property <bool> qt-found: false;
+    in property <string> qt-ini-path;
+    in property <string> qt-run-dir; // its emulator folder, where _SaveData and _Trophies already are
+    in property <bool> qt-run-dir-available: false;
+    // 0 = with the launcher data, 1 = the Qt launcher's folder, 2 = a folder the user picked.
+    in-out property <int> run-choice: 0;
+    in-out property <string> picked-run-dir;
+    in-out property <bool> import-qt: false;
+
+    // The saves folder the choices add up to; C++ reads it once the window is closed.
+    out property <string> chosen-run-dir: root.run-choice == 2 ? root.picked-run-dir : root.run-choice == 1 ? root.qt-run-dir : root.default-run-dir;
+
+    callback continue-clicked();
+    callback pick-run-dir();
+
+    // The hovered option's explanation, shown in the panel at the bottom.
+    property <string> hover-help;
+    function on-hover(help: string, own: string) {
+        if (help != "") {
+            root.hover-help = help;
+        } else if (root.hover-help == own) {
+            root.hover-help = "";
+        }
+    }
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 10px;
+
+        Card {
+            title: "Launcher data";
+            ChoiceRow {
+                title: "App data (recommended)";
+                help: "Settings, downloaded emulator versions, cache and logs are kept in your user folder: " + root.app-data-root;
+                selected: !root.portable-selected;
+                picked => { root.portable-selected = false; }
+                hover(h, o) => { root.on-hover(h, o); }
+            }
+            ChoiceRow {
+                title: "Next to the launcher (portable)";
+                help: root.portable-enabled
+                    ? "Everything is kept beside the launcher, so the folder can be moved or copied as a whole: " + root.portable-root
+                    : root.portable-disabled-reason;
+                selected: root.portable-selected;
+                enabled: root.portable-enabled;
+                picked => { root.portable-selected = true; }
+                hover(h, o) => { root.on-hover(h, o); }
+            }
+        }
+
+        Card {
+            title: "Saves";
+            if root.qt-run-dir-available: ChoiceRow {
+                title: "Keep the Qt launcher's folder";
+                help: "Games keep using the _SaveData and _Trophies already in " + root.qt-run-dir;
+                selected: root.run-choice == 1;
+                picked => { root.run-choice = 1; }
+                hover(h, o) => { root.on-hover(h, o); }
+            }
+            ChoiceRow {
+                title: "With the launcher data";
+                help: "Games keep _SaveData and _Trophies in " + root.default-run-dir;
+                selected: root.run-choice == 0;
+                picked => { root.run-choice = 0; }
+                hover(h, o) => { root.on-hover(h, o); }
+            }
+            ChoiceRow {
+                title: root.run-choice == 2 && root.picked-run-dir != "" ? "Another folder" : "Another folder...";
+                help: root.run-choice == 2 && root.picked-run-dir != ""
+                    ? "Games keep _SaveData and _Trophies in " + root.picked-run-dir + ". Click to pick a different one."
+                    : "Pick any folder for _SaveData and _Trophies.";
+                selected: root.run-choice == 2;
+                picked => { root.pick-run-dir(); }
+                hover(h, o) => { root.on-hover(h, o); }
+            }
+        }
+
+        if root.qt-found: Card {
+            title: "Qt launcher";
+            ChoiceRow {
+                title: "Import its settings and games";
+                help: "Copies the settings and the game list from " + root.qt-ini-path;
+                check: true;
+                selected: root.import-qt;
+                picked => { root.import-qt = !root.import-qt; }
+                hover(h, o) => { root.on-hover(h, o); }
+            }
+        }
+
+        // Description panel, as in the Qt launcher's settings: the hovered option's explanation.
+        Rectangle {
+            height: 52px;
+            border-width: 1px;
+            border-radius: 0px;
+            border-color: Theme.card-border;
+            background: Theme.card;
+            HorizontalLayout {
+                padding: 8px;
+                Text {
+                    text: root.hover-help != "" ? root.hover-help : "Point your mouse at an option to see what it does. Both can be changed later in Settings > Paths.";
+                    color: root.hover-help != "" ? Theme.text : Theme.muted;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        HorizontalLayout {
+            alignment: end;
+            AppButton {
+                text: "Continue";
+                primary: true;
+                clicked => { root.continue-clicked(); }
+            }
+        }
+    }
+}

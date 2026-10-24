@@ -17,6 +17,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fmt/format.h>
+#include <iterator>
+#include <vector>
+#include <vulkan/vulkan_format_traits.hpp>
 #include <xxhash.h>
 
 namespace Libs::Graphics {
@@ -32,15 +35,17 @@ namespace {
 	}
 }
 
-[[nodiscard]] vk::ImageCreateFlags ImageCreateFlags(const GraphicContext& graphics,
-                                                   const ImageInfo& info) {
+[[nodiscard]] vk::ImageCreateFlags
+ImageCreateFlags(const GraphicContext& graphics, const ImageInfo& info, vk::ImageUsageFlags usage) {
 	vk::ImageCreateFlags flags {};
 	if (DepthAspectTransferFormat(info.pixel_format) == vk::Format::eUndefined) {
 		flags |= vk::ImageCreateFlagBits::eMutableFormat;
-		flags |= vk::ImageCreateFlagBits::eExtendedUsage;
 		if (info.IsBlock() && graphics.supports_block_texel_view) {
 			flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
 		}
+	}
+	if (usage & vk::ImageUsageFlagBits::eStorage) {
+		flags |= vk::ImageCreateFlagBits::eExtendedUsage;
 	}
 	if (info.IsVolume()) {
 		flags |= vk::ImageCreateFlagBits::e2DArrayCompatible;
@@ -61,7 +66,7 @@ namespace {
 			const auto storage = usage | vk::ImageUsageFlagBits::eStorage;
 			if (graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
 			                                      vk::ImageTiling::eOptimal, storage,
-			                                      ImageCreateFlags(graphics, info),
+			                                      ImageCreateFlags(graphics, info, storage),
 			                                      nullptr) == vk::Result::eSuccess) {
 				usage = storage;
 			} else {
@@ -79,7 +84,7 @@ namespace {
 					    vk::to_string(info.pixel_format), static_cast<int>(info.type),
 					    info.extent.width, info.extent.height, info.extent.depth,
 					    info.resources.levels, info.resources.layers, info.data.address,
-					    static_cast<uint32_t>(ImageCreateFlags(graphics, info))));
+					    static_cast<uint32_t>(ImageCreateFlags(graphics, info, storage))));
 				}
 			}
 		}
@@ -99,7 +104,8 @@ namespace {
 	if (HasFormatFeature(properties, vk::FormatFeatureFlagBits::eColorAttachment)) {
 		usage |= vk::ImageUsageFlagBits::eColorAttachment;
 	}
-	if (info.samples == 1) {
+	if (graphics.GetPhysicalDeviceProperties().limits.storageImageSampleCounts &
+	    static_cast<vk::SampleCountFlagBits>(info.samples)) {
 		usage |= vk::ImageUsageFlagBits::eStorage;
 	}
 	return usage;
@@ -139,20 +145,26 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		range->base_layer  = 0;
 		range->layer_count = 1;
 	}
+	// Guest levels past the host chain alias its last (1x1) level.
+	const uint32_t host_levels = info.HostLevels();
+	if (range && range->base_level < info.resources.levels) {
+		range->base_level  = std::min(range->base_level, host_levels - 1);
+		range->level_count = std::min(range->level_count, host_levels - range->base_level);
+	}
 
 	const bool partial =
-	    range && (range->base_level != 0 || range->level_count != info.resources.levels ||
+	    range && (range->base_level != 0 || range->level_count != host_levels ||
 	              range->base_layer != 0 || range->layer_count != info.resources.layers);
 	const bool has_subresource_states = !subresource_states.empty();
 
 	Barriers barriers;
 	if (partial || has_subresource_states) {
 		if (!has_subresource_states) {
-			subresource_states.resize(info.resources.levels * info.resources.layers, state);
+			subresource_states.resize(host_levels * info.resources.layers, state);
 		}
 
 		const uint32_t base_level  = partial ? range->base_level : 0;
-		const uint32_t level_count = partial ? range->level_count : info.resources.levels;
+		const uint32_t level_count = partial ? range->level_count : host_levels;
 		const uint32_t base_layer  = partial ? range->base_layer : 0;
 		const uint32_t layer_count = partial ? range->layer_count : info.resources.layers;
 		for (uint32_t level = base_level; level < base_level + level_count; level++) {
@@ -220,6 +232,13 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 		barriers.push_back(barrier);
 	}
 
+	// Resident heaps sample their images in the read state; only leaving it invalidates them.
+	if (std::ranges::any_of(barriers, [&](const vk::ImageMemoryBarrier2& barrier) {
+		    return barrier.oldLayout == ReadLayout() &&
+		           barrier.srcAccessMask == vk::AccessFlagBits2::eShaderRead;
+	    })) {
+		HeapChanged();
+	}
 	state = {destination_stage, destination_access, destination_layout};
 	return barriers;
 }
@@ -255,6 +274,19 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
                    uint64_t size) {
 	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_TEX_UPLOAD);
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	// Guest levels past the host chain have no host storage; leave them in guest memory.
+	std::vector<vk::BufferImageCopy> host_copies;
+	if (std::ranges::any_of(copies, [&](const auto& copy) {
+		    return copy.imageSubresource.mipLevel >= backing.mip_levels;
+	    })) {
+		std::ranges::copy_if(copies, std::back_inserter(host_copies), [&](const auto& copy) {
+			return copy.imageSubresource.mipLevel < backing.mip_levels;
+		});
+		copies = host_copies;
+		if (copies.empty()) {
+			return;
+		}
+	}
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask        = vk::PipelineStageFlagBits2::eAllCommands;
@@ -294,6 +326,31 @@ void Image::Upload(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffe
 void Image::Download(std::span<const vk::BufferImageCopy> copies, vk::Buffer buffer,
                      uint64_t offset, uint64_t size) {
 	EXIT_IF(copies.empty() || buffer == nullptr || size == 0);
+	// Guest levels past the host chain are 1x1 like the last host level; read that one back.
+	std::vector<vk::BufferImageCopy> host_copies;
+	if (std::ranges::any_of(copies, [&](const auto& copy) {
+		    return copy.imageSubresource.mipLevel >= backing.mip_levels;
+	    })) {
+		const auto last = backing.mip_levels - 1;
+		host_copies.assign(copies.begin(), copies.end());
+		for (auto& copy: host_copies) {
+			if (copy.imageSubresource.mipLevel > last) {
+				copy.imageSubresource.mipLevel = last;
+				copy.imageOffset.x             = 0;
+				copy.imageOffset.y             = 0;
+				copy.imageExtent.width  = std::min(copy.imageExtent.width,
+				                                   std::max(backing.extent.width >> last, 1u));
+				copy.imageExtent.height = std::min(copy.imageExtent.height,
+				                                   std::max(backing.extent.height >> last, 1u));
+				if (backing.image_type == vk::ImageType::e3D) {
+					copy.imageOffset.z     = 0;
+					copy.imageExtent.depth = std::min(copy.imageExtent.depth,
+					                                  std::max(backing.extent.depth >> last, 1u));
+				}
+			}
+		}
+		copies = host_copies;
+	}
 	m_scheduler.EndRendering();
 	vk::BufferMemoryBarrier2 buffer_barrier {};
 	buffer_barrier.srcStageMask = vk::PipelineStageFlagBits2::eAllCommands;
@@ -364,13 +421,34 @@ void Image::CopyImage(Image& source) {
 	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
 	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	// Extents are in source texels. Clamp in texel blocks so neither image's mip is overrun.
+	const auto source_block      = vk::blockExtent(source.backing.format);
+	const auto destination_block = vk::blockExtent(backing.format);
+	const auto fit               = [](uint32_t source_size, uint32_t destination_size,
+                                uint32_t source_unit, uint32_t destination_unit) {
+		const auto blocks = std::min((source_size + source_unit - 1) / source_unit,
+		                             (destination_size + destination_unit - 1) / destination_unit);
+		return std::min(source_size, blocks * source_unit);
+	};
 	std::vector<vk::ImageCopy> copies;
 	copies.reserve(levels);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width  = std::max(source.backing.extent.width >> level, 1u);
-		const auto height = std::max(source.backing.extent.height >> level, 1u);
+		// Overlapping cache images can differ in size; copying the source extent into a smaller
+		// destination writes out of bounds and loses the device. Clamp in texel blocks so
+		// neither image's mip is overrun.
+		const auto width = std::min(
+		    fit(std::max(source.backing.extent.width >> level, 1u),
+		        std::max(backing.extent.width >> level, 1u), source_block[0], destination_block[0]),
+		    std::max(backing.extent.width >> level, 1u));
+		const auto height = std::min(
+		    fit(std::max(source.backing.extent.height >> level, 1u),
+		        std::max(backing.extent.height >> level, 1u), source_block[1], destination_block[1]),
+		    std::max(backing.extent.height >> level, 1u));
 		const auto depth  = std::max(base_depth >> level, 1u);
-		const auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
+		auto [source_layers, destination_layers] = SanitizeCopyLayers(source, *this, depth);
+		// Mixed 2D/3D copies map the 3D side's slices to array layers; the 2D side may have fewer.
+		source_layers      = std::min(source_layers, source.backing.layers);
+		destination_layers = std::min(destination_layers, backing.layers);
 		vk::ImageCopy copy {};
 		copy.srcSubresource = {source_aspect, level, 0, 1};
 		copy.dstSubresource = {destination_aspect, level, 0, 1};
@@ -510,8 +588,17 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 	               command);
 	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
 	for (uint32_t level = 0; level < levels; level++) {
-		const auto width             = std::max(source.backing.extent.width >> level, 1u);
-		const auto height            = std::max(source.backing.extent.height >> level, 1u);
+		// Copy the blocks both mips hold; each side's extent stops at its own edge.
+		const auto source_width      = std::max(source.backing.extent.width >> level, 1u);
+		const auto source_height     = std::max(source.backing.extent.height >> level, 1u);
+		const auto target_width      = std::max(backing.extent.width >> level, 1u);
+		const auto target_height     = std::max(backing.extent.height >> level, 1u);
+		const auto blocks_x          = std::min((source_width + source_block - 1) / source_block,
+		                                        (target_width + source_block - 1) / source_block);
+		const auto block_rows        = std::min((source_height + source_block - 1) / source_block,
+		                                        (target_height + source_block - 1) / source_block);
+		const auto width             = std::min(source_width, blocks_x * source_block);
+		const auto target_copy_width = std::min(target_width, blocks_x * source_block);
 		const auto source_depth      = source.backing.image_type == vk::ImageType::e3D
 		                                   ? std::max(source.backing.extent.depth >> level, 1u)
 		                                   : source.backing.layers;
@@ -519,16 +606,14 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 		                                   ? std::max(backing.extent.depth >> level, 1u)
 		                                   : backing.layers;
 		const auto slices            = std::min(source_depth, destination_depth);
-		const auto block_rows        = (height + source_block - 1) / source_block;
-		const auto row_size =
-		    static_cast<uint64_t>((width + source_block - 1) / source_block) * source_bytes;
+		const auto row_size          = static_cast<uint64_t>(blocks_x) * source_bytes;
 		const auto rows_per_copy = CopyRows(row_size, block_rows, buffer.Size());
 		EXIT_IF(slices == 0 || rows_per_copy == 0);
 		for (uint32_t slice = 0; slice < slices; slice++) {
 			for (uint32_t block_row = 0; block_row < block_rows; block_row += rows_per_copy) {
 				const auto          copy_rows   = std::min(rows_per_copy, block_rows - block_row);
 				const auto          y           = block_row * source_block;
-				const auto          copy_height = std::min(copy_rows * source_block, height - y);
+				const auto          copy_height = std::min(copy_rows * source_block, source_height - y);
 				const auto          copy_size   = row_size * copy_rows;
 				vk::BufferImageCopy source_copy {};
 				source_copy.imageSubresource = {
@@ -545,6 +630,8 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 				    backing.image_type == vk::ImageType::e3D ? 0u : slice, 1};
 				destination_copy.imageOffset.z =
 				    backing.image_type == vk::ImageType::e3D ? static_cast<int32_t>(slice) : 0;
+				destination_copy.imageExtent = {
+				    target_copy_width, std::min(copy_rows * source_block, target_height - y), 1};
 				barrier.size          = copy_size;
 				barrier.srcAccessMask = vk::AccessFlagBits2::eTransferRead;
 				barrier.dstAccessMask = vk::AccessFlagBits2::eTransferWrite;
@@ -575,6 +662,9 @@ void Image::CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tile
 }
 
 void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
+	if (mip >= backing.mip_levels && mip < info.resources.levels) {
+		return; // Guest level past the host chain: no host storage to fill.
+	}
 	EXIT_IF(source.backing.samples != backing.samples || mip >= backing.mip_levels ||
 	        layer >= backing.layers);
 	m_scheduler.EndRendering();
@@ -712,15 +802,15 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 	}
 
 	vk::ImageCreateInfo create {};
-	create.flags         = ImageCreateFlags(graphics, info);
+	create.usage         = ImageUsageFlags(graphics, info);
+	create.flags         = ImageCreateFlags(graphics, info, create.usage);
 	create.imageType     = HostImageType(info.type);
 	create.extent        = info.extent;
-	create.mipLevels     = info.resources.levels;
+	create.mipLevels     = info.HostLevels();
 	create.arrayLayers   = info.IsVolume() ? 1u : info.resources.layers;
 	create.format        = info.pixel_format;
 	create.tiling        = vk::ImageTiling::eOptimal;
 	create.initialLayout = vk::ImageLayout::eUndefined;
-	create.usage         = ImageUsageFlags(graphics, info);
 	create.samples       = vulkan_sample_count(info.samples);
 
 	vk::ImageFormatProperties properties {};
@@ -878,8 +968,13 @@ void Image::CopyStorageShadow(const ImageSubresourceRange& range, bool to_shadow
 	}
 }
 
-vk::ImageView Image::PrepareShadowStorage(const ImageViewInfo& view_info) {
-	EXIT_IF(!NeedsStorageShadow() || view_info.level_count != 1);
+vk::ImageView Image::PrepareShadowStorage(const ImageViewInfo& requested_view) {
+	EXIT_IF(!NeedsStorageShadow() || requested_view.level_count != 1);
+	auto view_info = requested_view;
+	if (view_info.base_level < info.resources.levels) {
+		// Guest levels past the host chain alias its last (1x1) level.
+		view_info.base_level = std::min(view_info.base_level, backing.mip_levels - 1);
+	}
 	m_scheduler.EndRendering();
 	const auto command = m_scheduler.Current().Handle();
 	const ImageSubresourceRange range {view_info.base_level, 1, view_info.base_layer,

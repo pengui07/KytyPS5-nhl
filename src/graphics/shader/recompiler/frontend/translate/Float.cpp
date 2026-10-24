@@ -203,6 +203,11 @@ void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode
 	    NativeF16MinMax(inst, opcode == IR::ValueOpcode::FPMax32, true)) {
 		return;
 	}
+	if (quiet_snan && ShaderFastMinMax()) {
+		// KYTY_FAST_MINMAX: like the f32 min/max path, v_pk_min/max_f16 skip the signaling-NaN
+		// quieting (games do not feed sNaN bit patterns to min/max).
+		quiet_snan = false;
+	}
 	if (ShaderNativeFp16() && !quiet_snan) {
 		// Native packed f16. Sources are packed into one u32 holding both halves exactly as the
 		// fallback reads them (op_sel/op_sel_hi, neg/neg_hi, abs, inline constants); omod falls back.
@@ -258,7 +263,7 @@ void Translator::PackedFloat16(const Decoder::Instruction& inst, IR::ValueOpcode
 	if (quiet_snan) {
 		const auto quiet_snan_lane = [&](const Decoder::Operand& operand, bool high) {
 			const auto bits     = ReadU16LaneAsU32(operand, high, false);
-			const auto exponent = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7c00u)));
+			const auto exponent = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x7e00u)));
 			const auto payload  = ir.BitwiseAnd(bits, IR::U32(IR::Value(0x01ffu)));
 			const auto snan     = ir.LogicalAnd(ir.IEqual(exponent, IR::U32(IR::Value(0x7c00u))),
 			                                    ir.INotEqual(payload, IR::U32(IR::Value(0u))));
@@ -520,13 +525,10 @@ void Translator::FloatCube(const Decoder::Instruction& inst, uint32_t result_kin
 			break;
 		case 1u: result = select_face(SelectF32(x_neg, z, nz), x, SelectF32(z_neg, nx, x)); break;
 		case 2u: result = select_face(ny, SelectF32(y_neg, nz, z), ny); break;
-		case 3u: {
-			const auto two = IR::F32(IR::Value::F32(2.0f));
-			result         = select_face(IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {x, two})),
-			                             IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {y, two})),
-			                             IR::F32(ir.Emit(IR::ValueOpcode::FPMul32, {z, two})));
+		case 3u:
+			result = IR::F32(
+			    ir.Emit(IR::ValueOpcode::FPMul32, {select_face(x, y, z), IR::Value::F32(2.0f)}));
 			break;
-		}
 		default: EXIT("invalid cube result kind");
 	}
 	WriteOperand(DestinationOperand(inst), result);

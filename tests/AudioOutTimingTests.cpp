@@ -35,6 +35,12 @@ bool                                 fail_open = false, fail_put = false, stalle
 bool                                 pad_connected = false, pad_bluetooth = false;
 uint64_t                             pad_queue_us = 0;
 const float*                         queued_pad_gains = nullptr;
+// Every pad-speaker queue request: the host controller it targeted and whether it carried sound.
+struct PadQueue {
+	int  controller;
+	bool audible;
+};
+std::vector<PadQueue> pad_queues;
 int                                  clears = 0;
 
 Stream& GetStream(SDL_AudioStream* stream) {
@@ -138,8 +144,9 @@ public:
 #undef SDL_ClearAudioStream
 
 namespace Libs::Controller {
-int GetActiveControllerId() {
-	return 0;
+// Users 1000 and 1001 own host controllers 1 and 2; other users have none.
+int GetPlayerControllerIdForUser(int32_t user_id) {
+	return user_id == 1000 ? 1 : user_id == 1001 ? 2 : -1;
 }
 float GetSettingScale(Setting) {
 	return 1.0f;
@@ -147,16 +154,24 @@ float GetSettingScale(Setting) {
 
 namespace DualSenseHaptics {
 Stream* Open(uint32_t, bool) {
-	static int pad_stream;
-	return pad_connected ? reinterpret_cast<Stream*>(&pad_stream) : nullptr;
+	static int pad_streams[8];
+	static int next;
+	return pad_connected ? reinterpret_cast<Stream*>(&pad_streams[next++ % 8]) : nullptr;
 }
 void     Close(Stream*) {}
 bool UsesBluetooth(const Stream* stream) {
 	return stream != nullptr && pad_bluetooth;
 }
-uint64_t Queue(Stream* stream, int, const void*, uint32_t, uint32_t, bool, const int*, float, const float* gains) {
+uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames,
+               uint32_t channels, bool, const int*, float, const float* gains) {
 	queued_pad_gains = gains;
-	return stream != nullptr ? pad_queue_us : 0;
+	bool audible     = false;
+	for (uint32_t i = 0; i < frames * channels; i++) {
+		audible |= static_cast<const float*>(data)[i] != 0.0f;
+	}
+	pad_queues.push_back({controller, audible});
+	// A port without a host controller cannot play on a pad.
+	return stream != nullptr && controller != -1 ? pad_queue_us : 0;
 }
 } // namespace DualSenseHaptics
 } // namespace Libs::Controller
@@ -189,11 +204,12 @@ struct Fixture {
 		pad_connected = pad_bluetooth = false;
 		pad_queue_us = 0;
 		queued_pad_gains = nullptr;
+		pad_queues.clear();
 		sleeps.clear();
 	}
 
-	Audio::Id Open(uint32_t frames = 256, int type = 0) {
-		const auto id = audio.AudioOutOpen(type, frames, 48000, Audio::Format::FloatStereo);
+	Audio::Id Open(uint32_t frames = 256, int type = 0, int user_id = 1000) {
+		const auto id = audio.AudioOutOpen(user_id, type, frames, 48000, Audio::Format::FloatStereo);
 		Check(id.IsValid(), "port open failed");
 		return id;
 	}
@@ -376,6 +392,42 @@ void TestControllerSpeakerPacing() {
 	      "stalled USB speaker waited longer than one audio block");
 }
 
+void TestPadAudioRoutesByUserId() {
+	Fixture f;
+	fail_open     = true; // No PC audio device: only the pad can play.
+	pad_connected = true;
+	pad_queue_us  = 1000;
+	const auto first    = f.Open(256, 4, 1000);
+	const auto second   = f.Open(256, 4, 1001);
+	const auto vibrate  = f.Open(256, 10, 1001);
+	const auto stranger = f.Open(256, 4, 1002);
+	std::array<float, 2048> silence {};
+	f.pcm.fill(0.25f);
+
+	// One user plays while the other's port is silent: each queue targets its owner's controller,
+	// and the silent port is still serviced.
+	Audio::OutputParam batch[] {{first, f.pcm.data()}, {second, silence.data()}};
+	f.audio.AudioOutOutputs(batch, 2, false);
+	Check(pad_queues.size() == 2 && pad_queues[0].controller == 1 && pad_queues[0].audible &&
+	          pad_queues[1].controller == 2 && !pad_queues[1].audible,
+	      "pad audio did not follow the owning users' controllers");
+
+	// Swapping which user is silent swaps nothing about routing.
+	pad_queues.clear();
+	Audio::OutputParam swapped[] {{first, silence.data()}, {second, f.pcm.data()}};
+	f.audio.AudioOutOutputs(swapped, 2, false);
+	Check(pad_queues.size() == 2 && pad_queues[0].controller == 1 && !pad_queues[0].audible &&
+	          pad_queues[1].controller == 2 && pad_queues[1].audible,
+	      "a silent port suppressed or rerouted another user's audio");
+
+	// Vibration ports follow their user as well; a user with no controller never borrows one.
+	pad_queues.clear();
+	Audio::OutputParam others[] {{vibrate, f.pcm.data()}, {stranger, f.pcm.data()}};
+	f.audio.AudioOutOutputs(others, 2, false);
+	Check(pad_queues.size() == 2 && pad_queues[0].controller == 2 && pad_queues[1].controller == -1,
+	      "vibration or unassigned pad audio chose the wrong controller");
+}
+
 void TestInvalidBatchSize() {
 	Libs::Audio::AudioOut::AudioOutOutputParam param {};
 	for (const auto count: {0u, 33u}) {
@@ -390,7 +442,7 @@ void TestZeroOutputFrequency() {
 	Check(Libs::Audio::AudioOut::AudioOutOpen(0, 0, 0, 256, 0, 4) ==
 	          Libs::Audio::AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ,
 	      "public output open accepted zero frequency");
-	Check(!f.audio.AudioOutOpen(10, 256, 0, Audio::Format::FloatStereo).IsValid(),
+	Check(!f.audio.AudioOutOpen(1000, 10, 256, 0, Audio::Format::FloatStereo).IsValid(),
 	      "internal output open accepted zero frequency");
 	Check(f.Open().ToInt() == 1, "rejected output port occupied a handle");
 }
@@ -405,7 +457,7 @@ void CheckOutputSamples(std::initializer_list<T> expected, const char* message) 
 void TestChannelGains() {
 	Fixture f;
 	const std::array pcm {0.25f, -0.5f, 0.75f, -1.0f};
-	const auto stereo = f.audio.AudioOutOpen(0, 2, 48000, Audio::Format::FloatStereo);
+	const auto stereo = f.audio.AudioOutOpen(1000, 0, 2, 48000, Audio::Format::FloatStereo);
 	std::array gains {2.0f, 0.5f};
 	Audio::OutputParam output {stereo, pcm.data(), gains.data()};
 	for (int push = 0; push < 2; push++) {
@@ -424,7 +476,7 @@ void TestChannelGains() {
 	CheckOutputSamples({0.125f, -0.5f, 0.375f, -1.0f}, "channel scaling changed original float PCM");
 
 	const std::array<int16_t, 2> integer_pcm {20000, -20000};
-	const auto integer = f.audio.AudioOutOpen(0, 1, 48000, Audio::Format::Signed16bitStereo);
+	const auto integer = f.audio.AudioOutOpen(1000, 0, 1, 48000, Audio::Format::Signed16bitStereo);
 	output = {integer, integer_pcm.data(), gains.data()};
 	for (const auto gain: {2.0f, std::numeric_limits<float>::max()}) {
 		gains = {gain, gain};
@@ -437,7 +489,7 @@ void TestChannelGains() {
 
 	const std::array surround_pcm {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f, 9.0f, 10.0f, 11.0f, 12.0f};
 	for (const auto format: {Audio::Format::Float8Ch, Audio::Format::Float12Ch}) {
-		const auto surround = f.audio.AudioOutOpen(0, 1, 48000, format);
+		const auto surround = f.audio.AudioOutOpen(1000, 0, 1, 48000, format);
 		output = {surround, surround_pcm.data(), surround_pcm.data()};
 		f.audio.AudioOutOutputs(&output, 1, false);
 		if (format == Audio::Format::Float8Ch) {
@@ -467,6 +519,7 @@ int main() {
 	TestFallbackUsesEachPortsPeriod();
 	TestFailedQueueUsesFallbackClock();
 	TestControllerSpeakerPacing();
+	TestPadAudioRoutesByUserId();
 	TestInvalidBatchSize();
 	TestZeroOutputFrequency();
 	TestChannelGains();

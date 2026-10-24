@@ -7,7 +7,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 // Resolves native descriptor sources, plans their scalar reads, and assigns dense resource bindings.
 void TrackResources(Program& program, const Decoder::Program& decoded, const CFG::Graph& native_cfg,
-                    bool gpu_scalar_data = false);
+                    bool gpu_scalar_data = false, ShaderStageInputInfo input = {});
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
 

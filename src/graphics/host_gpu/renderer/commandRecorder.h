@@ -232,6 +232,18 @@ public:
 		return m_direct;
 	}
 
+	// The caller retains pointer captures through GPU completion and invalidates
+	// pipeline/descriptor memoization for any state the external library changes.
+	template <typename F>
+	void RecordExternal(F function) const {
+		static_assert(std::is_trivially_copyable_v<F> && std::is_trivially_destructible_v<F>);
+		if (m_stream == nullptr) {
+			function(m_direct);
+		} else {
+			m_stream->Record(function);
+		}
+	}
+
 	void pipelineBarrier(vk::PipelineStageFlags src_stages, vk::PipelineStageFlags dst_stages,
 	                     vk::DependencyFlags dependency, uint32_t memory_count,
 	                     const vk::MemoryBarrier* memory, uint32_t buffer_count,

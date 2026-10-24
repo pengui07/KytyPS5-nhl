@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+
 #include <cstddef>
 #include <atomic>
 #include <filesystem>
@@ -34,7 +36,8 @@ public:
 		m_entries.clear();
 		m_run_head = NoRun;
 		m_bytes.clear();
-		m_failed     = false;
+		m_failed      = false;
+		m_fail_reason = 0;
 		m_base       = t_resolve_base;
 		m_base_valid = t_resolve_base_valid;
 		m_unsafe_pages.fill(~uint64_t {0});
@@ -48,7 +51,10 @@ public:
 	// Reads the backing store without faulting. Strict reads are checked the way specialization
 	// memory is read (GPU-owned bytes fail), the others as plain loads.
 	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);
-	void               Fail() { m_failed = true; }
+	void               Fail() {
+		if (!m_failed) m_fail_reason = 3;
+		m_failed = true;
+	}
 	[[nodiscard]] bool Failed() const { return m_failed; }
 	// Execution thread: whether every read still gives the recorded bytes.
 	// without_faults: bytes the GPU may have written since fail the check instead of being read back
@@ -56,6 +62,10 @@ public:
 	[[nodiscard]] bool StillValid(bool without_faults = false) const;
 	// Execution thread, before the operation that checks it: pulls its arrays into the cache.
 	void Prefetch() const;
+	// NHL27AHEAD (KYTY_PERF_STATS): how ahead resolutions end. Resolve thread: a finished
+	// resolution (ok or why it failed). Execution thread: a draw without a resolution.
+	static void NoteResolved(const GuestReadLog& log);
+	static void NoteNoResolution();
 
 private:
 	static constexpr uint64_t StrictCheckBytes = 64;
@@ -79,7 +89,8 @@ private:
 		return !entry.strict && !entry.unsafe && (entry.address >> 12u) == ((entry.address + entry.size - 1) >> 12u);
 	}
 	std::vector<uint8_t> m_bytes;
-	bool                 m_failed     = false;
+	bool                 m_failed      = false;
+	uint8_t              m_fail_reason = 0; // 1 plain read, 2 strict read, 3 other (program/permutation)
 	uint64_t             m_base       = 0;
 	bool                 m_base_valid = false;
 	// The last pages Read() looked up and whether their bytes may be GPU-owned.
@@ -122,6 +133,10 @@ class UserConfig;
 struct ComputeShaderInfo;
 } // namespace HW
 
+namespace ShaderRecompiler::IR {
+class ImageHeapSource;
+} // namespace ShaderRecompiler::IR
+
 #pragma pack(push, 1)
 
 struct PipelineStaticParameters {
@@ -131,6 +146,7 @@ struct PipelineStaticParameters {
 	bool                       primitive_restart_enable = false;
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
+	bool                       alpha_to_coverage_enable = false;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
 	bool                       cull_front                                         = false;
 	bool                       cull_back                                          = false;
@@ -154,7 +170,7 @@ struct PipelineStaticParameters {
 static_assert(std::is_trivially_copyable_v<PipelineStaticParameters>);
 static_assert(std::is_standard_layout_v<PipelineStaticParameters>);
 static_assert(alignof(PipelineStaticParameters) == 1);
-static_assert(sizeof(PipelineStaticParameters) == 116);
+static_assert(sizeof(PipelineStaticParameters) == 117);
 
 struct PipelineRenderingState {
 	std::array<vk::Format, RENDER_COLOR_ATTACHMENTS_MAX> color_formats {};
@@ -203,7 +219,7 @@ namespace PipelineRecord { class RecordFile; struct Records; }
 
 class PipelineCache {
 public:
-	explicit PipelineCache(GraphicContext& graphics);
+	PipelineCache(GraphicContext& graphics, ShaderRecompiler::IR::ImageHeapSource* image_heap);
 	~PipelineCache();
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
@@ -213,6 +229,7 @@ public:
 		vk::Pipeline            pipeline              = nullptr;
 		vk::DescriptorSetLayout descriptor_set_layout = nullptr;
 		bool                    uses_push_descriptors = false;
+		bool                    uses_image_heap       = false;
 	};
 
 	struct GraphicsPrograms {
@@ -288,6 +305,9 @@ private:
 	std::atomic_uint64_t          m_unsaved_pipelines {0};
 	Common::Mutex                 m_write_mutex;
 	std::jthread                  m_save_thread;
+	std::chrono::steady_clock::time_point m_next_driver_cache_save;
+	bool                          m_driver_cache_dirty = false;
+
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
@@ -309,6 +329,8 @@ private:
 	                            const ShaderPixelInputInfo* ps_input_info);
 	// Writes the driver cache data to m_driver_cache_path; the cache must stay alive meanwhile.
 	void WriteDriverCache();
+	void CheckpointDriverCache();
+
 };
 
 void LogPipelineTrace(const char* phase, uint64_t vertex_program_id, uint64_t pixel_program_id);

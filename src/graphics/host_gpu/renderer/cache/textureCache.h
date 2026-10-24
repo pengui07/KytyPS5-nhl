@@ -14,12 +14,13 @@
 
 #include <atomic>
 #include <array>
+#include <bitset>
+
 #include <map>
 #include <memory>
 #include <mutex>
 #include <memory>
 #include <type_traits>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -143,10 +144,8 @@ public:
 
 private:
 	struct MetaDataInfo {
-		enum class Type : uint8_t { CMask, FMask, HTile };
-
-		Type     type;
-		uint32_t clear_mask = UINT32_MAX;
+		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
+		std::bitset<8192> clear_mask;
 	};
 
 	struct OverlapResult {
@@ -178,7 +177,6 @@ private:
 	}
 
 	[[nodiscard]] ImageId     InsertImage(const ImageInfo& info);
-	[[nodiscard]] ImageId     GetNullImage(const ImageDesc& desc);
 	void                      RegisterImage(ImageId id);
 	void                      UnregisterImage(ImageId id);
 	void                      DeleteImage(ImageId id);
@@ -226,6 +224,12 @@ private:
 	// Caller holds m_lock. Volume layer ranges select depth slices.
 	void ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
 	                const vk::ImageSubresourceRange& range, const vk::ClearValue& clear);
+	// Caller holds m_lock and ends rendering. Begins rendering `layers` layers of one color mip
+	// through a `format` view, clearing them or, when `clear` is null, loading them; returns the
+	// render area.
+	vk::Rect2D BeginColorRendering(Image& image, vk::Format format, uint32_t level,
+	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
+	                               CommandRecorder command);
 	void PrepareImageCopy(Image& image);
 	void RefreshCopySource(ImageId id);
 	[[nodiscard]] bool CopyD16(Image& destination, Image& source);
@@ -235,6 +239,8 @@ private:
 	// Validates the view and binding of a description; ImageOps::Validate() checks its image
 	// information.
 	void ValidateImageViewDesc(const ImageDesc& desc) const;
+	void ValidateImageDesc(const ImageDesc& desc) const;
+	[[nodiscard]] ImageId GetNullImage(const ImageDesc& desc);
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	// tolerant_write: the deferred guest write skips (instead of exiting) if the range was unmapped.
@@ -274,6 +280,7 @@ private:
 	                    ImagePageTable::kFirstLevelBits>
 	    m_image_page_epochs;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
+
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
@@ -311,10 +318,13 @@ private:
 	    std::make_unique<std::array<ExactLookup, ExactLookupWays>>();
 	[[nodiscard]] static size_t ExactLookupSlot(const ImageInfo& info) noexcept;
 	[[nodiscard]] uint64_t      ImageEpochInRegionUnlocked(uint64_t address, uint64_t size) const;
+	bool             m_readback_tiled_images  = false;
+
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+	friend class ImageHeap;
 	friend bool BcAlias::Matches(const ImageInfo&, const ImageInfo&);
 	friend bool BcAlias::Publish(TextureCache&, Image&);
 	friend void BcAlias::Resolve(TextureCache&, ImageId, ImageId);

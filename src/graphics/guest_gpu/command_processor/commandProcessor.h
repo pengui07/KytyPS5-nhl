@@ -243,6 +243,8 @@ private:
 	const uint32_t* ShadowPm4Packet(const uint32_t* packet, uint32_t remaining_dw);
 	const uint32_t* ShadowProtectedPm4Packet(const uint32_t* packet, uint32_t remaining_dw);
 	void SuspendPm4();
+	uint32_t            NumInstances();
+	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
@@ -321,12 +323,16 @@ private:
 	uint64_t         m_draw_indirect_args_base_addr     = 0;
 	uint64_t         m_dispatch_indirect_args_base_addr = 0;
 	// Persistent draw state: indirect draws update it for subsequent draws when they execute.
-	GpuNumInstances m_num_instances;
+	GpuNumInstances m_num_instances_stage;
 	friend struct CommandProcessorTestAccess;
 	// KYTY_NATIVE_INDIRECT draws with user SGPR offsets (non-pipelined only).
 	void ResolveNativeShaderRegisters();
 	void CancelNativeShaderRegister(uint32_t location);
 	std::vector<NativeIndirectDraw> m_pending_shader_offsets;
+	// Persistent draw state. Indirect draws leave the address of their last instance count,
+	// read only when a later draw inherits it.
+	uint32_t m_num_instances      = 1;
+	uint64_t m_num_instances_addr = 0;
 
 	uint32_t m_de_count    = 0;
 	uint32_t m_ce_count    = 0;

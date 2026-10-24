@@ -78,11 +78,9 @@ bool IsLaneWise(ValueOpcode op) {
 		case ValueOpcode::BitFieldSExtract:
 		case ValueOpcode::IAdd32:
 		case ValueOpcode::IAdd64:
-		case ValueOpcode::IAddCarry32:
 		case ValueOpcode::ISub32:
 		case ValueOpcode::ISub64:
 		case ValueOpcode::IMul32:
-		case ValueOpcode::IMul64:
 		case ValueOpcode::UDiv32:
 		case ValueOpcode::SMulHi:
 		case ValueOpcode::UMulHi:
@@ -100,9 +98,7 @@ bool IsLaneWise(ValueOpcode op) {
 		case ValueOpcode::BitwiseNot32:
 		case ValueOpcode::BitReverse32:
 		case ValueOpcode::BitCount32:
-		case ValueOpcode::BitCount64:
 		case ValueOpcode::FindUMsb32:
-		case ValueOpcode::FindUMsb64:
 		case ValueOpcode::FindILsb32:
 		case ValueOpcode::SMin32:
 		case ValueOpcode::UMin32:

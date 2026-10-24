@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace {
@@ -17,37 +18,54 @@ void Check(bool condition, const char* text) {
 struct Rumble {
 	Uint16 large, small;
 	Uint32 duration;
+	int    id = 0; // The host gamepad (or haptics controller) that received the request.
 };
+struct Led {
+	int id;
+	std::array<Uint8, 3> color;
+};
+std::vector<Led>                   leds;
 Uint64                             now = 1000;
 std::vector<Rumble>                rumble;
 std::vector<Rumble>                haptics;
 std::vector<std::array<Uint8, 32>> effects;
+std::vector<int>                   effect_ids;
 bool                               haptics_handles_rumble = false;
+std::array<Rumble, 6>               pad_rumble {};
+std::vector<int>                    closed_pads;
+std::array<std::array<Uint8, 3>, 6> pad_colors {};
 } // namespace
 
 namespace Fake {
 Uint64 GetTicks() {
 	return now;
 }
+int PadId(SDL_Gamepad* pad) {
+	return static_cast<int>(reinterpret_cast<uintptr_t>(pad));
+}
 SDL_Gamepad* GetGamepadFromID(SDL_JoystickID id) {
-	return id == 1 || id == 2 ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
+	return id >= 1 && id <= 5 ? reinterpret_cast<SDL_Gamepad*>(static_cast<uintptr_t>(id))
 	                          : nullptr;
 }
 SDL_GamepadType GetGamepadType(SDL_Gamepad*) {
 	return SDL_GAMEPAD_TYPE_PS5;
 }
-bool RumbleGamepad(SDL_Gamepad*, Uint16 large, Uint16 small, Uint32 duration) {
-	rumble.push_back({large, small, duration});
+bool RumbleGamepad(SDL_Gamepad* pad, Uint16 large, Uint16 small, Uint32 duration) {
+	rumble.push_back({large, small, duration, PadId(pad)});
+	pad_rumble[reinterpret_cast<uintptr_t>(pad)] = rumble.back();
 	return true;
 }
-bool SendGamepadEffect(SDL_Gamepad*, const void* data, int size) {
+bool SendGamepadEffect(SDL_Gamepad* pad, const void* data, int size) {
 	Check(size == 32, "unexpected DualSense effect size");
 	std::array<Uint8, 32> effect {};
 	std::memcpy(effect.data(), data, effect.size());
 	effects.push_back(effect);
+	effect_ids.push_back(PadId(pad));
 	return true;
 }
-bool SetGamepadLED(SDL_Gamepad*, Uint8, Uint8, Uint8) {
+bool SetGamepadLED(SDL_Gamepad* pad, Uint8 r, Uint8 g, Uint8 b) {
+	leds.push_back({PadId(pad), {r, g, b}});
+	pad_colors[reinterpret_cast<uintptr_t>(pad)] = {r, g, b};
 	return true;
 }
 bool GamepadHasSensor(SDL_Gamepad*, SDL_SensorType) {
@@ -56,7 +74,9 @@ bool GamepadHasSensor(SDL_Gamepad*, SDL_SensorType) {
 bool SetGamepadSensorEnabled(SDL_Gamepad*, SDL_SensorType, bool) {
 	return true;
 }
-void CloseGamepad(SDL_Gamepad*) {}
+void CloseGamepad(SDL_Gamepad* pad) {
+	closed_pads.push_back(static_cast<int>(reinterpret_cast<uintptr_t>(pad)));
+}
 void Delay(Uint32) {}
 } // namespace Fake
 
@@ -82,9 +102,17 @@ void Delay(Uint32) {}
 #undef SDL_CloseGamepad
 #undef SDL_Delay
 
+namespace Libs::Controller {
+// No virtual headset in these tests (padVr.cpp is not linked here).
+int PadVrPortHand(int) { return -1; }
+int PadVrPort(int, int, int, bool) { return PAD_ERROR_INVALID_ARG; }
+int PadVrCheckHandle(int) { return PAD_ERROR_INVALID_HANDLE; }
+int PadVrClose(int) { return PAD_ERROR_INVALID_HANDLE; }
+} // namespace Libs::Controller
+
 namespace Libs::Controller::DualSenseHaptics {
-bool SetVibration(int, uint8_t large_motor, uint8_t small_motor, uint32_t duration_ms) {
-	haptics.push_back({large_motor, small_motor, duration_ms});
+bool SetVibration(int controller, uint8_t large_motor, uint8_t small_motor, uint32_t duration_ms) {
+	haptics.push_back({large_motor, small_motor, duration_ms, controller});
 	return haptics_handles_rumble;
 }
 void Shutdown() {}
@@ -105,6 +133,14 @@ double GetTimeMs() {
 namespace {
 using namespace Libs::Controller;
 
+void ClearOutputs() {
+	leds.clear();
+	rumble.clear();
+	haptics.clear();
+	effects.clear();
+	effect_ids.clear();
+}
+
 struct Controller {
 	Controller() {
 		now                    = 1000;
@@ -119,9 +155,7 @@ struct Controller {
 		              Config::GetControllerVibrationIntensity() / 100.0f &&
 		          GetSettingScale(Setting::TriggerEffectIntensity) == 1.0f,
 		      "controller initialization retained old settings");
-		rumble.clear();
-		haptics.clear();
-		effects.clear();
+		ClearOutputs();
 	}
 	~Controller() { Shutdown(); }
 };
@@ -191,6 +225,387 @@ void TestPadPortOwnership() {
 	Check(PadOpen(user, 0, 0, nullptr) == handle && PadReadState(handle, &data) == 0,
 	      "a closed port could not reopen");
 	Shutdown();
+}
+
+int PlayerUser(int player) {
+	return GetPlayerUserId(player);
+}
+
+PadData ReadPlayer(int handle) {
+	PadData data {};
+	Check(PadReadState(handle, &data) == OK, "a player pad handle could not read state");
+	return data;
+}
+
+void TestTwoPlayerInputIsolation() {
+	Controller controller;
+	Connect(2);
+	Check(PadOpen(PlayerUser(1), 0, 0, nullptr) == 2, "Player2 did not open its own pad handle");
+
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	SetButton(2, PAD_BUTTON_CIRCLE, true);
+	SetAxis(2, Axis::LeftX, 10);
+	Check(ReadPlayer(1).buttons == PAD_BUTTON_CROSS && ReadPlayer(2).buttons == PAD_BUTTON_CIRCLE,
+	      "two host controllers did not retain independent button state");
+	Check(ReadPlayer(1).left_stick_x == 128 && ReadPlayer(2).left_stick_x == 10,
+	      "one controller's axis reached another player");
+
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_OPTIONS, true);
+	SetTouchPad(HOST_INPUT_CONTROLLER_ID, 0, true, 0.5f, 0.5f);
+	Check(ReadPlayer(1).buttons == (PAD_BUTTON_CROSS | PAD_BUTTON_OPTIONS | PAD_BUTTON_TOUCH_PAD) &&
+	          ReadPlayer(2).buttons == PAD_BUTTON_CIRCLE && ReadPlayer(2).touch_data.touch_num == 0,
+	      "keyboard input did not remain isolated to Player1");
+
+	// Input from a device that no player owns is ignored.
+	SetButton(5, PAD_BUTTON_SQUARE, true);
+	Check(ReadPlayer(1).buttons == (PAD_BUTTON_CROSS | PAD_BUTTON_OPTIONS | PAD_BUTTON_TOUCH_PAD) &&
+	          ReadPlayer(2).buttons == PAD_BUTTON_CIRCLE,
+	      "an unassigned controller changed a player's state");
+
+	Disconnect(1);
+	const auto player_one = ReadPlayer(1);
+	Check(ReadPlayer(2).buttons == PAD_BUTTON_CIRCLE && ReadPlayer(2).connected,
+	      "disconnecting Player1's gamepad changed Player2's state");
+	Check(player_one.connected && player_one.buttons == 0,
+	      "Player1 did not fall back to the neutral keyboard pseudo-device");
+}
+
+void TestPlayerSlotCapacityAndReuse() {
+	Controller controller;
+	const int  user_two = PlayerUser(1), user_three = PlayerUser(2), user_four = PlayerUser(3);
+	Check(GetPlayerControllerIdForUser(PlayerUser(0)) == 1 &&
+	          GetPlayerControllerIdForUser(user_two) == -1 && !IsPlayerControllerConnected(1) &&
+	          IsPlayerControllerConnected(0),
+	      "Player1 lost its gamepad or keyboard connection, or Player2 started connected");
+
+	int32_t user      = 0;
+	bool    connected = false;
+	Check(!PollPlayerConnectionEvent(&user, &connected), "a primary player queued a login event");
+
+	Connect(2);
+	Connect(3);
+	Connect(4);
+	Check(GetPlayerControllerIdForUser(user_two) == 2 && GetPlayerControllerIdForUser(user_three) == 3 &&
+	          GetPlayerControllerIdForUser(user_four) == 4,
+	      "controllers were not assigned to slots in connection order");
+
+	Connect(5);
+	Check(GetPlayerControllerIdForUser(PlayerUser(0)) == 1 && GetPlayerControllerIdForUser(user_four) == 4,
+	      "a fifth controller displaced a player");
+	SetButton(5, PAD_BUTTON_CROSS, true);
+	Disconnect(5);
+	for (int player = 0; player < PLAYER_SLOT_COUNT; ++player) {
+		Check(player == 0 || IsPlayerControllerConnected(player), "ignoring a fifth controller cleared a slot");
+	}
+	Connect(2); // Duplicate connections do not take a second slot.
+	Disconnect(99);
+
+	Disconnect(3);
+	Check(GetPlayerControllerIdForUser(user_two) == 2 && GetPlayerControllerIdForUser(user_three) == -1 &&
+	          GetPlayerControllerIdForUser(user_four) == 4 && IsPlayerControllerConnected(1) &&
+	          !IsPlayerControllerConnected(2) && IsPlayerControllerConnected(3),
+	      "a disconnect cleared a slot other than its own");
+
+	Connect(5);
+	Check(GetPlayerControllerIdForUser(user_three) == 5,
+	      "a later controller did not fill the freed slot");
+
+	// One login per secondary connection and one logout, in order.
+	const struct {
+		int32_t user_id;
+		bool    connected;
+	} expected[] = {{user_two, true}, {user_three, true}, {user_four, true}, {user_three, false}, {user_three, true}};
+	for (const auto& event: expected) {
+		Check(PollPlayerConnectionEvent(&user, &connected) && user == event.user_id &&
+		          connected == event.connected,
+		      "connection events were lost, repeated, or out of order");
+	}
+	Check(!PollPlayerConnectionEvent(&user, &connected), "extra connection events were queued");
+
+	// Player one's pad can also come and go without events; the keyboard keeps the slot connected.
+	Disconnect(1);
+	Check(IsPlayerControllerConnected(0) && !PollPlayerConnectionEvent(&user, &connected),
+	      "Player1's gamepad changed its login state");
+	Connect(1);
+	Check(GetPlayerControllerIdForUser(PlayerUser(0)) == 1, "Player1 did not reclaim its slot");
+}
+
+void TestPerPlayerPadPorts() {
+	Controller controller;
+	constexpr auto already_opened = static_cast<int32_t>(0x80920004u);
+	constexpr auto invalid_arg    = static_cast<int32_t>(0x80920001u);
+	constexpr auto invalid_handle = static_cast<int32_t>(0x80920003u);
+	constexpr auto no_handle      = static_cast<int32_t>(0x80920008u);
+	for (int player = 1; player < PLAYER_SLOT_COUNT; ++player) {
+		Check(PadGetHandle(PlayerUser(player), 0, 0) == no_handle,
+		      "an unopened player port exposed a handle");
+		Check(PadOpen(PlayerUser(player), 0, 0, nullptr) == player + 1,
+		      "a player did not receive the handle matching its slot");
+		Check(PadOpen(PlayerUser(player), 0, 0, nullptr) == already_opened,
+		      "a player port opened twice");
+	}
+	Check(PadClose(3) == OK && PadGetHandle(PlayerUser(2), 0, 0) == no_handle,
+	      "closing a player's port did not release it");
+	Check(PadGetHandle(PlayerUser(0), 0, 0) == 1 && PadGetHandle(PlayerUser(1), 0, 0) == 2 &&
+	          PadGetHandle(PlayerUser(3), 0, 0) == 4,
+	      "closing one player's port closed another's");
+	PadData data {};
+	Check(PadReadState(3, &data) == invalid_handle && PadRead(3, &data, 1) == invalid_handle &&
+	          PadClose(3) == invalid_handle && ReadPlayer(2).connected == false,
+	      "a closed player handle stayed usable");
+	for (const int handle: {0, 5, -1, 1000}) {
+		Check(PadReadState(handle, &data) == invalid_handle && PadClose(handle) == invalid_handle,
+		      "an out-of-range handle aliased a player");
+	}
+	Check(PadOpen(12345, 0, 0, nullptr) == invalid_arg &&
+	          PadOpen(PlayerUser(1), 1, 0, nullptr) == invalid_arg &&
+	          PadOpen(PlayerUser(2), 0, 1, nullptr) == invalid_arg &&
+	          PadGetHandle(12345, 0, 0) == no_handle,
+	      "an invalid port tuple was accepted");
+	Check(PadOpen(PlayerUser(2), 0, 0, nullptr) == 3, "a closed player port could not reopen");
+	Check(PadGetHandle(PlayerUser(1), 0, 1) == no_handle && PadGetHandle(PlayerUser(1), 2, 0) == no_handle,
+	      "a different tuple aliased a player's pad");
+}
+
+void TestWaitingControllerTakesFreedSlot() {
+	Controller controller;
+	Connect(2);
+	Connect(3);
+	Connect(4);
+	Connect(5);
+	Connect(5); // A repeated SDL notification must not queue the same device twice.
+	Disconnect(2);
+	Check(GetPlayerControllerIdForUser(PlayerUser(1)) == 5,
+	      "an already-connected fifth controller did not take the freed Player2 slot");
+	Check(GetPlayerControllerIdForUser(PlayerUser(0)) == 1 &&
+	          GetPlayerControllerIdForUser(PlayerUser(2)) == 3 &&
+	          GetPlayerControllerIdForUser(PlayerUser(3)) == 4,
+	      "promoting the waiting controller changed another player's assignment");
+	Check(PadOpen(PlayerUser(1), 0, 0, nullptr) == 2, "promoted controller did not open Player2's pad");
+	SetButton(5, PAD_BUTTON_CIRCLE, true);
+	Check(ReadPlayer(2).buttons == PAD_BUTTON_CIRCLE,
+	      "the promoted controller did not feed its new player's pad");
+	Disconnect(5);
+	Check(!IsPlayerControllerConnected(1), "a duplicate waiting entry resurrected a disconnected pad");
+	Connect(2);
+	Connect(5);
+	Disconnect(5); // Removing a waiting device must remove it from the queue as well.
+	Disconnect(2);
+	Check(!IsPlayerControllerConnected(1), "an unplugged waiting controller took a free slot");
+}
+
+void TestPerPlayerReadHistory() {
+	Controller controller;
+	Connect(2);
+	Check(PadOpen(PlayerUser(1), 0, 0, nullptr) == 2, "Player2 did not open");
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	SetButton(1, PAD_BUTTON_CROSS, false);
+	SetButton(2, PAD_BUTTON_CIRCLE, true);
+	SetButton(2, PAD_BUTTON_SQUARE, true);
+
+	PadData history[8] {};
+	Check(PadRead(1, history, 8) == 2 && history[0].buttons == PAD_BUTTON_CROSS && history[1].buttons == 0,
+	      "Player1's history was not returned in order");
+	Check(PadRead(1, history, 8) == 1 && history[0].buttons == 0,
+	      "Player1's history was not drained");
+	Check(PadRead(2, history, 8) == 2 && history[0].buttons == PAD_BUTTON_CIRCLE &&
+	          history[1].buttons == (PAD_BUTTON_CIRCLE | PAD_BUTTON_SQUARE),
+	      "draining Player1 consumed Player2's history");
+
+	// A departed device's state never reaches the next device in that slot.
+	Disconnect(2);
+	PadData gone = ReadPlayer(2);
+	Check(!gone.connected && gone.buttons == 0, "a disconnected slot kept the departed device's state");
+	Check(PadRead(2, history, 8) == 1 && !history[0].connected && history[0].buttons == 0,
+	      "a disconnected slot replayed the departed device's history");
+	Connect(3);
+	PadData fresh = ReadPlayer(2);
+	Check(fresh.connected && fresh.buttons == 0 && fresh.left_stick_x == 128,
+	      "a new device inherited the previous device's state");
+	Check(PadRead(2, history, 8) == 1 && history[0].buttons == 0,
+	      "a new device inherited the previous device's history");
+	SetButton(2, PAD_BUTTON_CROSS, true); // The old device is no longer assigned.
+	Check(ReadPlayer(2).buttons == 0, "a departed device still drives its old slot");
+	SetButton(3, PAD_BUTTON_L1, true);
+	Check(ReadPlayer(2).buttons == PAD_BUTTON_L1 && ReadPlayer(1).buttons == 0,
+	      "the replacement device did not drive only its slot");
+}
+
+void TestPerPlayerOutputIsolation() {
+	Controller controller;
+	Connect(2);
+	Check(PadOpen(PlayerUser(1), 0, 0, nullptr) == 2, "Player2 did not open");
+	const auto expect_only = [](const std::vector<Rumble>& requests, int id, const char* message) {
+		Check(!requests.empty(), message);
+		for (const auto& request: requests) {
+			Check(request.id == id, message);
+		}
+	};
+
+	const PadVibrationParam player_two {200, 100};
+	ClearOutputs();
+	Check(PadSetVibration(2, &player_two) == OK, "Player2 vibration failed");
+	expect_only(rumble, 2, "Player2's vibration reached another device");
+
+	ClearOutputs();
+	const PadVibrationParam player_one {50, 25};
+	Check(PadSetVibration(1, &player_one) == OK, "Player1 vibration failed");
+	expect_only(rumble, 1, "Player1's vibration reached another device");
+
+	PadTriggerEffectParam trigger {};
+	trigger.trigger_mask       = 1;
+	trigger.command[0].mode    = 1;
+	trigger.command[0].data[1] = 8;
+	ClearOutputs();
+	Check(PadSetTriggerEffect(2, &trigger) == OK && !effect_ids.empty(), "Player2 trigger request failed");
+	for (const int id: effect_ids) {
+		Check(id == 2, "Player2's trigger effect reached another device");
+	}
+
+	// Cycling the global level re-sends each player's own cached request to its own device.
+	ClearOutputs();
+	CycleSetting(Setting::VibrationIntensity);
+	bool saw_one = false, saw_two = false;
+	for (const auto& request: rumble) {
+		saw_one |= request.id == 1;
+		saw_two |= request.id == 2;
+	}
+	Check(saw_one && saw_two, "a level change did not reach every player's controller");
+
+	// Output through the haptics path keeps its controller too.
+	haptics_handles_rumble = true;
+	ClearOutputs();
+	Check(PadSetVibration(2, &player_two) == OK, "Player2 haptics vibration failed");
+	expect_only(haptics, 2, "Player2's haptics vibration was routed to another device");
+	Check(rumble.empty(), "haptics-handled vibration also used plain rumble");
+
+	// Without a physical controller (keyboard only) a player's output has nowhere to go.
+	Disconnect(1);
+	ClearOutputs();
+	haptics_handles_rumble = false;
+	Check(PadSetVibration(1, &player_one) == OK && PadSetTriggerEffect(1, &trigger) == OK,
+	      "keyboard-only player output failed");
+	Check(rumble.empty() && effects.empty(), "keyboard input received controller output");
+	Disconnect(2);
+	ClearOutputs();
+	Check(PadSetVibration(2, &player_two) == OK && rumble.empty(),
+	      "a disconnected player's output reached a device");
+}
+
+void TestVirtualUserIdAllocation() {
+	struct Case {
+		int32_t configured;
+		int32_t expected[3];
+	};
+	const Case cases[] = {{1000, {1001, 1002, 1003}},
+	                      {1001, {1002, 1003, 1004}},
+	                      {2147483647, {1001, 1002, 1003}},
+	                      {0, {1001, 1002, 1003}}};
+	for (const auto& test: cases) {
+		Config::ConfigOptions options;
+		options.user_id = test.configured;
+		Config::Load(options);
+		for (int round = 0; round < 2; ++round) { // Deterministic across initializations.
+			Controller controller;
+			Check(PlayerUser(0) == test.configured, "Player1 lost the configured user ID");
+			for (int player = 1; player < PLAYER_SLOT_COUNT; ++player) {
+				Check(PlayerUser(player) == test.expected[player - 1],
+				      "a virtual user received an unexpected ID");
+			}
+			for (int a = 0; a < PLAYER_SLOT_COUNT; ++a) {
+				Check(PlayerUser(a) >= 0 && PlayerUser(a) != 0xfe && PlayerUser(a) != 0xff,
+				      "a player received an invalid or reserved user ID");
+				for (int b = a + 1; b < PLAYER_SLOT_COUNT; ++b) {
+					Check(PlayerUser(a) != PlayerUser(b), "two players share a user ID");
+				}
+			}
+		}
+	}
+	Check(PlayerUser(-1) == -1 && PlayerUser(PLAYER_SLOT_COUNT) == -1, "an invalid slot returned a user");
+	Config::Load(Config::ConfigOptions {});
+}
+
+void TestPlayerLightBarColors() {
+	// Startup colors identify slots; each guest light bar write can then select its own color.
+	Config::ConfigOptions options;
+	options.controller_color = Config::ControllerColor {12, 34, 56};
+	Config::Load(options);
+	Initialize();
+	Check(PadInit() == OK, "pad initialization failed");
+	ClearOutputs();
+	const std::array<Config::ControllerColor, 4> expected {{
+	    {12, 34, 56}, {255, 0, 0}, {0, 255, 0}, {255, 32, 160}
+	}};
+	for (int player = 0; player < 4; ++player) {
+		Connect(player + 1);
+		Check(!leds.empty() && leds.back().id == player + 1 && leds.back().color == expected[player],
+		      "connecting a controller did not apply its own player's color");
+		Check(PadOpen(PlayerUser(player), 0, 0, nullptr) == player + 1, "player light bar port did not open");
+		const PadLightBarParam game_color {static_cast<uint8_t>(player + 1), 2, 3, 0};
+		const Config::ControllerColor wanted = player == 0 ? expected[0]
+		    : Config::ControllerColor {static_cast<uint8_t>(player + 1), 2, 3};
+		const auto before = leds.size();
+		Check(PadSetLightBar(player + 1, &game_color) == OK &&
+		          leds.size() == before + 1 && leds.back().id == player + 1 && leds.back().color == wanted,
+		      "the game's light bar request was blocked or reached another player's device");
+	}
+	Disconnect(2);
+	ClearOutputs();
+	Connect(5);
+	Check(leds.size() == 1 && leds.back().id == 5 && leds.back().color == Config::ControllerColor {2, 2, 3},
+	      "a replacement controller did not restore Player2's last game-set color");
+	Shutdown();
+	Config::Load(Config::ConfigOptions {});
+	{
+		Controller controller;
+		// NHL uses its own order: Player1 red and Player2 blue must override the startup palette.
+		Connect(2);
+		Check(PadOpen(PlayerUser(1), 0, 0, nullptr) == 2, "Player2 did not open its light bar port");
+		ClearOutputs();
+		const PadLightBarParam game_color {255, 0, 0, 0};
+		Check(PadSetLightBar(1, &game_color) == OK && leds.back().id == 1 &&
+		          leds.back().color == Config::ControllerColor {255, 0, 0},
+		      "Player1's startup palette blocked the game's red light bar");
+		const PadLightBarParam second_color {0, 0, 255, 0};
+		Check(PadSetLightBar(2, &second_color) == OK && leds.size() == 2 &&
+		          leds.back().id == 2 && leds.back().color == Config::ControllerColor {0, 0, 255},
+		      "Player2's startup palette blocked the game's blue light bar");
+	}
+}
+
+void TestGameLightBarRestoredOnReconnect() {
+	Controller controller;
+	Connect(2);
+	Check(PadOpen(PlayerUser(1), 0, 0, nullptr) == 2, "Player2's pad did not open");
+	const PadLightBarParam red {255, 0, 0, 0}, blue {0, 0, 255, 0}, off {0, 0, 0, 0};
+	Check(PadSetLightBar(1, &red) == OK && PadSetLightBar(2, &blue) == OK,
+	      "game light bar requests failed");
+	Disconnect(2);
+	Check(PadClose(2) == OK, "disconnected player's pad did not close");
+	ClearOutputs();
+	Connect(3);
+	Check(leds.size() == 1 && leds.back().id == 3 && leds.back().color == Config::ControllerColor {0, 0, 255},
+	      "Player2 reconnect restored the startup palette instead of the game's blue");
+	Check(PadOpen(PlayerUser(1), 0, 0, nullptr) == 2, "reconnected pad did not reopen");
+	Disconnect(1);
+	ClearOutputs();
+	Connect(4);
+	Check(leds.size() == 1 && leds.back().id == 4 && leds.back().color == Config::ControllerColor {255, 0, 0},
+	      "Player1 reconnect lost the game color or changed another player's LED");
+	Check(PadSetLightBar(2, &off) == OK, "game could not turn off Player2's light bar");
+	Disconnect(3);
+	ClearOutputs();
+	Connect(3);
+	Check(leds.size() == 1 && leds.back().color == Config::ControllerColor {0, 0, 0},
+	      "reconnect treated a game-requested off light bar as an unset color");
+	Disconnect(3);
+	ClearOutputs();
+	const PadLightBarParam absent_color {17, 28, 39, 0};
+	Check(PadSetLightBar(2, &absent_color) == OK && leds.empty(),
+	      "setting a disconnected player's color touched another device");
+	Connect(5);
+	Check(leds.size() == 1 && leds.back().id == 5 && leds.back().color == Config::ControllerColor {17, 28, 39},
+	      "reconnect lost the latest color requested while the controller was absent");
 }
 
 void TestSettingCycles() {
@@ -368,7 +783,15 @@ void TestIndependentOutputsAndPadSwitch() {
 	      "speaker volume resent controller effects");
 	Connect(2);
 	Disconnect(1);
+	Check(GetPlayerControllerIdForUser(PlayerUser(0)) == -1 &&
+	          GetPlayerControllerIdForUser(PlayerUser(1)) == 2,
+	      "the second controller did not become Player2");
+	Check(GetActiveControllerId() == HOST_INPUT_CONTROLLER_ID,
+	      "disconnecting player 1 stole player 2's pad");
+	Disconnect(2);
+	Connect(2);
 	Check(GetActiveControllerId() == 2, "active controller did not change");
+	ClearOutputs();
 	haptics.clear();
 	effects.clear();
 	CycleSetting(Setting::VibrationIntensity);
@@ -382,9 +805,9 @@ void TestIndependentOutputsAndPadSwitch() {
 	SetRumble(200, 100);
 	Check(PadSetTriggerEffect(1, &param) == 0, "replacement pad trigger request failed");
 	EmergencyShutdown();
-	Check(GetActiveControllerId() == -1, "released controller remained active");
-	haptics.clear();
-	effects.clear();
+	Check(GetPlayerControllerIdForUser(PlayerUser(1)) == -1 && !IsPlayerControllerConnected(1),
+	      "released controller remained assigned");
+	ClearOutputs();
 	CycleSetting(Setting::VibrationIntensity);
 	CycleSetting(Setting::TriggerEffectIntensity);
 	Check(effects.empty(), "released controller received a trigger request");
@@ -392,6 +815,126 @@ void TestIndependentOutputsAndPadSwitch() {
 		Check(request.large == 0 && request.small == 0,
 		      "released controller retained a cached vibration");
 	}
+}
+
+void TestPlayerUserIds() {
+	Check(Config::IsConfiguredUserIdValid(Config::MAX_USER_ID) &&
+	          !Config::IsConfiguredUserIdValid(Config::MAX_USER_ID + 1) &&
+	          !Config::IsConfiguredUserIdValid(254) && !Config::IsConfiguredUserIdValid(255),
+	      "configured user IDs did not reserve a valid range for guests");
+	Config::ConfigOptions options;
+	options.user_id = Config::MAX_USER_ID;
+	Config::Load(options);
+	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
+		Check(Config::GetPlayerFromUserId(Config::GetPlayerUserId(player)) == player,
+		      "player user ID did not round-trip at the upper limit");
+	}
+	Check(Config::GetPlayerUserId(3) == std::numeric_limits<int32_t>::max() &&
+	          Config::GetPlayerFromUserId(-1) == -1,
+	      "guest user ID overflowed or accepted an unknown user");
+	Config::Load(Config::ConfigOptions {});
+}
+
+void TestMultiplayerRouting() {
+	Controller controller;
+	for (int player = 1; player < Config::MAX_PLAYERS; player++) {
+		Check(PadOpen(Config::GetPlayerUserId(player), 0, 0, nullptr) == player + 1,
+		      "a guest could not open its own pad port");
+	}
+	for (int id = 2; id <= 5; id++) {
+		Connect(id);
+	}
+	Connect(2); // Duplicate device reports must not consume another port.
+	const auto read = [](int handle) {
+		PadData data {};
+		Check(PadReadState(handle, &data) == OK, "player pad read failed");
+		return data;
+	};
+	SetButton(1, PAD_BUTTON_CROSS, true);
+	SetButton(2, PAD_BUTTON_CIRCLE, true);
+	SetButton(5, PAD_BUTTON_TRIANGLE, true);
+	Check(read(1).buttons == PAD_BUTTON_CROSS && read(2).buttons == PAD_BUTTON_CIRCLE &&
+	          read(3).buttons == 0 && read(4).buttons == 0,
+	      "physical pads did not route independently or overflow reached a player");
+
+	SetRumble(100, 50);
+	CycleKeyboardPlayer(); // Dedicated player 1; physical pad 1 waits.
+	Check(GetActiveControllerId() == HOST_INPUT_CONTROLLER_ID &&
+	          read(2).buttons == PAD_BUTTON_CIRCLE && pad_rumble[1].large == 0 &&
+	          pad_rumble[1].small == 0,
+	      "keyboard reassignment changed an unaffected player or left pad output "
+	      "running");
+	for (int mode = 2; mode <= Config::MAX_PLAYERS; mode++) {
+		CycleKeyboardPlayer();
+	}
+	CycleKeyboardPlayer(); // Shared player 1; all original pads must return.
+	ResetInputState();
+	for (int id = 1; id <= 5; id++) {
+		SetButton(id, 1u << id, true);
+	}
+	for (int handle = 1; handle <= Config::MAX_PLAYERS; handle++) {
+		Check(read(handle).buttons == (1u << handle),
+		      "cycling keyboard players lost or duplicated a connected pad");
+	}
+
+	// Moving the keyboard clears its held input from the old player.
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_TRIANGLE, true);
+	CycleKeyboardPlayer();
+	CycleKeyboardPlayer();
+	SetButton(HOST_INPUT_CONTROLLER_ID, PAD_BUTTON_TRIANGLE, true);
+	CycleKeyboardPlayer(); // Keyboard now moves from player 2 to player 3.
+	Check((read(2).buttons & PAD_BUTTON_TRIANGLE) == 0,
+	      "moving the keyboard retained a held button on its old player");
+	CycleKeyboardPlayer();
+	CycleKeyboardPlayer();
+	Disconnect(2);
+	SetButton(5, PAD_BUTTON_SQUARE, true);
+	Check(read(2).buttons == PAD_BUTTON_SQUARE && GetActiveControllerId() == 1,
+	      "waiting pad did not fill a free slot or an unaffected pad moved");
+	Disconnect(99);
+	Check(PadCheckHandle(std::numeric_limits<int>::min()) == PAD_ERROR_INVALID_HANDLE &&
+	          PadClose(std::numeric_limits<int>::max()) == PAD_ERROR_INVALID_HANDLE,
+	      "an extreme handle aliased a player port");
+	closed_pads.clear();
+	EmergencyShutdown();
+	std::sort(closed_pads.begin(), closed_pads.end());
+	Check(closed_pads == std::vector<int> {1, 3, 4, 5},
+	      "shutdown did not close each registered host pad exactly once");
+}
+
+void TestDedicatedKeyboardOutputs() {
+	Config::ConfigOptions options;
+	options.keyboard_player  = 1;
+	options.controller_color = Config::ControllerColor {30, 40, 50};
+	Config::Load(options);
+	Initialize();
+	PadInit();
+	for (int player = 0; player < Config::MAX_PLAYERS; player++) {
+		Check(PadOpen(Config::GetPlayerUserId(player), 0, 0, nullptr) == player + 1,
+		      "dedicated keyboard port did not open");
+	}
+	Connect(1);
+	Connect(2);
+	const PadVibrationParam request {100, 50};
+	Check(PadSetVibration(3, &request) == OK, "player three vibration failed");
+	SetButton(2, PAD_BUTTON_CROSS, true);
+	CycleKeyboardPlayer(); // Pad 1 moves from player 2 to player 1.
+	PadData data {};
+	Check(GetActiveControllerId() == 1 && pad_colors[1] == *options.controller_color,
+	      "moving a pad to an earlier slot cleared its configured lightbar");
+	Check(PadReadState(3, &data) == OK && data.buttons == PAD_BUTTON_CROSS &&
+	          pad_rumble[2].large == 100 * 257 && pad_rumble[2].small == 50 * 257,
+	      "keyboard reassignment reset an unaffected player's input or output");
+	haptics_handles_rumble = true;
+	SetRumble(200, 100);
+	for (int mode = 0; mode < 4; mode++) {
+		CycleKeyboardPlayer();
+	}
+	Check(GetActiveControllerId() == HOST_INPUT_CONTROLLER_ID && haptics.back().large == 0 &&
+	          haptics.back().small == 0 && haptics.back().duration == 0,
+	      "moving player one's pad retained its DualSense vibration request");
+	Shutdown();
+	Config::Load(Config::ConfigOptions {});
 }
 
 void TestTriggerEffectState() {
@@ -553,7 +1096,17 @@ void TestTriggerEffectState() {
 
 int main() {
 	Config::Initialize();
+	TestPlayerUserIds();
 	TestPadPortOwnership();
+	TestTwoPlayerInputIsolation();
+	TestPlayerSlotCapacityAndReuse();
+	TestWaitingControllerTakesFreedSlot();
+	TestPerPlayerPadPorts();
+	TestPerPlayerReadHistory();
+	TestPerPlayerOutputIsolation();
+	TestVirtualUserIdAllocation();
+	TestPlayerLightBarColors();
+	TestGameLightBarRestoredOnReconnect();
 	TestSettingCycles();
 	TestGlobalControllerLevels();
 	// Each following test initializes another controller and requires strong defaults.
@@ -561,6 +1114,8 @@ int main() {
 	TestMaskedTriggersAndValidation();
 	TestIndependentOutputsAndPadSwitch();
 	TestTriggerEffectState();
+	TestMultiplayerRouting();
+	TestDedicatedKeyboardOutputs();
 	Config::Shutdown();
 	return 0;
 }

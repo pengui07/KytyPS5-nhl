@@ -9,6 +9,7 @@
 #include <array>
 #include <cmath>
 #include <map>
+#include <set>
 #include <vector>
 
 namespace Libs::Controller::DualSenseHaptics {
@@ -28,38 +29,45 @@ namespace {
 
 constexpr int      FRAME_BYTES  = 4 * sizeof(float);
 constexpr uint32_t MAX_QUEUE_MS = 80;
-Common::Mutex      g_mutex;
-int                g_controller      = -1;
-int                g_haptics_streams = 0;
-uint8_t            g_large_motor = 0, g_small_motor = 0;
-uint64_t           g_rumble_until = 0, g_haptics_until = 0;
-int                g_speaker_controller = -1;
-std::map<int, int> g_speaker_streams;
+// Output state of one host controller (SDL instance ID); controllers never share it.
+struct Output {
+	int      haptics_streams = 0;
+	uint8_t  large_motor = 0, small_motor = 0;
+	uint64_t rumble_until = 0, haptics_until = 0;
+};
 
-void ApplyRumble(bool force = false) { // Caller holds g_mutex; no calls into Audio or Controller.
+Common::Mutex         g_mutex;
+std::map<int, Output> g_outputs;         // By controller.
+std::map<int, int>    g_speaker_streams; // Open speaker streams by controller.
+std::set<int>         g_speaker_routed;  // Controllers whose speaker route is on.
+
+// Caller holds g_mutex; no calls into Audio or Controller.
+void ApplyRumble(int controller, bool force = false) {
+	const auto output = g_outputs.find(controller);
+	if (output == g_outputs.end()) {
+		return;
+	}
+	const auto& state = output->second;
 	SDL_LockJoysticks();
-	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(g_controller));
-	    pad != nullptr) {
+	if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller)); pad != nullptr) {
 		const auto now   = SDL_GetTicks();
-		const bool muted = g_haptics_until > now || g_rumble_until <= now;
+		const bool muted = state.haptics_until > now || state.rumble_until <= now;
 		if (force && !muted) {
 			// SDL caches motor strengths. Force a report after raw speaker routing changed the
 			// controller's motor mode without changing that cache.
 			(void)SDL_RumbleGamepad(pad, 0, 0, 0);
 		}
 		(void)SDL_RumbleGamepad(
-		    pad, muted ? 0 : g_large_motor * 0x101U, muted ? 0 : g_small_motor * 0x101U,
-		    g_rumble_until > now ? static_cast<uint32_t>(g_rumble_until - now) : 0);
+		    pad, muted ? 0 : state.large_motor * 0x101U, muted ? 0 : state.small_motor * 0x101U,
+		    state.rumble_until > now ? static_cast<uint32_t>(state.rumble_until - now) : 0);
 	}
 	SDL_UnlockJoysticks();
 }
 
-void SelectController(int controller) {
-	if (g_controller != controller) {
-		g_haptics_until = g_rumble_until = 0;
-		ApplyRumble();
-		g_controller  = controller;
-		g_large_motor = g_small_motor = 0;
+void StopRumble(int controller) { // Caller holds g_mutex.
+	if (const auto output = g_outputs.find(controller); output != g_outputs.end()) {
+		output->second.haptics_until = output->second.rumble_until = 0;
+		ApplyRumble(controller);
 	}
 }
 
@@ -81,32 +89,37 @@ bool RouteSpeaker(int controller, bool speaker) { // Caller holds g_mutex.
 		routed = SDL_SendGamepadEffect(pad, report.data(), static_cast<int>(report.size()));
 	}
 	SDL_UnlockJoysticks();
-	if (routed && controller == g_controller) {
-		ApplyRumble(true);
+	if (routed) {
+		ApplyRumble(controller, true);
 	}
 	return routed;
 }
 
-bool SelectSpeaker(int controller) { // Caller holds g_mutex; -1 restores headphone routing.
-	if (g_speaker_controller == controller) {
+bool SelectSpeaker(int controller) { // Caller holds g_mutex; routes only this controller.
+	if (g_speaker_routed.count(controller) != 0) {
 		return true;
 	}
-	if (g_speaker_controller != -1) {
-		RouteSpeaker(g_speaker_controller, false);
-	}
-	g_speaker_controller = -1;
-	if (controller != -1 && !RouteSpeaker(controller, true)) {
+	if (!RouteSpeaker(controller, true)) {
 		return false;
 	}
-	g_speaker_controller = controller;
+	g_speaker_routed.insert(controller);
 	return true;
+}
+
+void ReleaseSpeaker(int controller) { // Caller holds g_mutex; restores its headphone routing.
+	if (g_speaker_routed.erase(controller) != 0) {
+		RouteSpeaker(controller, false);
+	}
 }
 
 void SDLCALL UpdateRumble(void*, SDL_AudioStream*, int, int) {
 	Common::LockGuard lock(g_mutex);
-	if (g_haptics_until != 0 && SDL_GetTicks() >= g_haptics_until) {
-		g_haptics_until = 0;
-		ApplyRumble();
+	// The callback does not say which stream ran; expire every controller's finished haptics.
+	for (auto& [controller, state]: g_outputs) {
+		if (state.haptics_until != 0 && SDL_GetTicks() >= state.haptics_until) {
+			state.haptics_until = 0;
+			ApplyRumble(controller);
+		}
 	}
 }
 
@@ -127,16 +140,17 @@ void CloseDevice(Stream* stream) {
 	}
 	if (had_device) {
 		Common::LockGuard lock(g_mutex);
-		if (!stream->speaker && --g_haptics_streams == 0 && g_haptics_until != 0) {
-			g_haptics_until = 0;
-			ApplyRumble();
+		if (!stream->speaker) {
+			auto& state = g_outputs[stream->controller];
+			if (--state.haptics_streams == 0 && state.haptics_until != 0) {
+				state.haptics_until = 0;
+				ApplyRumble(stream->controller);
+			}
 		}
 		// Route back to the headphones once no speaker port plays on the controller.
 		if (stream->speaker && --g_speaker_streams.at(stream->controller) == 0) {
 			g_speaker_streams.erase(stream->controller);
-			if (g_speaker_controller == stream->controller) {
-				SelectSpeaker(-1);
-			}
+			ReleaseSpeaker(stream->controller);
 		}
 	}
 }
@@ -239,7 +253,7 @@ void RefreshDevice(Stream* stream, int controller, bool wireless) {
 				g_speaker_streams[controller]++;
 			}
 		} else {
-			g_haptics_streams++;
+			g_outputs[controller].haptics_streams++;
 		}
 	}
 	if (ready) {
@@ -326,6 +340,33 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 	if (frames == 0) {
 		return 0;
 	}
+	if (!stream->speaker &&
+	    SDL_GetGamepadTypeForID(static_cast<SDL_JoystickID>(controller)) != SDL_GAMEPAD_TYPE_PS5) {
+		CloseDevice(stream);
+		stream->next_check = 0;
+		// Non-DualSense pads have no haptic audio path: approximate it with the rumble motors.
+		float peak[2] = {0.0f, 0.0f};
+		for (uint32_t frame = 0; frame < frames; frame++) {
+			for (uint32_t ch = 0; ch < 2; ch++) {
+				const auto src_ch = channels == 1 ? 0 : ch;
+				const auto index  = (static_cast<size_t>(first_frame) + frame) * channels + src_ch;
+				float      value  = is_float ? static_cast<const float*>(data)[index]
+				                             : static_cast<const int16_t*>(data)[index] / 32768.0f;
+				value *= volume[src_ch] / 32768.0f * gain * (gains != nullptr ? gains[src_ch] : 1.0f);
+				peak[ch] = std::max(peak[ch], std::fabs(value));
+			}
+		}
+		const auto to_motor = [](float v) {
+			return static_cast<uint16_t>(std::clamp(v * 2.0f, 0.0f, 1.0f) * 65535.0f);
+		};
+		SDL_LockJoysticks();
+		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller));
+		    pad != nullptr) {
+			(void) SDL_RumbleGamepad(pad, to_motor(peak[0]), to_motor(peak[1]), 100);
+		}
+		SDL_UnlockJoysticks();
+		return static_cast<uint64_t>(frames) * 1000000 / stream->freq;
+	}
 	const bool wireless = IsWireless(controller);
 	if (!wireless && !CanUseDevice(controller)) {
 		CloseDevice(stream);
@@ -374,13 +415,13 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 	}
 	if (audible && !stream->speaker) {
 		Common::LockGuard lock(g_mutex);
-		SelectController(controller);
-		const auto now      = SDL_GetTicks();
-		const bool starting = g_haptics_until <= now;
-		g_haptics_until =
-		    std::max(g_haptics_until, now + std::max<uint64_t>(queued_us / 1000, 250));
+		auto&             state    = g_outputs[controller];
+		const auto        now      = SDL_GetTicks();
+		const bool        starting = state.haptics_until <= now;
+		state.haptics_until =
+		    std::max(state.haptics_until, now + std::max<uint64_t>(queued_us / 1000, 250));
 		if (starting) {
-			ApplyRumble();
+			ApplyRumble(controller);
 		}
 	}
 	return queued_us;
@@ -391,19 +432,24 @@ bool SetVibration(int controller, uint8_t large_motor, uint8_t small_motor, uint
 		return false;
 	}
 	Common::LockGuard lock(g_mutex);
-	SelectController(controller);
-	g_large_motor  = large_motor;
-	g_small_motor  = small_motor;
-	g_rumble_until = SDL_GetTicks() + duration_ms;
-	ApplyRumble();
+	auto&             state = g_outputs[controller];
+	state.large_motor       = large_motor;
+	state.small_motor       = small_motor;
+	state.rumble_until      = SDL_GetTicks() + duration_ms;
+	ApplyRumble(controller);
 	return true;
 }
 
 void Shutdown() {
 	DualSenseBluetooth::Shutdown();
 	Common::LockGuard lock(g_mutex);
-	SelectController(-1);
-	SelectSpeaker(-1);
+	for (const auto& entry: g_outputs) {
+		StopRumble(entry.first);
+	}
+	g_outputs.clear();
+	for (const auto controller: std::set<int>(g_speaker_routed)) {
+		ReleaseSpeaker(controller);
+	}
 }
 
 } // namespace Libs::Controller::DualSenseHaptics

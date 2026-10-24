@@ -5,6 +5,7 @@
 #include "graphics/host_gpu/renderer/bindEpoch.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/experiments.h"
 #include "common/logging/log.h"
@@ -46,6 +47,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+
 #include <utility>
 #include <vector>
 
@@ -104,14 +106,14 @@ constexpr size_t ResolvedQueueSize = 256;
 // How long a command processor whose queues all wait spins before it retries them.
 constexpr auto BlockedRetryInterval = std::chrono::microseconds(20);
 
-struct DrawIndirectArgs {
+struct GuestDrawIndirectArgs {
 	uint32_t vertex_count_per_instance;
 	uint32_t instance_count;
 	uint32_t start_vertex_location;
 	uint32_t start_instance_location;
 };
 
-struct DrawIndexedIndirectArgs {
+struct GuestDrawIndexedIndirectArgs {
 	uint32_t index_count_per_instance;
 	uint32_t instance_count;
 	uint32_t start_index_location;
@@ -144,6 +146,7 @@ static void CopyFromGuest(void* destination, const volatile void* source, size_t
 		out[i] = bytes[i];
 	}
 }
+
 
 static bool GraphicsRunDebugDumpEnabled() {
 	return Config::GraphicsDebugDumpEnabled() &&
@@ -219,6 +222,12 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 	m_commands.push_back(std::move(command));
 	m_pending_commands.fetch_add(1, std::memory_order_release);
 	m_work_epoch.fetch_add(1, std::memory_order_release);
+	m_work_available.Signal();
+}
+
+void GuestGpu::Wake() {
+	Common::LockGuard lock(m_queue_mutex);
+	m_wake_pending = true;
 	m_work_available.Signal();
 }
 
@@ -1266,9 +1275,12 @@ void CommandProcessor::Reset() {
 	m_index_type_and_size              = 0;
 	m_index_buffer_size                = 0;
 	m_index_base_addr                  = 0;
-	m_num_instances.value              = 1;
-	m_num_instances.sequence++;
+	m_num_instances_stage.value        = 1;
+	m_num_instances_stage.sequence++;
 	m_pending_shader_offsets.clear();
+	m_num_instances                    = 1;
+	m_num_instances_addr               = 0;
+
 	m_predicate_skip                   = false;
 	m_user_data_marker                 = HW::UserSgprType::Unknown;
 	m_draw_indirect_args_base_addr     = 0;
@@ -1311,7 +1323,7 @@ GpuOperation CommandProcessor::MakeOperation(GpuOperationKind kind) {
 	operation.trace_op      = g_trace_op;
 	operation.processor     = this;
 	operation.submit_id     = m_submit_id;
-	operation.num_instances = m_num_instances;
+	operation.num_instances = m_num_instances_stage;
 	operation.after_wait    = std::exchange(m_wait_since_operation, false);
 	operation.write_epoch   = RegionManager::CurrentWriteEpoch();
 	if (m_pipeline == nullptr) {
@@ -2269,7 +2281,10 @@ void GuestGpu::ThreadRun(void* data) {
 					} else {
 						Common::Timeline::Mark("gpu-blocked");
 						StageStats::CpStateScope state(StageStats::CpState::Blocked);
-						gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						// A wake that came before this wait must not be lost.
+						if (!std::exchange(gpu->m_wake_pending, false)) {
+							gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+						}
 						Common::Timeline::Mark("gpu-unblocked");
 					}
 					for (auto& queue: gpu->m_queues) {
@@ -2577,7 +2592,6 @@ static bool BdaBoundaryKind(uint32_t opcode, uint32_t header, RenderContext::Bda
 		case Pm4::IT_NOP:
 			switch (KYTY_PM4_R(header)) {
 				case Pm4::R_WAIT_FLIP_DONE: kind = B::Wait; return true;
-				case Pm4::R_ACQUIRE_MEM: kind = B::Acquire; return true;
 				case Pm4::R_RELEASE_MEM: kind = B::Event; return true;
 				case Pm4::R_FLIP: kind = B::Flip; return true;
 				default: return false;
@@ -3009,8 +3023,11 @@ void CommandProcessor::SetNumInstances(uint32_t num_instances) {
 		num_instances = 1;
 	}
 
-	m_num_instances.value = num_instances;
-	m_num_instances.sequence++;
+	m_num_instances_stage.value = num_instances;
+	m_num_instances_stage.sequence++;
+	// Upstream's persistent count shares this setter (see NumInstances()).
+	m_num_instances      = num_instances;
+	m_num_instances_addr = 0;
 }
 
 bool CommandProcessor::HasPendingInstances(const GpuOperation& operation) const {
@@ -3033,6 +3050,15 @@ uint32_t CommandProcessor::ResolveNumInstances(const GpuOperation& operation) {
 		return m_indirect_instances;
 	}
 	return operation.num_instances.value;
+}
+
+uint32_t CommandProcessor::NumInstances() {
+	if (m_num_instances_addr != 0) {
+		m_num_instances      = *reinterpret_cast<const uint32_t*>(m_num_instances_addr);
+		m_num_instances_addr = 0;
+	}
+	return m_num_instances;
+
 }
 
 void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,
@@ -3153,8 +3179,7 @@ void CommandProcessor::ExecuteDrawIndex(const GpuOperation& operation, DrawIndex
 	m_renderer.GetRenderExecutor().DrawIndex(operation.submit_id, CurrentBuffer(), args);
 }
 
-void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
-	++g_work_items;
+const void* CommandProcessor::IndexAddress(uint32_t first_index) const {
 	uint64_t index_size = 0;
 	switch (m_index_type_and_size) {
 		case 0: index_size = 2; break;
@@ -3162,11 +3187,11 @@ void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_cou
 		case 2: index_size = 1; break;
 		default: EXIT("unknown index_type_and_size: %u\n", m_index_type_and_size);
 	}
+	return reinterpret_cast<const void*>(m_index_base_addr + first_index * index_size);
+}
 
-	auto* index_addr = reinterpret_cast<const void*>(
-	    m_index_base_addr + static_cast<uint64_t>(index_offset) * index_size);
-
-	DrawIndex({.index_count = index_count, .index_addr = index_addr});
+void CommandProcessor::DrawIndexOffset(uint32_t index_offset, uint32_t index_count) {
+	DrawIndex({.index_count = index_count, .index_addr = IndexAddress(index_offset)});
 }
 
 // Writes indirect draw offsets to the live SH registers (KYTY_NATIVE_INDIRECT write-back).
@@ -3224,7 +3249,9 @@ void CommandProcessor::ResolveNativeShaderRegisters() {
 void CommandProcessor::DrawIndirect(uint32_t data_offset, IndirectDrawRegisters registers,
                                     uint32_t draw_initiator, bool indexed) {
 	++g_work_items;
-	const auto args_size = indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	const auto args_size =
+	    indexed ? sizeof(vk::DrawIndexedIndirectCommand) : sizeof(vk::DrawIndirectCommand);
+
 	DrawIndirectMulti(data_offset, 1, nullptr, args_size, registers, draw_initiator, indexed);
 }
 
@@ -3235,6 +3262,10 @@ void CommandProcessor::DrawIndirectMulti(uint32_t data_offset, uint32_t max_coun
 	++g_work_items;
 	EXIT_NOT_IMPLEMENTED((draw_initiator & ~0x20u) != (indexed ? 0u : 2u));
 	EXIT_NOT_IMPLEMENTED(m_draw_indirect_args_base_addr == 0);
+	// The guest records match Vulkan's indirect commands byte for byte.
+	EXIT_NOT_IMPLEMENTED((stride_in_bytes & 3u) != 0 ||
+	                     stride_in_bytes < (indexed ? sizeof(vk::DrawIndexedIndirectCommand)
+	                                                : sizeof(vk::DrawIndirectCommand)));
 
 	// Report packet shapes without reading GPU-written argument or count memory.
 	// These SH destinations determine which shader inputs must become GPU draw parameters.
@@ -3445,13 +3476,16 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 			draw_count = indirect.max_count;
 		}
 	}
+
 	if (draw_count == 0) {
 		return;
 	}
 	m_pending_instances.clear();
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::IndirectDraws, draw_count);
+
 
 	const auto args_size =
-	    indirect.indexed ? sizeof(DrawIndexedIndirectArgs) : sizeof(DrawIndirectArgs);
+	    indirect.indexed ? sizeof(GuestDrawIndexedIndirectArgs) : sizeof(GuestDrawIndirectArgs);
 	EXIT_NOT_IMPLEMENTED(indirect.multi && indirect.stride < args_size);
 
 	uint64_t index_size = 0;
@@ -3469,7 +3503,7 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 		    indirect.args_base + indirect.data_offset + static_cast<uint64_t>(i) * indirect.stride);
 
 		if (!indirect.indexed) {
-			DrawIndirectArgs args {};
+			GuestDrawIndirectArgs args {};
 			std::memcpy(&args, args_addr, sizeof(args));
 			m_indirect_instances          = args.instance_count;
 			m_indirect_instances_sequence = operation.num_instances.sequence;
@@ -3484,7 +3518,7 @@ void CommandProcessor::ExecuteDrawIndirect(const GpuOperation& operation) {
 			continue;
 		}
 
-		DrawIndexedIndirectArgs args {};
+		GuestDrawIndexedIndirectArgs args {};
 		std::memcpy(&args, args_addr, sizeof(args));
 		PatchIndirectDrawOffsets(operation, args.base_vertex_location,
 		                         args.start_instance_location, args.start_index_location);
@@ -3603,11 +3637,14 @@ void CommandProcessor::ExecuteDrawAuto(const GpuOperation& operation, DrawAutoAr
 }
 
 void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_buffer_index) {
-	EmitCallback([this, video_out_handle, display_buffer_index] {
-		GetScheduler().Flush();
-		m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
-		                                      static_cast<int>(display_buffer_index));
-	}, GpuCallbackTag::FlipWait);
+	// Stage-2 merge: upstream removed VideoOutDriver::WaitFlipDone; the stall below is its
+	// replacement (flip waiting now goes through IsSafeForRendering).
+	// Stall only this command processor, not the host command lane or other queues.
+	if (!m_renderer.GetVideoOut().IsSafeForRendering(static_cast<int>(video_out_handle),
+	                                                 static_cast<int>(display_buffer_index))) {
+		SuspendPm4();
+	}
+
 }
 
 template <typename T>
@@ -3966,6 +4003,7 @@ void CommandProcessor::ExecuteGlobalBarrier() {
 	CurrentBuffer().Handle().pipelineBarrier2(dependency);
 }
 
+
 void CommandProcessor::TriggerEopEventAtEndOfPipe(uint32_t interrupt_context_id) {
 	EmitCallback([this, interrupt_context_id] { DeferEopInterrupt(interrupt_context_id); },
 	             GpuCallbackTag::Eop);
@@ -4052,12 +4090,16 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 void CommandProcessor::ExecuteTriggerEvent(uint32_t event_type, uint32_t event_index,
                                            uint64_t event_address) {
 	const auto valid_cache_event_index = event_index == 0x00000000 || event_index == 0x00000007;
+	// Partial flushes and cache writebacks only order GPU work, which the renderer's resource
+	// barriers already order.
 	switch (event_type) {
 		// CsPartialFlush, GsPartialFlush, PsPartialFlush.
 		case 0x00000007:
 		case 0x0000000f:
 		case 0x00000010: ExecuteGlobalBarrier(); break;
-		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate.
+		// CbDbDataWritebackInvalidate, CbDataWritebackInvalidate, DbDataWritebackInvalidate,
+		// DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
+
 		case 0x00000016:
 		case 0x00000031:
 			if (!valid_cache_event_index) {
@@ -4067,6 +4109,7 @@ void CommandProcessor::ExecuteTriggerEvent(uint32_t event_type, uint32_t event_i
 			ExecuteGlobalBarrier();
 			break;
 		// DbDataWritebackInvalidate, DbMetadataWritebackInvalidate, CbMetadataWritebackInvalidate.
+
 		case 0x0000002a:
 		case 0x0000002c:
 		case 0x0000002e:
@@ -4075,6 +4118,7 @@ void CommandProcessor::ExecuteTriggerEvent(uint32_t event_type, uint32_t event_i
 				     event_index);
 			}
 			ExecuteGlobalBarrier();
+
 			break;
 		case 0x0000000d:
 		case 0x0000000e:

@@ -4,6 +4,7 @@
 #include "common/experiments.h"
 #include "graphics/host_gpu/renderer/nativeIndirect.h"
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -35,6 +36,7 @@
 #include <set>
 #include <span>
 #include <tuple>
+#include <utility>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Libs::Graphics {
@@ -42,6 +44,8 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
+// Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
+constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
@@ -54,7 +58,9 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 		// Register clears belong to the color buffer; the texture pipe cannot decode them.
 		return desc.type == TextureCache::BindingType::RenderTarget &&
 		       metadata.clear_register_valid &&
-		       DecodeRegisterColorClear(format, metadata.clear_word, metadata.clear_word1, clear);
+		       DecodeRegisterColorClear(format, static_cast<uint32_t>(metadata.clear_word),
+		                                static_cast<uint32_t>(metadata.clear_word >> 32u),
+		                                clear);
 	}
 	if (cmask) {
 		return false;
@@ -130,7 +136,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_blit_helper(graphics, scheduler),
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
-      m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
+      m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
+      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -274,6 +281,7 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 		RegisterImage(id);
 		BumpGeneration(info.data.address, info.data.address + info.data.size);
 	}
+
 	return id;
 }
 
@@ -315,6 +323,8 @@ void TextureCache::UnregisterImage(ImageId id) {
 	// It is also logged by range: removing a candidate can change which overlap candidate wins for another
 	// T# overlapping it (FindImage picks the last matching candidate / last ResolveOverlap result).
 	BumpGeneration(image.info.data.address, image.info.data.address + image.info.data.size);
+	image.HeapChanged();
+
 	UntrackImage(id);
 	ImagePageTable::PageRange pages {};
 	if (!ImagePageTable::TryGetPageRange(image.info.data.address, image.info.data.size, pages)) {
@@ -392,16 +402,11 @@ void TextureCache::DeleteImage(ImageId id) {
 	if (image == nullptr || !image->registered) {
 		return;
 	}
-	// Only depth images ever get stencil planes: the scan of every image for them was 1% of the
-	// execution thread in play (images are replaced all the time).
-	if (!image->depth_id && image->stencil_associated) {
-		std::vector<ImageId> associations;
-		m_slot_images.ForEach([&](ImageId candidate, const Image& associated) {
-			if (associated.depth_id == id) {
-				associations.push_back(candidate);
-			}
-		});
-		for (const auto association: associations) {
+	if (image->depth_id) {
+		std::erase(m_slot_images[image->depth_id].stencil_ids, id);
+	} else if (image->stencil_associated) {
+		// Detach first: deleting each association also unlinks it from its depth owner.
+		for (const auto association: std::exchange(image->stencil_ids, {})) {
 			FreeImage(association);
 		}
 	}
@@ -409,14 +414,8 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
-	if (image->info.HasMetadata()) {
-		const auto metadata = m_surface_metas.find(image->info.metadata.range.address);
-		if (metadata != m_surface_metas.end() &&
-		    image->info.metadata.kind == ImageMetadataKind::Htile &&
-		    metadata->second.type == MetaDataInfo::Type::HTile) {
-			// A later binding may have reused this address for another metadata type.
-			m_surface_metas.erase(metadata);
-		}
+	if (image->info.metadata.kind == ImageMetadataKind::Htile) {
+		m_surface_metas.erase(image->info.metadata.range.address);
 	}
 	UnregisterImage(id);
 	if (m_scheduler.Active()) {
@@ -544,9 +543,6 @@ void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 	// Registration/free changes still bump via Unregister/Delete/Free.
 	GenCount(FrameBreakdown::g_delta.gen_dirty_skipped);
 	image.MarkMaybeCpuDirty();
-	if (image.NeedsMaybeCpuHash()) {
-		image.SetMaybeCpuHash(image.HashGuestEdges());
-	}
 	UntrackImage(id);
 }
 
@@ -636,6 +632,7 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
 	const auto size    = address - begin;
 	image.track_addr   = address;
+	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
 	}
@@ -655,6 +652,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	const auto address   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
 	const auto size      = end - address;
 	image.track_addr_end = address;
+	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {
 		MarkAsMaybeDirty(id, image);
 	}
@@ -664,7 +662,14 @@ void TextureCache::UntrackImageTail(ImageId id) {
 }
 
 void TextureCache::TrackImageDownload(ImageId id, Image& image) {
-	if (m_readback_linear_images && !image.info.IsTiled() && !image.info.data.Empty()) {
+	// Small tiled targets are written back too: games read GPU results such as reductions and
+	// simulation state from them on the CPU (PPSA04263 keeps the origin of its ocean wave grid
+	// in a 1x1 R32G32 target, and its water physics read it to sample the wave heights).
+	const auto& info   = image.info;
+	const auto  texels = static_cast<uint64_t>(info.extent.width) * info.extent.height *
+	                     info.extent.depth * info.resources.layers;
+	if (info.IsTiled() ? m_readback_tiled_images && texels <= SmallTiledReadbackTexels
+	                   : m_readback_linear_images) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
@@ -730,6 +735,30 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 }
 
 void TextureCache::ValidateImageViewDesc(const ImageDesc& desc) const {
+	if (desc.view_info.format == vk::Format::eUndefined || desc.view_info.level_count == 0 ||
+	    desc.view_info.layer_count == 0 ||
+	    desc.view_info.base_level >= desc.info.resources.levels ||
+	    desc.view_info.level_count > desc.info.resources.levels - desc.view_info.base_level ||
+	    (!desc.info.IsVolume() &&
+	     (desc.view_info.base_layer >= desc.info.resources.layers ||
+	      desc.view_info.layer_count > desc.info.resources.layers - desc.view_info.base_layer))) {
+		EXIT("TextureCache: invalid image view description\n");
+	}
+	if (desc.type == BindingType::DepthTarget && !IsSupportedDepthTargetFormat(desc.info)) {
+		EXIT("TextureCache: unsupported depth image description\n");
+	}
+	if (desc.type == BindingType::VideoOut && !IsSupportedVideoOutFormat(desc.info)) {
+		EXIT("TextureCache: unsupported video-out image description\n");
+	}
+	if (desc.type == BindingType::VideoOut &&
+	    desc.info.metadata.compression == VideoOutCompression::Unsupported) {
+		EXIT("TextureCache: unsupported compressed video-out description\n");
+	}
+}
+
+void TextureCache::ValidateImageDesc(const ImageDesc& desc) const {
+	ImageOps::Validate(desc.info);
+
 	if (desc.view_info.format == vk::Format::eUndefined || desc.view_info.level_count == 0 ||
 	    desc.view_info.layer_count == 0 ||
 	    desc.view_info.base_level >= desc.info.resources.levels ||
@@ -1010,7 +1039,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.linear_slice_stride = cached.info.linear_slice_stride;
 		info.first_tail_level    = cached.info.first_tail_level;
 	}
-	info.htile_clear_mask     = 0;
+	info.htile_initial_clear  = false;
 	const auto replacement_id = InsertImage(info);
 	auto&      replacement    = m_slot_images[replacement_id];
 	replacement.usage         = cached.usage;
@@ -1149,7 +1178,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	auto&      cached       = *owner;
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
-	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval;
+	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
+	    cached.heap_refs.load(std::memory_order_relaxed) == 0u;
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -1337,6 +1367,7 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		const auto linear = m_tiler.Detile(source.Handle(), source_offset, info);
 		const auto copies = info.BufferCopies(linear.offset);
 		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 		return;
 	}
 
@@ -1382,13 +1413,11 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		copies[0].imageExtent       = info.extent;
 	}
 	destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
 }
 
 void TextureCache::InitializeImage(ImageId id) {
 	auto& image = m_slot_images[id];
-	if (image.info.data.Empty()) {
-		return;
-	}
 	TrackImage(id);
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (image.IsCpuDirty()) {
@@ -1461,6 +1490,29 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	                      m_buffer_cache.TryGetGpuFill(selected_address, selected_size, shadow_value);
 	if (shadowed) {
 		BufferCache::PerfCount(BufferCache::PerfEvent::ColorClearShadowHit);
+	}
+	// Experiment FillPatterns: the GPU filled every selected slice with a repeating element whose
+	// bytes differ, so no slice holds one repeated clear code: nothing to materialize, and no
+	// readback is needed to find that out.
+	if (!shadowed && selected_size != 0 && desc.type != BindingType::VideoOut &&
+	    Common::Experiments::EnvEnabled(Common::Experiments::EnvBit::FillPatterns) &&
+	    BufferCache::PerfNoSyncReadback() &&
+	    m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size) &&
+	    m_buffer_cache.GpuFillCoversNonUniform(selected_address, selected_size)) {
+		if (FrameBreakdown::Enabled()) {
+			static std::atomic<uint64_t> hits {0};
+			static std::atomic<int64_t>  last_print {0};
+			const auto n = hits.fetch_add(1, std::memory_order_relaxed) + 1;
+			const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+			                        std::chrono::steady_clock::now().time_since_epoch()).count();
+			int64_t last = last_print.load(std::memory_order_relaxed);
+			if (now - last >= 5000 && last_print.compare_exchange_strong(last, now)) {
+				std::printf("NHL27PATTERN: color-clear readbacks skipped=%llu\n",
+				            static_cast<unsigned long long>(n));
+				std::fflush(stdout);
+			}
+		}
+		return;
 	}
 	// Experiment GpuColorClear: the GPU wrote these metadata bytes. Check them on the GPU and clear
 	// through conditional rendering instead of reading them back, which waits for that GPU work.
@@ -1672,12 +1724,7 @@ void TextureCache::RefreshImage(ImageId id) {
 	}
 	TrackImage(id);
 	if (image.IsMaybeCpuDirty()) {
-		const auto hash = image.HashGuestEdges();
-		if (image.NeedsMaybeCpuHash()) {
-			image.SetMaybeCpuHash(hash);
-			return;
-		}
-		(void)image.ResolveMaybeCpuHash(hash);
+		(void)image.ResolveMaybeCpuHash(image.HashGuestEdges());
 	}
 	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
@@ -1732,6 +1779,12 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 		    plane.IsTiled() ? TileGetDepthPitch(plane.extent.width, 1, 0) : depth.info.pitch;
 		plane.bytes_per_block = 1;
 		plane.UpdateSize();
+		if (record.depth_id != depth_id) {
+			if (record.depth_id) {
+				std::erase(m_slot_images[record.depth_id].stencil_ids, association);
+			}
+			depth.stencil_ids.push_back(association);
+		}
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
@@ -1761,6 +1814,9 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 		std::scoped_lock lock {m_lock};
 		return GetNullImage(desc);
 	}
+	ValidateImageDesc(desc);
+	EXIT_IF(desc.info.data.Empty());
+
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
@@ -2151,7 +2207,6 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
-	image.usage.depth_target = true;
 	if (desc.info.HasStencil()) {
 		const auto layers = image.info.resources.layers;
 		EXIT_IF(layers == 0 || image.info.data.size % layers != 0 ||
@@ -2167,9 +2222,10 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 	image.info.stencil = desc.info.stencil;
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
-		m_surface_metas.emplace(desc.info.metadata.range.address,
-		                        MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                                      .clear_mask = image.info.htile_clear_mask});
+		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
+		if (inserted && image.info.htile_initial_clear) {
+			metadata->second.clear_mask.set();
+		}
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -2321,29 +2377,8 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	if (format != image.backing.format || (image.info.IsVolume() && !full_image)) {
 		EXIT_NOT_IMPLEMENTED(range.aspectMask != vk::ImageAspectFlagBits::eColor ||
 		                     range.levelCount != 1);
-		ImageViewInfo view {};
-		view.format = format;
-		view.type   = range.layerCount == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
-		view.base_level  = range.baseMipLevel;
-		view.base_layer  = range.baseArrayLayer;
-		view.layer_count = range.layerCount;
-		view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
-		image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
-		              vk::AccessFlagBits2::eColorAttachmentWrite, {}, command.Handle());
-		vk::RenderingAttachmentInfo attachment {};
-		attachment.imageView   = image.FindView(view);
-		attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
-		attachment.loadOp      = vk::AttachmentLoadOp::eClear;
-		attachment.storeOp     = vk::AttachmentStoreOp::eStore;
-		attachment.clearValue  = clear;
-		vk::RenderingInfo rendering {};
-		rendering.renderArea.extent = {
-		    std::max(image.info.extent.width >> range.baseMipLevel, 1u),
-		    std::max(image.info.extent.height >> range.baseMipLevel, 1u)};
-		rendering.layerCount           = range.layerCount;
-		rendering.colorAttachmentCount = 1;
-		rendering.pColorAttachments    = &attachment;
-		command.Handle().beginRendering(&rendering);
+		BeginColorRendering(image, format, range.baseMipLevel, range.baseArrayLayer,
+		                    range.layerCount, &clear, command.Handle());
 		command.Handle().endRendering();
 		CommitGpuWrite(image);
 		return;
@@ -2351,6 +2386,11 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
 	              command.Handle());
 	auto native_range = range;
+	// Guest levels past the host chain alias its last (1x1) level.
+	const auto host_levels    = image.backing.mip_levels;
+	native_range.baseMipLevel = std::min(native_range.baseMipLevel, host_levels - 1);
+	native_range.levelCount =
+	    std::min(native_range.levelCount, host_levels - native_range.baseMipLevel);
 	if (image.info.IsVolume()) {
 		native_range.baseArrayLayer = 0;
 		native_range.layerCount     = 1;
@@ -2364,6 +2404,40 @@ void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format for
 		                                        &clear.depthStencil, 1, &native_range);
 	}
 	CommitGpuWrite(image);
+}
+
+vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, uint32_t level,
+                                             uint32_t layer, uint32_t layers,
+                                             const vk::ClearValue* clear,
+                                             CommandRecorder       command) {
+	ImageViewInfo view {};
+	view.format      = format;
+	view.type        = layers == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	view.base_level  = level;
+	view.base_layer  = layer;
+	view.layer_count = layers;
+	view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+	image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+	              vk::AccessFlagBits2::eColorAttachmentRead |
+	                  vk::AccessFlagBits2::eColorAttachmentWrite,
+	              {}, command);
+	vk::RenderingAttachmentInfo attachment {};
+	attachment.imageView   = image.FindView(view);
+	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+	if (clear != nullptr) {
+		attachment.loadOp     = vk::AttachmentLoadOp::eClear;
+		attachment.clearValue = *clear;
+	}
+	vk::RenderingInfo rendering {};
+	rendering.renderArea.extent    = {std::max(image.info.extent.width >> level, 1u),
+	                                  std::max(image.info.extent.height >> level, 1u)};
+	rendering.layerCount           = layers;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &attachment;
+	command.beginRendering(&rendering);
+	return rendering.renderArea;
 }
 
 void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
@@ -2504,6 +2578,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	     copy_size != image.info.data.size)) {
 		return false;
 	}
+	ForgetColorMetadataChecks(image.info.data.address, copy_size);
 	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
 	return true;
 }
@@ -2530,6 +2605,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool tolerant_write) {
 	download.Flush(offset, range.size);
 
 	DownloadImage(image, download, offset, range.size, image.info.resources.levels);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
 	vk::BufferMemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
 	                        vk::AccessFlagBits::eShaderWrite;
@@ -2605,7 +2681,7 @@ void TextureCache::InvalidateCpuAliases(uint64_t address, uint64_t size) {
 			continue;
 		}
 		if (owner->Overlaps(address, size)) {
-			owner->InvalidateCpuWrite(address, size);
+			owner->MarkCpuDirty();
 			UntrackImage(id);
 			continue;
 		}
@@ -2630,10 +2706,10 @@ bool TextureCache::IsMeta(uint64_t address) {
 bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= 32) {
+	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
 		return false;
 	}
-	return (found->second.clear_mask & (1u << slice)) != 0;
+	return found->second.clear_mask.test(slice);
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -2642,21 +2718,17 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
+	found->second.clear_mask.set();
 	return true;
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
-	if (found == m_surface_metas.end() || slice >= 32) {
+	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
 		return false;
 	}
-	if (is_clear) {
-		found->second.clear_mask |= 1u << slice;
-	} else {
-		found->second.clear_mask &= ~(1u << slice);
-	}
+	found->second.clear_mask.set(slice, is_clear);
 	return true;
 }
 
@@ -2720,6 +2792,11 @@ void TextureCache::RunGarbageCollector() {
 			if (owner == nullptr || !owner->registered || owner->depth_id) {
 				continue;
 			}
+			if (owner->heap_refs.load(std::memory_order_relaxed) != 0u) {
+				// Resident heaps sample it without touching it.
+				TouchImage(*owner);
+				continue;
+			}
 			if (owner->IsGpuModified()) {
 				const bool safe = owner->SafeToDownload();
 				if (safe && owner->info.IsTiled()) {
@@ -2734,6 +2811,7 @@ void TextureCache::RunGarbageCollector() {
 			}
 			BufferCache::PerfCount(BufferCache::PerfEvent::ImageGcFree);
 			FreeImage(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
 				aggressive = false;
@@ -2751,7 +2829,7 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::ProcessDownloadImages() {
-	if (!m_readback_linear_images) {
+	if (!m_readback_linear_images && !m_readback_tiled_images) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};

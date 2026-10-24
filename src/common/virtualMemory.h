@@ -37,6 +37,10 @@ bool     Free(uint64_t address);
 bool     FreeRange(uint64_t address, uint64_t size);
 bool     Protect(uint64_t address, uint64_t size, Mode mode);
 bool     FlushInstructionCache(uint64_t address, uint64_t size);
+// Committed and readable without faulting (no guard or no-access pages) across the whole range.
+bool     IsReadable(uint64_t address, uint64_t size);
+// Committed and writable (read-write, execute-read-write or copy-on-write) across the whole range.
+bool     IsWritable(uint64_t address, uint64_t size);
 
 } // namespace VirtualMemory
 

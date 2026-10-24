@@ -265,7 +265,9 @@ class ResourceMemoEntry {
                left.samplers == right.samplers && left.flattened_srt == right.flattened_srt &&
                left.user_data == right.user_data &&
                SameReadCoverage(left.specialization_reads, right.specialization_reads) &&
-               left.uniform_fill == right.uniform_fill;
+               left.uniform_fill == right.uniform_fill &&
+               left.uniform_pattern == right.uniform_pattern &&
+               left.uniform_pattern_values == right.uniform_pattern_values;
     }
     // KYTY_DBG_MEMO_CHECK=1: every hit is materialized again with the live readers and compared
     // (NHL27MEMOCHECK; a mismatch is a hit that reused resources the inputs no longer give).

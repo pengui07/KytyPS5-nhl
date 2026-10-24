@@ -2,7 +2,9 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_FRAMEDUMP_H_
 
 // "Poor man's RenderDoc": KYTY_DBG_FRAME_DUMP=1 enables a frame dump that is triggered with F2 in the
-// game window. The next complete guest frame (flip to flip) is captured: every draw/dispatch is
+// game window. KYTY_DBG_FRAME_DUMP_CS_CONSTANTS=1 additionally surveys all compute bindings and
+// copies bound GPU buffers up to 4096 bytes, without reading protected guest backing.
+// The next complete guest frame (flip to flip) is captured: every draw/dispatch is
 // logged to <captures>/frame_<n>/frame.txt and every render pass's color/depth targets and every
 // dispatch's written storage images are read back and saved as PNG. Zero cost when the flag is off
 // (one relaxed atomic load per draw/dispatch/end-of-render-pass).

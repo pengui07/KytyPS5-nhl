@@ -18,6 +18,32 @@ using SrtMemoryReader = bool (*)(void* userdata, uint64_t address, std::span<uin
 using SrtUserDataObserver = void (*)(void* userdata, uint32_t index);
 
 // Optional per-evaluation diagnostics; no global atomics on the recording/replay path.
+// Image descriptors at base + first + k * step, k < count, within size bytes that a sampled
+// root selects by GPU-computed byte offset. The 1.5 passes never request a resident heap.
+struct ImageHeapRequest {
+	uint64_t             base  = 0;
+	uint64_t             size  = 0;
+	uint64_t             step  = 0;
+	uint64_t             first = 0;
+	uint64_t             count = 0;
+	const ImageResource* root  = nullptr;
+};
+
+struct ImageHeapView {
+	uint64_t                         slots      = 0; // Device address of one slot per heap dword.
+	uint32_t                         slot_count = 0; // Keys past it select a trailing null slot.
+	std::span<const DescriptorValue> kinds; // One representative descriptor per kind.
+};
+
+class ImageHeapSource {
+public:
+	// False when the host does not keep the table resident.
+	virtual bool Acquire(const ImageHeapRequest& request, ImageHeapView& view) = 0;
+
+protected:
+	~ImageHeapSource() = default;
+};
+
 struct SrtEvaluationCounts {
 	uint64_t recursive_ops = 0;
 	uint64_t tape_ops = 0;
@@ -59,6 +85,8 @@ struct SrtRuntime {
 	bool allow_compiled = true;
 	// Owned by the immutable shader-plan entry (KYTY_SRT_COMPILED): per-program previous outputs.
 	ResourceDelta* delta = nullptr;
+	uint64_t                  indirect_args_address = 0;
+	ImageHeapSource*          image_heap            = nullptr;
 };
 
 class SrtReadCapture {

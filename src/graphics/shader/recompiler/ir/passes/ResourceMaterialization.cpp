@@ -1,3 +1,4 @@
+#include "common/experiments.h"
 #include "common/runtimeFlags.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -23,6 +24,8 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <cstdlib>
+#include <mutex>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -1624,8 +1627,59 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 	const auto words = fill.fill.words;
 	std::array<uint32_t, 4> stored {};
 	bool uniform_fill = words != 0;
+	uint32_t fill_stop = 0;
+	bool     fill_eval_failed = false;
 	for (uint32_t i = 0; i < words && uniform_fill; ++i) {
-		uniform_fill = clean.Evaluate(fill.values[i], stored[i]) && stored[i] == stored[0];
+		fill_stop        = i;
+		fill_eval_failed = !clean.Evaluate(fill.values[i], stored[i]);
+		uniform_fill     = !fill_eval_failed && stored[i] == stored[0];
+	}
+	snapshot.uniform_pattern        = {};
+	snapshot.uniform_pattern_values = {};
+	// Computed when KYTY_FILL_PATTERNS=1 was set at startup, so cached snapshots already hold the
+	// pattern when an A/B switches experiment bit 9 on; the consumers check the bit.
+	static const bool compute_patterns = [] {
+		const char* value = std::getenv("KYTY_FILL_PATTERNS");
+		return value != nullptr && value[0] == '1';
+	}();
+	if (words > 1 && !uniform_fill && !fill_eval_failed && compute_patterns) {
+		// The words differ: evaluate the rest; a proven element pattern is still known memory.
+		bool pattern = true;
+		for (uint32_t i = fill_stop + 1; i < words && pattern; ++i) {
+			pattern = clean.Evaluate(fill.values[i], stored[i]);
+		}
+		if (pattern) {
+			snapshot.uniform_pattern        = fill.fill;
+			snapshot.uniform_pattern_values = stored;
+		}
+	}
+	if (words != 0 && !uniform_fill) {
+		// KYTY_DBG_FILL_DIAG=1: why a planned uniform fill was not taken (NHL27FILLVALUE, once per
+		// shader and outcome, at most 256 lines).
+		static const bool diag = [] {
+			const char* value = std::getenv("KYTY_DBG_FILL_DIAG");
+			return value != nullptr && value[0] == '1';
+		}();
+		if (diag) {
+			static std::mutex                   diag_mutex;
+			static std::unordered_set<uint64_t> seen;
+			const uint64_t key = program.shader_hash ^ (uint64_t {fill_stop} << 60u) ^
+			                     (fill_eval_failed ? (uint64_t {1} << 59u) : 0u) ^
+			                     (fill_eval_failed ? 0u : (uint64_t {stored[fill_stop]} << 20u));
+			bool first = false;
+			{
+				std::scoped_lock lock {diag_mutex};
+				first = seen.size() < 256 && seen.insert(key).second;
+			}
+			if (first) {
+				std::printf("NHL27FILLVALUE: shader=0x%016llx kind=%d words=%u stop_word=%u %s values=%08x %08x %08x %08x\n",
+				            static_cast<unsigned long long>(program.shader_hash),
+				            static_cast<int>(fill.fill.kind), words, fill_stop,
+				            fill_eval_failed ? "evaluate_failed" : "words_differ", stored[0], stored[1],
+				            stored[2], stored[3]);
+				std::fflush(stdout);
+			}
+		}
 	}
 	if (uniform_fill) {
 		snapshot.uniform_fill = fill.fill;
@@ -1661,7 +1715,7 @@ static bool MaterializeResourcesCore(const ResourcePlan& program, const SrtRunti
 					FrameBreakdown::Timer indirect_timer(FrameBreakdown::g_counters.mat_indirect_ns);
 					if (!MaterializeIndirectDescriptor(
 					        program, *source->indirect_descriptor, i, 4u, observed, clean, snapshot,
-					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBuffers,
+					        snapshot.buffers, specialization.buffers, ShaderInfo::MaxBufferRoots,
 					        NormalizeIndirectStoreBuffer))
 						return false;
 				}
@@ -2223,6 +2277,43 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 	}
 	image_remap.Apply(images);
+}
+
+uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
+	// Mirrors BuildResourceSpecialization for sampled roots: entries it would reject, and
+	// entries that need shader-side conversion, read as null instead of failing the draw.
+	const auto format = static_cast<Prospero::BufferFormat>((value.dwords[1] >> 20u) & 0x1ffu);
+	const auto tile = static_cast<Prospero::TileMode>((value.dwords[3] >> 20u) & 0x1fu);
+	const auto numeric_class =
+	    Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format));
+	if (NullImageDescriptor(value) || !ValidImageDescriptor(value, root.r128) ||
+	    DescriptorDimension(value, root.dimension) != root.dimension ||
+	    Prospero::IsFmaskTextureFormat(format) || format == Prospero::BufferFormat::k11_11_10UNorm ||
+	    ImageConversionFormat(format) != Prospero::BufferFormat::kInvalid ||
+	    (root.unfiltered_access_only && format == Prospero::BufferFormat::k16UInt &&
+	     tile == Prospero::TileMode::kDepth) ||
+	    numeric_class == Prospero::TextureNumericClass::Unsupported ||
+	    (root.depth_compare && numeric_class != Prospero::TextureNumericClass::Float)) {
+		value.dwords.fill(0u);
+		return 0u;
+	}
+	return 1u + static_cast<uint32_t>(numeric_class) * 2u + (DescriptorIsCube(value) ? 1u : 0u);
+}
+
+ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind) {
+	ImageResource resource;
+	resource.resource_class         = ImageResourceClass::Sampled;
+	resource.read                   = true;
+	resource.heap                   = true;
+	resource.dimension              = root.dimension;
+	resource.unfiltered_access_only = root.unfiltered_access_only;
+	resource.depth_compare          = root.depth_compare;
+	resource.r128                   = root.r128;
+	if (kind != 0u) {
+		resource.numeric_class = static_cast<Prospero::TextureNumericClass>((kind - 1u) / 2u);
+		resource.cube          = ((kind - 1u) & 1u) != 0u;
+	}
+	return resource;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

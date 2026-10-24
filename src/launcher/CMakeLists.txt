@@ -1,82 +1,135 @@
+# Slint launcher (replaces the former Qt launcher in this directory).
+# Slint is fetched and built from source (needs Rust >= 1.92); everything here stays local to
+# this directory so the emulator targets are not affected.
 
-find_package(Qt6 COMPONENTS Concurrent Network Widgets REQUIRED)
+include(FetchContent)
+
+# On Windows the launcher is one exe with no dependency on the VC++ Redistributable: both the
+# C++ code (/MT, set on the target below) and the Rust runtime (crt-static, set after Slint is
+# fetched) use the static CRT. Turn KYTY_SLINT_STATIC_CRT off to link the dynamic CRT instead.
+if(WIN32)
+	set(_kyty_static_crt_default ON)
+else()
+	set(_kyty_static_crt_default OFF)
+endif()
+option(KYTY_SLINT_STATIC_CRT "Link the Slint launcher with the static VC++ runtime" ${_kyty_static_crt_default})
+if((KYTY_CLANG_CL OR MSVC) AND NOT KYTY_SLINT_STATIC_CRT)
+	foreach(flag_var CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE CMAKE_C_FLAGS CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE)
+		string(REGEX REPLACE "/MT" "/MD" ${flag_var} "${${flag_var}}")
+	endforeach()
+endif()
+
+# One exe, no slint_cpp.dll; the smallest feature set a desktop window needs.
+set(BUILD_SHARED_LIBS OFF)
+set(SLINT_FEATURE_INTERPRETER OFF CACHE BOOL "" FORCE)
+set(SLINT_FEATURE_TESTING OFF CACHE BOOL "" FORCE)
+set(SLINT_FEATURE_SYSTEM_TRAY OFF CACHE BOOL "" FORCE)
+set(SLINT_FEATURE_ACCESSIBILITY OFF CACHE BOOL "" FORCE)
+set(SLINT_FEATURE_BACKEND_QT OFF CACHE BOOL "" FORCE)
+set(SLINT_FEATURE_RENDERER_SKIA OFF CACHE BOOL "" FORCE)
+set(SLINT_FEATURE_RENDERER_FEMTOVG OFF CACHE BOOL "" FORCE)
+set(SLINT_FEATURE_RENDERER_SOFTWARE ON CACHE BOOL "" FORCE)
+set(SLINT_STYLE "fluent-dark" CACHE STRING "" FORCE)
+
+FetchContent_Declare(
+	Slint
+	GIT_REPOSITORY https://github.com/slint-ui/slint.git
+	GIT_TAG v1.18.1
+	GIT_SHALLOW TRUE
+	# Slint has no submodules; an explicit empty list skips the submodule
+	# update step entirely (CMP0097 NEW in the FetchContent subbuild).
+	GIT_SUBMODULES ""
+	SOURCE_SUBDIR api/cpp
+)
+FetchContent_MakeAvailable(Slint)
+# Popup menus shaped like the shadPS4 launcher's. Slint has no per-app menu styling, so the fluent
+# style's menu file is replaced in the fetched source; slint-compiler embeds the styles and
+# rebuilds when it changes. Copied only when it differs.
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/slint-style/fluent-menu.slint"
+	"${slint_SOURCE_DIR}/internal/compiler/widgets/fluent/menu.slint" COPYONLY)
+if(WIN32 AND KYTY_SLINT_STATIC_CRT)
+	# Rust side of the static CRT (the C++ side is the target property further down).
+	corrosion_add_target_rustflags(slint_cpp "-Ctarget-feature=+crt-static")
+endif()
+
+# The updater is kept free of Qt and launcher DLL dependencies so it can replace
+# those files on Windows; CI packages it next to the launcher.
 add_subdirectory("${KYTY_SOURCE_DIR}/updater" "${CMAKE_CURRENT_BINARY_DIR}/updater")
 
-set(CMAKE_AUTOUIC_SEARCH_PATHS forms)
-set(CMAKE_INCLUDE_CURRENT_DIR ON)
-
-file(GLOB launcher_src
-	"include/*.h"
-	"src/*.cpp"
-)
-
-file(GLOB launcher_forms
-	"forms/*.ui"
-)
-
+if(WIN32)
+	# The exe's own icon (Explorer, taskbar pin); the windows get theirs from the .slint files.
+	enable_language(RC)
+endif()
 add_executable(launcher WIN32
-	${launcher_src}
-	${launcher_forms}
-	resources.qrc
+	src/main.cpp
+	src/settings.cpp
+	src/settings.h
+	src/paths.cpp
+	src/paths.h
+	src/launch.cpp
+	src/net.cpp
+	src/net.h
+	src/platform.cpp
+	src/platform.h
+	src/launch.h
+	src/library.cpp
+	src/library.h
+	# STEP6:6f: the Controls page (bindings, capture, host_input_mapping)
+	src/input_mapping.cpp
+	src/input_mapping.h
+	src/versions.cpp
+	src/versions.h
+	src/version_manager.cpp
+	src/trophies.cpp
+	src/trophies.h
+	src/secret_store.cpp
+	src/secret_store.h
+	src/qt_ini.cpp
+	src/qt_ini.h
+	src/qt_import.cpp
+	src/qt_import.h
+	src/version_manager.h
+	$<$<BOOL:${WIN32}>:src/app.rc>
 )
-
-
-target_link_libraries(launcher Qt6::Concurrent Qt6::Network Qt6::Widgets Vulkan::Headers SDL3::SDL3-static kyty_git_version common)
-if(LINUX)
-	find_package(Qt6 COMPONENTS DBus REQUIRED)
-	target_link_libraries(launcher Qt6::DBus)
+slint_target_sources(launcher ui/app.slint)
+target_link_libraries(launcher PRIVATE Slint::Slint)
+target_include_directories(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+if(NOT WIN32)
+	# Downloads go through libcurl here (WinHTTP on Windows); stb_image decodes the game art.
+	find_package(CURL REQUIRED)
+	target_link_libraries(launcher PRIVATE CURL::libcurl ${CMAKE_DL_LIBS})
+	target_include_directories(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../3rdparty/stb")
+endif()
+if(APPLE)
+	# The monitor size (platform.cpp).
+	target_link_libraries(launcher PRIVATE "-framework CoreGraphics")
+endif()
+if(UNIX AND NOT APPLE)
+	# The static Slint runtime finds system fonts through fontconfig (libfontconfig1-dev).
+	# Added to the Slint target itself so it is linked after libslint_cpp.a (static libraries are
+	# resolved in order).
+	find_library(KYTY_FONTCONFIG_LIB fontconfig REQUIRED)
+	cmake_policy(SET CMP0079 NEW)
+	target_link_libraries(Slint INTERFACE ${KYTY_FONTCONFIG_LIB})
 endif()
 if(WIN32)
-target_link_libraries(launcher setupapi)
-endif()
-if (CLANG AND NOT KYTY_CLANG_CL)
-target_compile_options(launcher PRIVATE -frtti)
-target_link_libraries(launcher pthread)
-endif()
-target_include_directories(launcher PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include" "${CMAKE_CURRENT_SOURCE_DIR}/src")
-set_target_properties(launcher PROPERTIES AUTOUIC ON AUTOMOC ON AUTORCC ON)
-
-if(WIN32 AND NOT KYTY_CLANG_CL)
-	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
-elseif(LINUX)
-	# Use the same linker as kyty_emulator.
-	set_target_properties(launcher PROPERTIES LINK_FLAGS "${KYTY_LD_OPTIONS}")
+	if(KYTY_SLINT_STATIC_CRT)
+		# clang-cl defaults to the dynamic runtime (-MD); ask for the static one (-MT).
+		set_property(TARGET launcher PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded")
+	endif()
+	target_compile_definitions(launcher PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
+	# imm32 and uxtheme are needed by winit when slint_cpp is static.
+	target_link_libraries(launcher PRIVATE user32 shell32 ole32 imm32 uxtheme winhttp windowscodecs uuid advapi32)
+	if(KYTY_CLANG_CL OR MSVC)
+		# WIN32 subsystem but a normal main().
+		target_link_options(launcher PRIVATE /ENTRY:mainCRTStartup /OPT:NOREF)
+	endif()
 endif()
 
-add_custom_target(stage_updater
-	COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:launcher>
-	COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:kyty_updater>
-		$<TARGET_FILE_DIR:launcher>/$<TARGET_FILE_NAME:kyty_updater>
-	DEPENDS kyty_updater
-	VERBATIM)
-add_dependencies(launcher kyty_emulator stage_updater)
+# Next to kyty_emulator.exe in the build dir.
+set_target_properties(launcher PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
-if(KYTY_CLANG_CL)
-	add_custom_command(TARGET launcher POST_BUILD
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_PDB_FILE:kyty_emulator> $<TARGET_FILE_DIR:launcher>/$<TARGET_PDB_FILE_NAME:kyty_emulator>
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE_DIR:kyty_emulator>/${KYTY_EMULATOR_MAP_NAME} $<TARGET_FILE_DIR:launcher>/${KYTY_EMULATOR_MAP_NAME}
-		COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" $<TARGET_FILE_DIR:launcher>/libwinpthread-1.dll
-	)
-endif()
-
-if(WIN32)
-    find_program(QT_WINDEPLOYQT NAMES windeployqt PATHS "${Qt6_DIR}/../../../bin")
-    if(NOT QT_WINDEPLOYQT)
-    	message(FATAL_ERROR "Could not find windeployqt")
-    endif()
-	add_custom_command(TARGET launcher POST_BUILD
-		COMMAND ${QT_WINDEPLOYQT} $<TARGET_FILE:launcher>
-			--no-compiler-runtime
-			--no-system-d3d-compiler
-			--no-system-dxc-compiler
-			--no-opengl-sw
-			--no-translations
-		COMMENT "Deploying Qt runtime and TLS plugins"
-		VERBATIM
-	)
-endif()
-
-set(launcher_name "launcher")
+set(launcher_name "kyty_launcher")
 if(APPLE)
 	set(launcher_name "KytyPS5")
 endif()
@@ -84,11 +137,9 @@ endif()
 set_target_properties(launcher PROPERTIES OUTPUT_NAME ${launcher_name})
 
 if(APPLE)
-	# macOS bundle: KytyPS5.app with launcher as main executable and
-	# kyty_emulator as helper inside Contents/MacOS. MoltenVK is found
-	# next to a flat executable or in the bundle's Contents/Frameworks;
-	# no rpath fixup is needed because SDL loads it by absolute path.
-	# Qt deployment (Frameworks + plugins) is handled by macdeployqt.
+	# macOS bundle: KytyPS5.app with the launcher as the main executable and
+	# kyty_emulator as a helper inside Contents/MacOS. (No Qt deployment:
+	# the Slint runtime is linked statically.)
 	set_target_properties(launcher PROPERTIES
 		MACOSX_BUNDLE TRUE
 		MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in"
@@ -101,116 +152,22 @@ install(TARGETS launcher
 	BUNDLE DESTINATION .
 	RUNTIME DESTINATION .)
 
+if(NOT APPLE)
+	# Older releases require the previous executable name when validating updates.
+	install(CODE "
+		file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}\"
+			TYPE PROGRAM RENAME \"launcher${CMAKE_EXECUTABLE_SUFFIX}\"
+			FILES \"\${CMAKE_INSTALL_PREFIX}/${launcher_name}${CMAKE_EXECUTABLE_SUFFIX}\")
+	")
+endif()
+
 if(APPLE)
 	install(TARGETS kyty_emulator DESTINATION "KytyPS5.app/Contents/MacOS")
 	install(TARGETS kyty_updater DESTINATION "KytyPS5.app/Contents/MacOS")
 	install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION "KytyPS5.app/Contents/Resources/assets/sounds")
-	# Deploy and ad-hoc sign the Qt frameworks and plugins in the bundle.
-	find_program(KYTY_MACDEPLOYQT NAMES macdeployqt PATHS "${Qt6_DIR}/../../../bin" NO_DEFAULT_PATH)
-	if(NOT KYTY_MACDEPLOYQT)
-		message(FATAL_ERROR "Could not find macdeployqt")
-	endif()
-	install(CODE "
-		execute_process(COMMAND \"${KYTY_MACDEPLOYQT}\" \"\${CMAKE_INSTALL_PREFIX}/KytyPS5.app\"
-			-codesign=-
-			RESULT_VARIABLE _kyty_deploy_result)
-		if(NOT _kyty_deploy_result EQUAL 0)
-			message(FATAL_ERROR \"macdeployqt failed with \${_kyty_deploy_result}\")
-		endif()
-	")
+	install(DIRECTORY "${CMAKE_SOURCE_DIR}/assets/cursors" DESTINATION "KytyPS5.app/Contents/Resources/assets")
 endif()
 
 if(NOT APPLE)
 	install(TARGETS kyty_updater RUNTIME DESTINATION .)
 endif()
-
-if(WIN32)
-    install(CODE "
-    		execute_process(
-    			COMMAND ${QT_WINDEPLOYQT} \"\${CMAKE_INSTALL_PREFIX}/${launcher_name}.exe\"
-				--no-compiler-runtime
-				--no-system-d3d-compiler
-				--no-system-dxc-compiler
-				--no-opengl-sw
-				--no-translations
-    		)
-    ")
-elseif(LINUX)
-	# Bundle the Qt runtime and plugins.
-	set_target_properties(launcher PROPERTIES
-		INSTALL_RPATH "$ORIGIN/lib"
-		BUILD_WITH_INSTALL_RPATH FALSE
-		LINK_FLAGS "${KYTY_LD_OPTIONS} -Wl,--disable-new-dtags")
-
-	# Support distribution and official Qt layouts.
-	get_target_property(kyty_qt_core_lib Qt6::Core IMPORTED_LOCATION_RELEASE)
-	if(NOT kyty_qt_core_lib)
-		get_target_property(kyty_qt_core_lib Qt6::Core IMPORTED_LOCATION)
-	endif()
-	get_filename_component(kyty_qt_libdir "${kyty_qt_core_lib}" DIRECTORY)
-
-	set(kyty_qt_plugins_dir "")
-	foreach(kyty_candidate
-			"${kyty_qt_libdir}/qt6/plugins"
-			"${kyty_qt_libdir}/../plugins"
-			"${Qt6_DIR}/../../../plugins")
-		if(IS_DIRECTORY "${kyty_candidate}/platforms")
-			get_filename_component(kyty_qt_plugins_dir "${kyty_candidate}" ABSOLUTE)
-			break()
-		endif()
-	endforeach()
-
-	if(kyty_qt_plugins_dir)
-		message(STATUS "Qt plugins for launcher deployment: ${kyty_qt_plugins_dir}")
-		set(kyty_qt_plugin_files "")
-		foreach(kyty_qt_plugin platforms tls imageformats xcbglintegrations wayland-shell-integration)
-			if(IS_DIRECTORY "${kyty_qt_plugins_dir}/${kyty_qt_plugin}")
-				file(GLOB kyty_qt_plugin_group
-					"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/*.so"
-					"${kyty_qt_plugins_dir}/${kyty_qt_plugin}/*.so.*")
-				list(APPEND kyty_qt_plugin_files ${kyty_qt_plugin_group})
-				install(DIRECTORY "${kyty_qt_plugins_dir}/${kyty_qt_plugin}" DESTINATION "plugins")
-			endif()
-		endforeach()
-		install(CODE "
-			set(kyty_plugin_files \"${kyty_qt_plugin_files}\")
-			file(GET_RUNTIME_DEPENDENCIES
-				EXECUTABLES \"${CMAKE_CURRENT_BINARY_DIR}/${launcher_name}\"
-				LIBRARIES \${kyty_plugin_files}
-				RESOLVED_DEPENDENCIES_VAR kyty_resolved
-				POST_INCLUDE_REGEXES \"libQt6\" \"libicu\"
-				POST_EXCLUDE_REGEXES \".*\")
-			foreach(kyty_dep \${kyty_resolved})
-				file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/lib\"
-					TYPE SHARED_LIBRARY FOLLOW_SYMLINK_CHAIN FILES \"\${kyty_dep}\")
-			endforeach()
-		")
-		install(CODE "
-			file(WRITE \"\${CMAKE_INSTALL_PREFIX}/qt.conf\" \"[Paths]\\nPlugins = plugins\\n\")
-		")
-	else()
-		message(WARNING "Qt plugin directory not found; the installed launcher will need a system Qt")
-	endif()
-endif()
-
-
-set(tidy_dirs "${CMAKE_CURRENT_SOURCE_DIR}/include")
-set(iwyu_maps "${CMAKE_CURRENT_SOURCE_DIR}/utils/qt6_16.imp")
-
-get_property(inc_headers TARGET launcher PROPERTY INCLUDE_DIRECTORIES)
-
-list(APPEND inc_headers
-	${CMAKE_CURRENT_SOURCE_DIR}
-	${CMAKE_CURRENT_BINARY_DIR}/launcher_autogen/include
-	${Qt6Widgets_INCLUDE_DIRS}
-	${Qt6Core_INCLUDE_DIRS}
-	${Qt6Gui_INCLUDE_DIRS}
-	#${Qt6_DIR}/../../../include
-	#${Qt6_DIR}/../../../include/QtWidgets
-	#${Qt6_DIR}/../../../include/QtCore
-	#${Qt6_DIR}/../../../include/QtGui
-)
-
-include_what_you_use_with_mappings(launcher "${inc_headers}" "${iwyu_maps}")
-
-clang_tidy_check(launcher "" "${tidy_dirs}" "${inc_headers}")

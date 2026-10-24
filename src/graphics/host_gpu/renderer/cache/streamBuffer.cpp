@@ -82,9 +82,19 @@ Buffer::Buffer(GraphicContext& graphics, CommandScheduler& scheduler, MemoryUsag
 	                    Common::Experiments::Enabled(Common::Experiments::PooledBdaBuffers);
 	const VmaAllocationCreateFlags bda_flag =
 	    with_bda && !pooled ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
+
 	VmaAllocationCreateInfo allocation_info {};
+	// Experiment DirectGpuReads: game buffers go to CPU-visible video memory when the driver offers
+	// it (Resizable BAR), so finished GPU results can be read without a GPU copy. Otherwise VMA
+	// keeps them in ordinary video memory and they stay unmapped.
+	const VmaAllocationCreateFlags host_flags =
+	    usage == MemoryUsage::DeviceLocal && with_bda && Common::Experiments::DirectGpuReadsMemory()
+	        ? VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+	              VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT
+	        : 0;
 	allocation_info.flags =
-	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage);
+	    VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | AllocationFlags(usage) | host_flags;
+
 	allocation_info.usage = AllocationUsage(usage);
 	allocation_info.preferredFlags = usage == MemoryUsage::DeviceLocal
 	                                     ? VkMemoryPropertyFlags {}
@@ -142,7 +152,8 @@ void Buffer::Flush(uint64_t offset, uint64_t size) {
 }
 
 void Buffer::Invalidate(uint64_t offset, uint64_t size) {
-	EXIT_IF(m_usage != MemoryUsage::Download || offset > Size() || size > Size() - offset);
+	EXIT_IF((m_usage != MemoryUsage::Download && m_mapped.empty()) || offset > Size() ||
+	        size > Size() - offset);
 	if (!IsCoherent() && size != 0) {
 		const auto result =
 		    vmaInvalidateAllocation(m_graphics->allocator, m_allocation, offset, size);
