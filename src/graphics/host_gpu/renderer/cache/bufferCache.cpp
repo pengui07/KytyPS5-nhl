@@ -1089,14 +1089,31 @@ bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size,
 		const char* value = std::getenv("KYTY_LABEL_UNCACHED_DIRECT");
 		return value != nullptr && value[0] == '1';
 	}();
+	// The copy thread writes the bytes into guest memory (TryWriteLabel with a queue).
+	const auto queue_backing = [&] {
+		// A slot is reused once the copy thread wrote it (the queue holds fewer labels than slots
+		// before every submission drains it).
+		if (m_deferred_labels_queued - g_deferred_labels_written.load(std::memory_order_acquire) >=
+		    DeferredLabelSlots) {
+			deferred->Drain();
+		}
+		auto& label = m_deferred_labels[m_deferred_labels_queued++ % DeferredLabelSlots];
+		label.vaddr = vaddr;
+		label.size  = size;
+		std::memcpy(label.bytes.data(), data, size);
+		deferred->Call(&WriteDeferredLabel, &label);
+		(void)deferred->Flush();
+	};
+	// A deferred label needs no GPU copy either: the copy thread writes the backing (most of NHL 27's
+	// end-of-pipe labels; the old path drained the copy queue and prepared the page first).
 	const auto write_uncached = [&] {
-		if (!uncached_direct || HasGpuDirtyBytes(vaddr, size) || m_texture_cache.HasImagesInRegion(vaddr, size)) {
+		if ((!uncached_direct && deferred == nullptr) || HasGpuDirtyBytes(vaddr, size) ||
+		    m_texture_cache.HasImagesInRegion(vaddr, size)) {
 			return false;
 		}
 		if (deferred != nullptr) {
-			deferred->Drain();
-		}
-		if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+			queue_backing();
+		} else if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 			return false;
 		}
 		DropGpuFills(vaddr, size);
@@ -1123,18 +1140,7 @@ bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size,
 		return written;
 	}
 	if (deferred != nullptr) {
-		// A slot is reused once the copy thread wrote it (the queue holds fewer labels than slots
-		// before every submission drains it).
-		if (m_deferred_labels_queued - g_deferred_labels_written.load(std::memory_order_acquire) >=
-		    DeferredLabelSlots) {
-			deferred->Drain();
-		}
-		auto& label = m_deferred_labels[m_deferred_labels_queued++ % DeferredLabelSlots];
-		label.vaddr = vaddr;
-		label.size  = size;
-		std::memcpy(label.bytes.data(), data, size);
-		deferred->Call(&WriteDeferredLabel, &label);
-		(void)deferred->Flush();
+		queue_backing();
 	} else if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 		NoteLabel(LabelBacking, vaddr);
 		return false;
