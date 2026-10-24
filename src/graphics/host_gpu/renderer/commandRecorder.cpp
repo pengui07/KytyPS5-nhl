@@ -5,6 +5,19 @@
 
 namespace Libs::Graphics {
 
+namespace {
+// KYTY_IDLE_TRACE timestamps around one of the emulator's own commands.
+struct HostTraceScope {
+	HostTraceScope(const CommandRecorder& cmd, const char* kind, uint64_t code)
+	    : cmd(cmd), slot(HostTraceBegin(cmd, kind, 0x4057000000000000ull | code)) {}
+	~HostTraceScope() { HostTraceEnd(cmd, slot); }
+	HostTraceScope(const HostTraceScope&)            = delete;
+	HostTraceScope& operator=(const HostTraceScope&) = delete;
+	const CommandRecorder& cmd;
+	uint32_t               slot;
+};
+} // namespace
+
 CommandStream::Chunk::Chunk(size_t capacity): capacity(capacity), arrays(capacity) {
 	data = static_cast<std::byte*>(::operator new(capacity, std::align_val_t {Alignment}));
 }
@@ -75,6 +88,7 @@ void CommandRecorder::pipelineBarrier(vk::PipelineStageFlags src_stages,
                                       const vk::MemoryBarrier* memory, uint32_t buffer_count,
                                       const vk::BufferMemoryBarrier* buffers,
                                       uint32_t image_count, const vk::ImageMemoryBarrier* images) const {
+	const HostTraceScope trace(*this, "host-barrier", 1);
 	if (m_stream == nullptr) {
 		m_direct.pipelineBarrier(src_stages, dst_stages, dependency, memory_count, memory,
 		                         buffer_count, buffers, image_count, images);
@@ -96,6 +110,7 @@ void CommandRecorder::pipelineBarrier(vk::PipelineStageFlags src_stages,
 }
 
 void CommandRecorder::pipelineBarrier2(const vk::DependencyInfo& dependency) const {
+	const HostTraceScope trace(*this, "host-barrier2", 2);
 	if (m_stream == nullptr) {
 		m_direct.pipelineBarrier2(dependency);
 		return;
@@ -201,6 +216,7 @@ void CommandRecorder::updateDescriptorSets(vk::Device device, uint32_t write_cou
 
 void CommandRecorder::updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
                                    const void* data) const {
+	const HostTraceScope trace(*this, "host-update", 3);
 	if (m_stream == nullptr) {
 		m_direct.updateBuffer(buffer, offset, size, data);
 		return;
@@ -264,6 +280,7 @@ void CommandRecorder::bindVertexBuffers2(uint32_t first, uint32_t count,
 
 void CommandRecorder::copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
                                  const vk::BufferCopy* regions) const {
+	const HostTraceScope trace(*this, "host-copy-buffer", 4);
 	if (m_stream == nullptr) {
 		m_direct.copyBuffer(source, destination, count, regions);
 		return;
@@ -277,6 +294,7 @@ void CommandRecorder::copyBuffer(vk::Buffer source, vk::Buffer destination, uint
 void CommandRecorder::copyImage(vk::Image source, vk::ImageLayout source_layout,
                                 vk::Image destination, vk::ImageLayout destination_layout,
                                 uint32_t count, const vk::ImageCopy* regions) const {
+	const HostTraceScope trace(*this, "host-copy-image", 5);
 	if (m_stream == nullptr) {
 		m_direct.copyImage(source, source_layout, destination, destination_layout, count,
 		                   regions);
@@ -292,6 +310,7 @@ void CommandRecorder::copyImage(vk::Image source, vk::ImageLayout source_layout,
 void CommandRecorder::resolveImage(vk::Image source, vk::ImageLayout source_layout,
                                    vk::Image destination, vk::ImageLayout destination_layout,
                                    uint32_t count, const vk::ImageResolve* regions) const {
+	const HostTraceScope trace(*this, "host-resolve", 6);
 	if (m_stream == nullptr) {
 		m_direct.resolveImage(source, source_layout, destination, destination_layout, count,
 		                      regions);
@@ -308,6 +327,7 @@ void CommandRecorder::blitImage(vk::Image source, vk::ImageLayout source_layout,
                                 vk::Image destination, vk::ImageLayout destination_layout,
                                 uint32_t count, const vk::ImageBlit* regions,
                                 vk::Filter filter) const {
+	const HostTraceScope trace(*this, "host-blit", 7);
 	if (m_stream == nullptr) {
 		m_direct.blitImage(source, source_layout, destination, destination_layout, count, regions,
 		                   filter);
@@ -323,6 +343,7 @@ void CommandRecorder::blitImage(vk::Image source, vk::ImageLayout source_layout,
 void CommandRecorder::copyImageToBuffer(vk::Image source, vk::ImageLayout source_layout,
                                         vk::Buffer destination, uint32_t count,
                                         const vk::BufferImageCopy* regions) const {
+	const HostTraceScope trace(*this, "host-image-to-buffer", 8);
 	if (m_stream == nullptr) {
 		m_direct.copyImageToBuffer(source, source_layout, destination, count, regions);
 		return;
@@ -337,6 +358,7 @@ void CommandRecorder::copyImageToBuffer(vk::Image source, vk::ImageLayout source
 void CommandRecorder::copyBufferToImage(vk::Buffer source, vk::Image destination,
                                         vk::ImageLayout destination_layout, uint32_t count,
                                         const vk::BufferImageCopy* regions) const {
+	const HostTraceScope trace(*this, "host-buffer-to-image", 9);
 	if (m_stream == nullptr) {
 		m_direct.copyBufferToImage(source, destination, destination_layout, count, regions);
 		return;
@@ -351,6 +373,7 @@ void CommandRecorder::copyBufferToImage(vk::Buffer source, vk::Image destination
 void CommandRecorder::clearColorImage(vk::Image image, vk::ImageLayout layout,
                                       const vk::ClearColorValue* color, uint32_t range_count,
                                       const vk::ImageSubresourceRange* ranges) const {
+	const HostTraceScope trace(*this, "host-clear-color", 10);
 	if (m_stream == nullptr) {
 		m_direct.clearColorImage(image, layout, color, range_count, ranges);
 		return;
@@ -367,6 +390,7 @@ void CommandRecorder::clearColorImage(vk::Image image, vk::ImageLayout layout,
 void CommandRecorder::clearAttachments(uint32_t attachment_count,
                                        const vk::ClearAttachment* attachments,
                                        uint32_t rect_count, const vk::ClearRect* rects) const {
+	const HostTraceScope trace(*this, "host-clear-attachments", 11);
 	if (m_stream == nullptr) {
 		m_direct.clearAttachments(attachment_count, attachments, rect_count, rects);
 		return;
@@ -384,6 +408,7 @@ void CommandRecorder::clearDepthStencilImage(vk::Image image, vk::ImageLayout la
                                              const vk::ClearDepthStencilValue* value,
                                              uint32_t                          range_count,
                                              const vk::ImageSubresourceRange*  ranges) const {
+	const HostTraceScope trace(*this, "host-clear-depth", 12);
 	if (m_stream == nullptr) {
 		m_direct.clearDepthStencilImage(image, layout, value, range_count, ranges);
 		return;

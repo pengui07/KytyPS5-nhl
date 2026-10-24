@@ -1263,6 +1263,19 @@ Toward 120 fps (2026-10-23):
   shaders stay bit-identical. Compute `c556aaf3` has 379 of them (each was a multiply and an add, 2980
   host instructions). Paused GPU A/Bs (gpu-abn): -1.3% (all stages, 3 rounds), then for pixel and
   compute only -0.6% (4 rounds, a heavy 20 ms scene) and -1.2% (6 rounds); frames in play normal.
+* `KYTY_IDLE_TRACE` per-command captures (`gpu-abn.sh` with `CMDS=1`) now also time the emulator's
+  own commands: barriers, buffer and image copies, clears, blits, buffer updates are reported like
+  draws with identity `0x4057'0000'0000'00xx` (`host-*` rows in the shaders file). A paused capture:
+  per flip 2841 draws (8.0 ms), 802 dispatches (7.5 ms), 1711 barriers (1.7 ms), 349 buffer copies
+  (0.9 ms), all with timestamps around each. Upper bounds measured with gpu-abn: label copies
+  (`WriteDataBuffer`, ~210 a flip, each between two barriers) without their barriers -1.3%; images
+  written by shaders without the barrier before their next same-layout use (the guest orders its
+  own shader writes) +0.8%. The GPU time is the guest's shaders.
+* Execution thread: `RuntimeFlags::Current()` is always inlined (it unpacked every flag out of line,
+  0.7%), and `TextureDescKey` / `DescriptorValue` compare as one memcmp instead of dword by dword
+  (1% and 0.6%). In play the command processor waits 91% of the time and the two resolvers 50-58%
+  (`prof-stage.sh`): the execution thread alone sets the pace; per shader pair its draws cost 1.7 us
+  (the most frequent, all memos hitting) to 5-16 us (`KYTY_DBG_DRAW_COST=1`).
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

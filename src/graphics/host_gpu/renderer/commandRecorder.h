@@ -205,6 +205,12 @@ private:
 // The vkCmd* subset used by the renderer. A recorder either calls the Vulkan command buffer
 // directly or appends the command to a CommandStream; the method names and signatures follow
 // vk::CommandBuffer so recording code does not depend on the mode.
+class CommandRecorder;
+// KYTY_IDLE_TRACE: GPU timestamps around the emulator's own commands (copies, clears, blits,
+// barriers), reported like draws with identity 0x4057'0000'0000'00xx; 0 when not capturing.
+uint32_t HostTraceBegin(const CommandRecorder& cmd, const char* kind, uint64_t identity);
+void     HostTraceEnd(const CommandRecorder& cmd, uint32_t slot_plus_one);
+
 class CommandRecorder {
 public:
 	CommandRecorder() = default;

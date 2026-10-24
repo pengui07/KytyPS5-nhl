@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <memory>
@@ -370,7 +371,11 @@ private:
 	struct TextureDescKey {
 		std::array<uint32_t, 8> dwords {};
 		std::array<uint32_t, 5> view {};
-		bool                    operator==(const TextureDescKey&) const = default;
+		// One memcmp of the 52 bytes (no padding): the defaulted compare went dword by dword
+		// (1% of the execution thread, in the description lookups of every texture bind).
+		bool operator==(const TextureDescKey& other) const noexcept {
+			return std::memcmp(this, &other, sizeof(*this)) == 0;
+		}
 	};
 	struct TextureDescKeyHash {
 		size_t operator()(const TextureDescKey& key) const noexcept;

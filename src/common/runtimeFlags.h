@@ -176,6 +176,11 @@ public:
  EvaluationScope(const EvaluationScope&)=delete;
  EvaluationScope& operator=(const EvaluationScope&)=delete;
 };
+// Always inlined: callers read one or two flags, and the unused ones then cost nothing (out of
+// line, unpacking every flag was 0.7% of the execution thread).
+#if defined(__clang__) || defined(__GNUC__)
+[[gnu::always_inline]]
+#endif
 inline FlagSet Current() {
  const auto bits = g_evaluation_bits!=kUnpinnedBits ? g_evaluation_bits : g_published.load(std::memory_order_relaxed);
  FlagSet f;
