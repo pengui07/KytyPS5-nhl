@@ -196,6 +196,14 @@ inline std::atomic<bool> g_shader_ftz32 {false};
 [[nodiscard]] inline bool ShaderExecRunConstReads() {
 	return ShaderExecRunTransparent() && Common::Experiments::Enabled(Common::Experiments::ExecRunConstReads);
 }
+// Codegen option: experiment SccBranches (key bit 536870912). A branch on SCC tested its condition
+// through a ballot like a branch on VCC or EXEC; SCC is uniform, and with the ballot (a convergent
+// operation) in its exit test the host compiler could not rotate a loop tested at the top, which then
+// kept its carried values in two register sets (c556aaf3 134 -> 119 VGPRs, d7cfa519 80 -> 16 bytes
+// of scratch).
+[[nodiscard]] inline bool ShaderSccBranches() {
+	return Common::Experiments::Enabled(Common::Experiments::SccBranches);
+}
 // Codegen option: experiment AlignedBufferOffsets (key bit 8388608). A buffer binding starts at the
 // guest base aligned down to the device's storage offset alignment, and the shader adds the rest
 // (the binding prefix, from the shader data). Scalar buffer reads align the base and the offset
@@ -243,7 +251,8 @@ inline std::atomic<bool> g_shader_storage_align4 {false};
 	       (ShaderF16ImagePack() ? 2097152u : 0u) | (ShaderExecRunTransparent() ? 4194304u : 0u) |
 	       (ShaderAlignedBufferOffsets() ? 8388608u : 0u) | (ShaderNativeFract() ? 16777216u : 0u) |
 	       (ShaderNativeF16Ops() ? 33554432u : 0u) | (ShaderMovRelArrays() ? 67108864u : 0u) |
-	       (ShaderBdaTwoLookups() ? 134217728u : 0u) | (ShaderExecRunConstReads() ? 268435456u : 0u);
+	       (ShaderBdaTwoLookups() ? 134217728u : 0u) | (ShaderExecRunConstReads() ? 268435456u : 0u) |
+	       (ShaderSccBranches() ? 536870912u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

@@ -101,7 +101,7 @@ uint64_t EnvironmentMask() {
 	set("KYTY_COMPUTE_UNLOCKED", ComputeUnlocked, true);
 	set("KYTY_AHEAD_UNLOCKED", AheadUnlocked, true);
 	set("KYTY_BACKING_LOOKUP_CACHE", BackingLookupCache, true);
-	set("KYTY_PROTECT_SHARED_LOCK", ProtectSharedLock, false);
+	set("KYTY_SCC_BRANCHES", SccBranches, true);
 	set("KYTY_CLOCK_WAIT_PREDICT", ClockWaitPredict, false);
 	// On: the command processor's and guest threads' reads of bytes the GPU never wrote, on pages
 	// protected for other GPU-written bytes, use the backing (exact, no speculation): the execution

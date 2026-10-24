@@ -1,6 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include "common/logging/log.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <atomic>
@@ -830,6 +831,10 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.other_half != nullptr && ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
 	const auto kind = inst.Flags<CFG::BranchCondition>();
 	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
+	// Experiment SccBranches: SCC is the same in every lane (scalar results, ballots of masks).
+	if (ShaderSccBranches() && (kind == CFG::BranchCondition::SccZero || kind == CFG::BranchCondition::SccNonZero)) {
+		return ctx.Arg(inst, 0);
+	}
 	const bool zero = kind == CFG::BranchCondition::ExecZero ||
 	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
 	const auto ballot = ctx.Ballot(inst.Arg(0));

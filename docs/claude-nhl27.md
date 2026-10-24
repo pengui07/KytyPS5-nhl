@@ -1340,6 +1340,26 @@ Toward 120 fps (2026-10-23):
   execution thread 3-5% more (3.30 vs 3.15 us). A 3-minute match afterwards: 77.9 fps at 60 Hz.
 * PGO profile v16 (recorded with these changes; the build uses ThinLTO). Soak: 77.5 / 81.0 / 77.0 fps
   in 60 Hz play, 45-48 in the game's 30 Hz scenes, no errors.
+* Why the heavy shaders kept loop-carried values twice: a small GLSL compute shader
+  (`KytyPS5-tools/spvisa/looptest.py`, 48 accumulators in a loop over the set bits of a uniform mask, three
+  light types) compiled through the AMD driver uses 58 VGPRs with `while (mask != 0)`, and 105 when
+  the loop leaves through any subgroup operation (`subgroupBallot(z) == subgroupBallot(true)`, the
+  emulator's form, or even `subgroupBroadcastFirst`, `subgroupAll`, `subgroupAny`): a convergent
+  operation in the exit test keeps LLVM from rotating the loop, and the carried values then live in two
+  sets copied at the header and the latch every iteration (as in `d7cfa519`, `33037c60`). If/else chains
+  nested in other branches doubled them too in that test (sequential single-armed ifs did not), but the
+  emulator's shaders have few of those (8 in `d7cfa519`, 48 in `33037c60`; splitting them changed
+  nothing there).
+* Bit 32 `KYTY_SCC_BRANCHES` (default on; key bit 536870912): branches on SCC (`S_CBRANCH_SCC0/1`)
+  test the condition itself instead of a ballot of it; SCC is uniform (scalar results, and ballots of
+  masks for SALU mask operations). Almost every loop of the heavy shaders is tested on SCC at its top.
+  `c556aaf3` 134 -> 119 VGPRs and 2705 -> 2623 instructions, `d7cfa519` 80 -> 16 bytes of scratch
+  (still 256 VGPRs: 183 of the values live at its peak come from its prologue). Paused GPU A/B, 5 rounds:
+  -4.1, -4.5, -5.2, -6.9, -5.6% per flip (mean -5.3%); the whole warm-up validates. Bit 32 was
+  `KYTY_PROTECT_SHARED_LOCK` (a shared lock in `ProtectTransient`, measured as noise twice; removed).
+  Loops tested on VCC or EXEC (`d46af19f`'s two step loops) still exit through a ballot. Soak (the first
+  boot recompiling every shader): 71.3 / 73.4 / 78.6 fps in 60 Hz play (CPU-bound), 49-51 in the game's
+  30 Hz scenes (were 45-48); no errors, frames normal.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

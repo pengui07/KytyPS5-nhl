@@ -54,7 +54,7 @@ enum Bit : uint64_t {
 	AsyncGuestReads      = 1u << 28u, // KYTY_ASYNC_GUEST_READS (default off; a guest thread waits for its own readback)
 	BdaDirtyRegions      = 1u << 29u, // KYTY_BDA_DIRTY_REGIONS (default off; BDA preparation syncs only CPU-written regions)
 	LdsLaneSlots         = 1u << 30u, // KYTY_LDS_LANE_SLOTS (default on; per-lane LDS slots of non-compute stages as a small array, part of shader keys)
-	ProtectSharedLock    = uint64_t {1} << 32u, // KYTY_PROTECT_SHARED_LOCK (default off; page-tracking protections of different pages run in parallel)
+	SccBranches          = uint64_t {1} << 32u, // KYTY_SCC_BRANCHES (default on; branches on SCC test the uniform condition itself instead of a ballot of it, so loops tested at the top can be rotated; part of shader keys; was ProtectSharedLock, no longer read)
 	ClockWaitPredict     = uint64_t {1} << 33u, // KYTY_CLOCK_WAIT_PREDICT (default off; WAIT_REG_MEM on a pending clock write need not wait for it)
 	FalseShareAnyThread  = uint64_t {1} << 34u, // KYTY_FALSE_SHARE_ANY_THREAD (default on; CP and guest reads of clean bytes on GPU-dirty pages use the backing)
 	CpCleanRegReads      = uint64_t {1} << 35u, // KYTY_CP_CLEAN_REG_READS (default off; the command processor reads clean indirect register tables from the backing)
