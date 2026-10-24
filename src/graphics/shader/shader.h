@@ -197,6 +197,12 @@ inline std::atomic<bool> g_shader_storage_align4 {false};
 	return g_shader_storage_align4.load(std::memory_order_relaxed) &&
 	       Common::Experiments::Enabled(Common::Experiments::AlignedBufferOffsets);
 }
+// Codegen option: experiment NativeFract (key bit 16777216), AMD devices only (see
+// g_shader_native_pkrtz): the clamp after V_FRACT_F32's Fract is left out.
+[[nodiscard]] inline bool ShaderNativeFract() {
+	return g_shader_native_pkrtz.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::NativeFract);
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
@@ -210,7 +216,7 @@ inline std::atomic<bool> g_shader_storage_align4 {false};
 	       (ShaderUndefVgprs() ? 131072u : 0u) | (ShaderFtz32() ? 262144u : 0u) |
 	       (ShaderMovRelBounds() ? 524288u : 0u) | (ShaderF16Converts() ? 1048576u : 0u) |
 	       (ShaderF16ImagePack() ? 2097152u : 0u) | (ShaderExecRunTransparent() ? 4194304u : 0u) |
-	       (ShaderAlignedBufferOffsets() ? 8388608u : 0u);
+	       (ShaderAlignedBufferOffsets() ? 8388608u : 0u) | (ShaderNativeFract() ? 16777216u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

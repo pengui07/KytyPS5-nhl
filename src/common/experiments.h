@@ -76,7 +76,10 @@ enum Bit : uint64_t {
 	AbPending4 = uint64_t {1} << 49u,
 	// A/B only and read by nothing else: a pending change's A/B changes nothing more.
 	AbPending5 = uint64_t {1} << 56u,
-	AbPending6 = uint64_t {1} << 57u,
+	// KYTY_NATIVE_FRACT (default on; AMD devices): V_FRACT_F32 is GLSL Fract alone, which the AMD
+	// compiler emits as the same v_fract_f32 (clamped below one), without the clamp that
+	// x - floor(x) needs elsewhere; part of shader keys. Was AbPending6.
+	NativeFract = uint64_t {1} << 57u,
 	AbPending7 = uint64_t {1} << 58u,
 	// KYTY_F16_CONVERTS (default on; with NativeFp16): f32 <-> f16 conversions as OpFConvert on f16
 	// instead of PackHalf2x16 / UnpackHalf2x16; part of shader keys.

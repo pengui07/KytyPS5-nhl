@@ -67,6 +67,19 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 
 namespace {
 
+// ConvertU32F32 as the guest's V_CVT_U32_F32: NaN and values at or below zero give 0, values at
+// or above 2^32 give UINT32_MAX, the rest truncate.
+[[nodiscard]] uint32_t SaturateF32ToU32(float value) {
+	if (!(value > 0.0f)) {
+		return 0;
+	}
+	if (value >= 4294967296.0f) {
+		return UINT32_MAX;
+	}
+	return static_cast<uint32_t>(value);
+}
+
+
 // --- resource fixture recording ------------------------------------------------
 // Opt-in recording of the memory access trace the SRT walker performs, so a real
 // plan's workload can be replayed offline with no emulator run. Off unless
@@ -1345,12 +1358,8 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::ConvertU32F32:
 			if (Arg(inst, 0, a)) {
-				const auto value = Float32(a);
-				if (!std::isfinite(value) || value < 0.0f ||
-				    static_cast<double>(value) > UINT32_MAX) {
-					return false;
-				}
-				result = static_cast<uint32_t>(value);
+				// Saturating, as V_CVT_U32_F32 (NaN and negatives give 0).
+				result = SaturateF32ToU32(Float32(a));
 				return true;
 			}
 			return false;
@@ -4165,12 +4174,7 @@ inline bool TapeAlu(ValueOpcode opcode, const std::array<uint32_t, 5>& args, uin
 			result = std::bit_cast<uint32_t>(static_cast<float>(static_cast<uint32_t>(a)));
 			break;
 		case ValueOpcode::ConvertU32F32: {
-			const auto v = TapeFloat32(a);
-			if (!std::isfinite(v) || v < 0.0f || static_cast<double>(v) > UINT32_MAX) {
-				g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-				return false;
-			}
-			result = static_cast<uint32_t>(v);
+			result = SaturateF32ToU32(TapeFloat32(a));
 			break;
 		}
 		case ValueOpcode::FPTrunc32:

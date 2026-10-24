@@ -1156,6 +1156,13 @@ Toward 120 fps (2026-10-23):
   `BufferCache::HasGpuDirtyBytes` remembers its answers per range while the GPU-written set is
   unchanged (`RangeSet::Intersects` 1.9 -> 0.8%). The old alternates of AbPending5/6/7 (bits 56-58)
   are gone, so those bits are free for new A/Bs.
+* `V_CVT_U32_F32`, `V_CVT_I32_F32`, `V_CVT_RPI/FLR_I32_F32` emit `ConvertU32F32`/`ConvertS32F32`
+  alone: the backend already saturates them like the guest (`EmitF32ToU32`: NaN 0, the 32-bit
+  bounds), and the translator's clamp before them doubled each conversion (`c556aaf3` 3070 -> 2980
+  instructions, `ea94f09b` 2674 -> 2598). The resource-table walker saturates the same way instead
+  of failing on out-of-range values. Bit 57 `KYTY_NATIVE_FRACT` (default on, AMD only; key bit
+  16777216): `V_FRACT_F32` is GLSL `Fract` without the clamp below one, as the AMD compiler emits
+  `v_fract_f32`, which clamps itself (`c556aaf3` -19 instructions).
 * Host ISA without playing: `KYTY_WARMUP_ONLY=<hex hash>[,...]` warms up only the recorded
   pipelines that use those shaders (the driver cache is left as it was) and `KYTY_EXIT_AFTER_WARMUP=1`
   exits after the warm-up; with `KYTY_DBG_PIPELINE_STATS` that is the shaders' VGPRs, SGPRs and ISA

@@ -56,17 +56,16 @@ void Translator::V_CVT_F32_I32(const Decoder::Instruction& inst) {
 	             ir.Emit(IR::ValueOpcode::ConvertF32S32, {ReadU32(SourceAt(inst, 0))}));
 }
 
+// ConvertU32F32 / ConvertS32F32 saturate to the full 32-bit range like the guest (NaN gives 0;
+// see EmitF32ToU32): clamping before them as well doubled the code of each conversion.
 void Translator::V_CVT_U32_F32(const Decoder::Instruction& inst) {
 	const auto value = IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32));
-	WriteOperand(DestinationOperand(inst),
-	             ConvertF32ToU32Saturated(value, 4294967296.0f, 4294967040.0f, 0xffffffffu));
+	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::ConvertU32F32, {value}));
 }
 
 void Translator::V_CVT_I32_F32(const Decoder::Instruction& inst) {
 	const auto value = IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32));
-	WriteOperand(DestinationOperand(inst),
-	             ConvertF32ToI32Saturated(value, -2147483648.0f, 2147483648.0f, 2147483520.0f,
-	                                      0x80000000u, 0x7fffffffu));
+	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::ConvertS32F32, {value}));
 }
 
 void Translator::V_CVT_F16_F32(const Decoder::Instruction& inst) {
@@ -100,17 +99,13 @@ void Translator::V_CVT_RPI_I32_F32(const Decoder::Instruction& inst) {
 	const auto source  = IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32));
 	const auto biased  = IR::F32(ir.Emit(IR::ValueOpcode::FPAdd32, {source, IR::Value::F32(0.5f)}));
 	const auto rounded = IR::F32(ir.Emit(IR::ValueOpcode::FPFloor32, {biased}));
-	WriteOperand(DestinationOperand(inst),
-	             ConvertF32ToI32Saturated(rounded, -2147483648.0f, 2147483648.0f, 2147483520.0f,
-	                                      0x80000000u, 0x7fffffffu));
+	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::ConvertS32F32, {rounded}));
 }
 
 void Translator::V_CVT_FLR_I32_F32(const Decoder::Instruction& inst) {
 	const auto source  = IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32));
 	const auto rounded = IR::F32(ir.Emit(IR::ValueOpcode::FPFloor32, {source}));
-	WriteOperand(DestinationOperand(inst),
-	             ConvertF32ToI32Saturated(rounded, -2147483648.0f, 2147483648.0f, 2147483520.0f,
-	                                      0x80000000u, 0x7fffffffu));
+	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::ConvertS32F32, {rounded}));
 }
 
 void Translator::V_FREXP_EXP_I32_F32(const Decoder::Instruction& inst) {

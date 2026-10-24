@@ -346,6 +346,11 @@ void Translator::V_FRACT(const Decoder::Instruction& inst, bool half) {
 	// minnum(x - floor(x), nextafter(1.0, 0.0)) to V_FRACT for the same reason).
 	const auto source = half ? ReadF16AsF32(inst.src0) : IR::F32(ReadOperand(inst.src0, IR::Type::F32));
 	auto       result = IR::F32(ir.Emit(IR::ValueOpcode::FPFract32, {source}));
+	if (!half && ShaderNativeFract()) {
+		// The AMD compiler emits Fract as v_fract_f32, which clamps like the guest's.
+		WriteOperand(DestinationOperand(inst), result);
+		return;
+	}
 	// Clamp in the destination precision: an F16 result above 0x3bff would round to 1.0.
 	const auto below_one =
 	    IR::F32(IR::Value::F32(std::bit_cast<float>(half ? 0x3f7fe000u : 0x3f7fffffu)));
