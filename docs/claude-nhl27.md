@@ -1276,6 +1276,11 @@ Toward 120 fps (2026-10-23):
   (1% and 0.6%). In play the command processor waits 91% of the time and the two resolvers 50-58%
   (`prof-stage.sh`): the execution thread alone sets the pace; per shader pair its draws cost 1.7 us
   (the most frequent, all memos hitting) to 5-16 us (`KYTY_DBG_DRAW_COST=1`).
+* Sampled null T#s now go through the description memo like the others (`ResolveTexture`): each draw
+  with one built the null description, looked up the null image and its view again; reuse accepts
+  unregistered images without a guest range. Color fast-clear checks compare the metadata slice in
+  the backing store instead of copying it first. Exec profile in play: `ResolveTexture` 3.4 -> 2.1%,
+  `RebindImages` 2.2 -> 1.4%, `RuntimeFlags::Current` 1.0 -> 0.3%; frames normal.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

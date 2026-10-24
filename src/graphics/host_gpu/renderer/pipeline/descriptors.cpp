@@ -761,12 +761,13 @@ bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureB
 	auto&       found         = derived.found;
 	auto*       image         = texture_cache.m_slot_images.try_get(found.id);
 	const auto& range         = found.desc.info.data;
-	if (image == nullptr || !image->registered || image->binding.needs_rebind ||
+	// Null images (no guest range) are never registered and depend on no guest pages.
+	if (image == nullptr || (!image->registered && !range.Empty()) || image->binding.needs_rebind ||
 	    ImageLookupState::Of(found.id, *image) != found.state) {
 		found.valid = false;
 		return false;
 	}
-	if (const auto set_epoch = texture_cache.ImageSetEpoch(); found.image_set_epoch != set_epoch) {
+	if (const auto set_epoch = texture_cache.ImageSetEpoch(); found.image_set_epoch != set_epoch && !range.Empty()) {
 		if (texture_cache.ImageEpochInRegion(range.address, range.size) > found.image_set_epoch) {
 			found.valid = false;
 			return false;
@@ -807,6 +808,32 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
+		// Sampled null T#s go through the description memo like the others, so later draws reuse
+		// the lookup and its view (each draw built the null description, looked up its image and
+		// then its view again: about 1% of the execution thread in play).
+		if (!storage && !table_candidate && examined == nullptr &&
+		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+			const auto key    = MakeTextureDescKey(resource, value);
+			auto       cached = m_texture_descs.find(key);
+			if (cached == m_texture_descs.end()) {
+				TextureDescDerivation derived;
+				derived.desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+				if (m_texture_descs.size() >= MaxTextureDescs) {
+					m_clear_texture_descs = true;
+				}
+				cached = m_texture_descs.emplace(key, std::move(derived)).first;
+			}
+			auto& derived = cached->second;
+			if (derived.found.valid) {
+				TextureBinding binding;
+				if (ReuseTextureLookup(derived, binding)) {
+					return binding;
+				}
+			}
+			TextureBinding binding {texture_cache.FindImage(derived.desc), nullptr, derived.desc};
+			binding.lookup = &derived;
+			return binding;
+		}
 		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                                    : TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);
