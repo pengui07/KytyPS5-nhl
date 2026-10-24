@@ -1281,6 +1281,15 @@ Toward 120 fps (2026-10-23):
   unregistered images without a guest range. Color fast-clear checks compare the metadata slice in
   the backing store instead of copying it first. Exec profile in play: `ResolveTexture` 3.4 -> 2.1%,
   `RebindImages` 2.2 -> 1.4%, `RuntimeFlags::Current` 1.0 -> 0.3%; frames normal.
+* Reads ahead were re-checked far more than needed: writes into guest memory from threads other
+  than the execution thread (the labels the host copy thread writes, download publishes) raised their
+  pages to "always check" in `PageWriteSeq`, so no read on such a page was ever skipped again: in
+  play every one of a dispatch's ~15 reads (`GuestReadLog::StillValid` was 3.5% of the execution
+  thread for dispatches alone) and 5 of a draw's 35. Such a write now belongs after the operation the
+  execution thread runs at the time (`g_operation` + 1): a resolve that read the bytes before it had
+  seen at most the completion of an earlier operation. Now dispatches skip 10.4 of 14.8 reads, draws
+  34.7 of 35.4; `KYTY_DBG_VERIFY_SKIPS=1` (compares every skipped read) reported no changed read. In-boot
+  A/B (8 rounds, the old raise as an alternate table): draws 4.07 -> 3.60 us, dispatches 2.68 -> 2.35 us.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
