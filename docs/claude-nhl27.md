@@ -1511,7 +1511,10 @@ comparable pair of paused boots: draw 3.69 / 3.71 us, dispatch 3.01 / 2.89 us (t
 landed in 30 fps scenes); kept as it matches the current code. Profile v11 (2026-10-22, recorded on bdc062b3:
 the buffer slot memos, texel version table, unmap log and guest CPU sets had changed
 `RebindBuffers`, `ObtainBuffer` and the execution loop since v10). Profile v12 (2026-10-23, recorded on 610b5dbe: submission
-batching, the second draw resolver and the label path of `WRITE_DATA` since v11).
+batching, the second draw resolver and the label path of `WRITE_DATA` since v11). Profile v17
+(2026-10-25, recorded on bc8b1125, the merge of nhl27-eadb: the merged build had kept profile data
+for only part of its functions, 1107 mismatches): three 3-minute matches 78.4 / 76.3 / 69.9 fps at
+60 Hz (the merge on v16: 71.0 with a cold shader cache / 67.0 / 70.7).
 
 Single fixed-save matches of the same build differ by up to 5 fps at 60 Hz (52.2 and 57.1 within
 an hour): compare builds with `exe-ab.sh` (per-draw cost in paused boots), not one match each.
