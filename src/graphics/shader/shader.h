@@ -54,7 +54,10 @@ inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
 	return Common::Experiments::Enabled(Common::Experiments::NativeMinMax);
 }
 // Codegen option: experiment FusedMad. V_MAD_F32/V_MAC_F32 (a separately rounded multiply and
-// add on the guest) as one fused multiply-add instead of a NoContraction multiply and add.
+// add on the guest) of pixel and compute shaders as one fused multiply-add instead of a
+// NoContraction multiply and add. The guest compiler picks V_MAD/V_MAC for contractable multiply-adds
+// (the fast form with FP32 denormals flushed); vertex and mesh shaders keep the separate rounding so
+// positions computed by different shaders stay bit-identical (depth-equal passes).
 [[nodiscard]] inline bool ShaderFusedMad() {
 	return Common::Experiments::Enabled(Common::Experiments::FusedMad);
 }

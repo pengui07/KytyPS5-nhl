@@ -91,7 +91,7 @@ uint64_t EnvironmentMask() {
 	set("KYTY_EARLY_SUBMIT_WRITERS", EarlySubmitWriters, false);
 	set("KYTY_READBACK_COMPUTE", ReadbackCompute, true);
 	set("KYTY_ROBUST_LOADS", RobustLoads, true);
-	set("KYTY_FUSED_MAD", FusedMad, false);
+	set("KYTY_FUSED_MAD", FusedMad, true);
 	set("KYTY_FAULT_PAGE_DIRECT", FaultPageDirect, true);
 	set("KYTY_BACKING_READ_MRU", BackingReadMru, true);
 	set("KYTY_DISPATCH_AHEAD", DispatchAhead, true);

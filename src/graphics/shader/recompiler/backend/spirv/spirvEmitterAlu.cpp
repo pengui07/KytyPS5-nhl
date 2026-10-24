@@ -306,7 +306,7 @@ uint32_t EmitFPFma32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
-	if (ShaderFusedMad()) {
+	if (ShaderFusedMad() && (state.program.stage == ShaderType::Pixel || state.program.stage == ShaderType::Compute)) {
 		return EmitGlsl<GLSLstd450Fma, IR::Type::F32>(state, a, b, c);
 	}
 	// Explicit denormal checks typically drop 3DMiniGolf menu FPS from 28-29 to 21-24

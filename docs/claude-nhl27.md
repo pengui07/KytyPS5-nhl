@@ -1239,6 +1239,30 @@ Toward 120 fps (2026-10-23):
 * Tried: skipping the region lock in the BDA dirty-span drain when the span had no CPU-dirty page
   (`ForEachCpuDirtySpanBefore`, where the profile showed 2.8% spinning on that lock): 63.2 vs 64.3 fps,
   draw 3.80 vs 3.82 us; dropped.
+* Tried: pointer windows for the material shaders' scalar BDA groups through a user-data pointer
+  with a dynamic offset: the 64 KiB after the pointer (clipped to the buffer already holding it)
+  bound as a read-only storage buffer, read when the group lies inside it (`OpArrayLength`), through
+  BDA otherwise. Both paths stay in the shader, so 9eaaf80c grew 21201 -> 22392 instructions, and two
+  paused GPU A/Bs were neutral (-0.4% and +0.4% of the top shaders; the material shaders +3.0, +9.2,
+  -5.5, -4.1, +3.7%). The BDA address math is not what limits them; dropped. Two lessons: binding a
+  range with `FindBuffer`/`ObtainBuffer` that overruns the buffer holding its start creates and
+  merges buffers on every draw (execution 3 -> 31 us per operation), and an in-boot mask switch of a
+  key bit recompiles every shader (~4 a second), so in-boot A/Bs of key bits need long phases.
+* Paused GPU A/Bs are now measured with `KytyPS5-tools/gpu-abn.sh <prefix> <rounds> <mask>...`: a
+  paused match, each mask for a few seconds per round, a 3 s capture of command-buffer timestamps
+  only (`KYTY_IDLE_TRACE_NO_CMDS`) per mask and round, GPU busy per flip averaged per mask
+  (`WARM=<seconds>` first compiles each shader-key mask's variants). Per-draw timestamps inflate GPU
+  time per flip by 30-50% and the GPU, not saturated while paused, changes clocks between captures:
+  whole captures moved 5-10% (every shader alike) in A/B/A runs, while gpu-abn's rounds agree within
+  about 1%. With it, scoped guest barriers (a CS/VS/PS partial flush waiting for its own stage only,
+  a cache acquire for none) measured -0.1% (5 rounds) and were dropped.
+* Bit 9 `KYTY_FUSED_MAD` is now on by default for pixel and compute shaders: `V_MAD_F32`/`V_MAC_F32`
+  become one fused multiply-add. The guest compiler emits them for multiply-adds it may contract (the
+  fast form while FP32 denormals are flushed), so fusing them stays within what the shaders allow;
+  vertex and mesh shaders keep the separately rounded form so that positions computed by different
+  shaders stay bit-identical. Compute `c556aaf3` has 379 of them (each was a multiply and an add, 2980
+  host instructions). Paused GPU A/Bs (gpu-abn): -1.3% (all stages, 3 rounds), then for pixel and
+  compute only -0.6% (4 rounds, a heavy 20 ms scene) and -1.2% (6 rounds); frames in play normal.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
