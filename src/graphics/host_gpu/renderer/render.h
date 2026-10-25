@@ -452,7 +452,9 @@ private:
 	// Buffer bindings by range, in front of the lookups a slot memo miss makes: a program's slot sees
 	// a new range almost every draw (meshes' vertex streams: in play 8,500 of the 18,600 texel binds
 	// a frame missed their slot memo), and the same ranges come back every frame (see RebindBuffers()).
-	static constexpr size_t BindMemoSlots = 16384;
+	// With 16384 slots, ranges pushing each other out were most of the lookups left (draws: 60,000 of
+	// 70,000 a second in play); paused A/B with 65536: dispatches -1.1%, draws the same.
+	static constexpr size_t BindMemoSlots = 65536;
 	struct BindMemo {
 		PreparedBindings::BufferSlotMemo slot;
 		uint8_t                          kind = 0; // 1 plain, 2 written, 3 texel

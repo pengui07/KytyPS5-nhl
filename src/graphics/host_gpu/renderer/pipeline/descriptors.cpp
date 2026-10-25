@@ -1476,7 +1476,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 				ExecRegions::Note(ExecRegions::ImageMemoDesc);
 			}
 			if (derived != nullptr && derived->found.valid &&
-			    ReuseTextureLookup(*derived, prepared.images[i])) {
+			    ExecRegions::TimedTwice(ExecRegions::WarmReuse,
+			                            [&] { return ReuseTextureLookup(*derived, prepared.images[i]); })) {
 				ExecRegions::Note(ExecRegions::ImageReused);
 				image_descs[i] = derived;
 				BindImage(prepared.images[i].image_id, false);
@@ -1589,8 +1590,10 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			    key.value == snapshot.buffers[resource]) {
 				ExecRegions::Note(ExecRegions::FindEpochs);
 			}
-			if (key.program == &program && key.generation == generation &&
-			    key.value == snapshot.buffers[resource]) {
+			if (ExecRegions::TimedTwice(ExecRegions::WarmFindSlot, [&] {
+				    return key.program == &program && key.generation == generation &&
+				           key.value == snapshot.buffers[resource];
+			    })) {
 				ExecRegions::Note(ExecRegions::FindSame);
 				if (StageStats::Enabled()) {
 					StageStats::g_bind_total.fetch_add(1, std::memory_order_relaxed);
@@ -1703,7 +1706,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	for (const auto& resource: program.info.buffers) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
-		ExecRegions::Note(ExecRegions::BufferSlots);
+		ExecRegions::NoteOp(ExecRegions::BufferSlots);
 		uint32_t    buffer_offset = 0;
 		const auto& source        = prepared.buffer_sources[index];
 		auto&       memo          = prepared.buffer_memos[index];
@@ -1723,7 +1726,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
 			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[0]);
-			ExecRegions::Note(ExecRegions::BufferMemoHits);
+			ExecRegions::NoteOp(ExecRegions::BufferMemoHits);
 			ExecRegions::InOp(ExecRegions::BuffersMemo, ExecRegions::DBufPlain);
 			continue;
 		}
@@ -1735,7 +1738,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
 			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[1]);
-			ExecRegions::Note(ExecRegions::BufferMemoHits);
+			ExecRegions::NoteOp(ExecRegions::BufferMemoHits);
 			ExecRegions::InOp(ExecRegions::BuffersMemo, ExecRegions::DBufWritten);
 			continue;
 		}
@@ -1746,7 +1749,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
 			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[2]);
-			ExecRegions::Note(ExecRegions::BufferMemoHits);
+			ExecRegions::NoteOp(ExecRegions::BufferMemoHits);
 			ExecRegions::InOp(ExecRegions::BuffersMemo, ExecRegions::DBufTexel);
 			continue;
 		}
@@ -1769,9 +1772,25 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 				pack_memory_offset(index, global.buffer_offset);
 				memo = global;
 				FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_global_hit[kind - 1]);
-				ExecRegions::Note(ExecRegions::BufferGlobalHits);
+				ExecRegions::NoteOp(ExecRegions::BufferGlobalHits);
 				ExecRegions::InOp(ExecRegions::BuffersMemo, ExecRegions::DBufGlobal);
 				continue;
+			}
+		}
+		if (ExecRegions::Enabled()) {
+			const bool range_memo = kind != 0 && bind_memo.kind == kind && bind_memo.slot.address == source.address &&
+			                        bind_memo.slot.size == source.size && bind_memo.slot.buffer != nullptr;
+			ExecRegions::NoteOp(kind == 0     ? ExecRegions::ObtainNoKind
+			                    : !range_memo ? ExecRegions::ObtainNoMemo
+			                    : kind == 1   ? ExecRegions::ObtainFailedPlain
+			                    : kind == 2   ? ExecRegions::ObtainFailedWritten
+			                                  : ExecRegions::ObtainFailedTexel);
+			if (kind != 0 && !range_memo) {
+				if (cache.IsRegionCpuModified(source.address, source.size)) ExecRegions::NoteOp(ExecRegions::ObtainNoMemoDirty);
+				if (ExecRegions::SeenRange(source.address, source.size, kind)) ExecRegions::NoteOp(ExecRegions::ObtainNoMemoEvicted);
+				if (memo.buffer != nullptr && memo.address == source.address && memo.size == source.size) {
+					ExecRegions::NoteOp(ExecRegions::ObtainNoMemoSlotSame);
+				}
 			}
 		}
 		if (FrameBreakdown::Verbose() && (plain || written || texel)) {
@@ -1806,8 +1825,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			bind_memo = {memo, kind};
 		} else {
 			memo.buffer = nullptr;
+			if (ExecRegions::Enabled() && (plain || written || texel)) {
+				ExecRegions::NoteOp(obtained != nullptr && cache.IsStreamBuffer(obtained) ? ExecRegions::ObtainStream
+				                                                                          : ExecRegions::ObtainNotKept);
+			}
 		}
-		ExecRegions::Note(ExecRegions::BufferObtains);
+		ExecRegions::NoteOp(ExecRegions::BufferObtains);
 		ExecRegions::InOp(ExecRegions::BuffersObtain, ExecRegions::DBufObtain);
 	}
 	lookup_timer.Stop();

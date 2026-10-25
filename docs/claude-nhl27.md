@@ -1432,6 +1432,15 @@ Toward 120 fps (2026-10-23):
 * `Image::GetBarriers` keeps up to two barriers in the object instead of a vector (a heap allocation
   per transition that needed one was about 0.5% of the execution thread).
 * PGO v18 (2026-10-25, recorded on f1541bf1, the merge of the 14 newer upstream commits).
+* Buffer slots that miss both memos of `RebindBuffers`, by reason (`NHL27REGIONS` draws,
+  `NHL27REGIONSDISP` dispatches; region-timer build only): in play about 70,000 a second in draws
+  and 76,000 in dispatches had no by-range memo of their range. Almost none were CPU-modified ranges
+  (an upload due); in draws 85% were ranges bound before that another range had pushed out of the
+  16384-slot memo, in dispatches a third (the rest are ranges not bound in the last 1M lookups).
+  With 65536 slots, paused in-boot A/B (6 rounds): dispatch 1.969 -> 1.948 us, draw 3.161 -> 3.158
+  us, fps 79.3 -> 80.3; kept.
+* The NHL 27 FSR3 hook skips dispatches other than its four passes before timing them (it read the
+  clock twice on each of 60,000 dispatches a second).
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

@@ -125,6 +125,21 @@ enum Event : uint32_t {
 	TargetsReused,
 	LeanStages,
 	LeanSlots,
+	// Buffer slots that missed both memos (counted for draws and dispatches apart, NoteOp()): no
+	// memo kind (formatted raw reads, null ranges), a by-range memo of the range whose check failed
+	// (plain, written, texel), no by-range memo of the range, and lookups whose result is not kept.
+	ObtainNoKind,
+	ObtainFailedPlain,
+	ObtainFailedWritten,
+	ObtainFailedTexel,
+	ObtainNoMemo,
+	ObtainNotKept,
+	ObtainStream,
+	// Of the no-memo lookups: the range is CPU-modified (an upload is due), the range was bound
+	// before but its by-range memo slot holds another range now, the slot memo had the same range.
+	ObtainNoMemoDirty,
+	ObtainNoMemoEvicted,
+	ObtainNoMemoSlotSame,
 	EventCount
 };
 inline const char* const EventNames[EventCount] = {"img_slots", "img_memo",  "img_map",   "img_reused",
@@ -134,13 +149,61 @@ inline const char* const EventNames[EventCount] = {"img_slots", "img_memo",  "im
                                                    "h_rebinds", "h_commits", "h_epochs", "h_away", "h_active",
                                                    "b_slots", "b_memo", "b_global", "b_obtain",
                                                    "same_ctx", "same_prog", "same_tex", "same_vs", "same_user",
-                                                   "same_but_data", "rt_reused", "lean_stages", "lean_slots"};
+                                                   "same_but_data", "rt_reused", "lean_stages", "lean_slots",
+                                                   "o_nokind", "o_plain", "o_written", "o_texel", "o_nomemo",
+                                                   "o_notkept", "o_stream", "o_dirty", "o_evicted", "o_slotsame"};
+// Ranges bound before (diagnostics of the by-range memo's evictions): a direct-mapped set of 1M keys.
+inline bool SeenRange(uint64_t address, uint64_t size, uint8_t kind) {
+	static auto* keys = new uint64_t[1u << 20u] {};
+	const uint64_t key  = (address * 0x9E3779B97F4A7C15ull) ^ (size << 40u) ^ kind ^ 1u;
+	auto&          slot = keys[(key >> 20u) & ((1u << 20u) - 1u)];
+	const bool     seen = slot == key;
+	slot                = key;
+	return seen;
+}
 inline uint64_t          g_events[EventCount] {};
+inline uint64_t          g_dispatch_events[EventCount] {};
 inline void              Note(Event event) {
 	if (Enabled() && g_in_draw) g_events[event]++;
 }
+// An event of a draw or of a dispatch (printed per dispatch in NHL27REGIONSDISP).
+inline void NoteOp(Event event) {
+	if (Enabled()) (g_in_draw ? g_events : g_dispatch_events)[event]++;
+}
 inline uint64_t g_draws      = 0;
 inline uint64_t g_dispatches = 0;
+// KYTY_DBG_WARM=1: an operation timed twice in a row (first call, then again with its data in the
+// cache): how much of its cost is waiting for memory. Per kind: [0] first ticks, [1] second ticks,
+// [2] count.
+enum WarmKind : uint32_t { WarmReuse, WarmFindSlot, WarmCount };
+inline const char* const WarmNames[WarmCount] = {"reuse", "findslot"};
+inline uint64_t          g_warm[WarmCount][3] {};
+[[nodiscard]] inline bool WarmEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_WARM");
+		return Enabled() && value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+// `check()` (a test without lasting effects when repeated); when it holds and KYTY_DBG_WARM is on,
+// runs it again and charges both runs. Without the region timers it is just `check()`.
+template <typename Check>
+[[nodiscard]] inline bool TimedTwice(WarmKind kind, Check&& check) {
+	if (!(Enabled() && WarmEnabled())) {
+		return check();
+	}
+	const auto first = __rdtsc();
+	if (!check()) {
+		return false;
+	}
+	const auto second = __rdtsc();
+	(void)check();
+	const auto end = __rdtsc();
+	g_warm[kind][0] += second - first;
+	g_warm[kind][1] += end - second;
+	g_warm[kind][2]++;
+	return true;
+}
 
 inline void Print() {
 	static uint64_t start_tsc = __rdtsc();
@@ -185,6 +248,30 @@ inline void Print() {
 		g_lean_ticks[i] = g_lean_counts[i] = 0;
 	}
 	std::printf("%s total=%.0f (ms/s)\n", line, total);
+	at = 0;
+	append("NHL27REGIONSDISP dispatches/s=%.0f", static_cast<double>(g_dispatches) * 1e9 / ns);
+	for (uint32_t i = 0; i < EventCount; i++) {
+		if (g_dispatch_events[i] != 0) {
+			append(" %s=%.1fk", EventNames[i], static_cast<double>(g_dispatch_events[i]) * 1e6 / ns);
+		}
+		g_dispatch_events[i] = 0;
+	}
+	std::printf("%s\n", line);
+	if (WarmEnabled()) {
+		at = 0;
+		append("NHL27WARM");
+		for (uint32_t i = 0; i < WarmCount; i++) {
+			const double count = static_cast<double>(g_warm[i][2]);
+			if (count > 0) {
+				const double ns_per_tick = ns / static_cast<double>(tsc - start_tsc);
+				append(" %s: first=%.1fns second=%.1fns n=%.0fk", WarmNames[i],
+				       static_cast<double>(g_warm[i][0]) * ns_per_tick / count,
+				       static_cast<double>(g_warm[i][1]) * ns_per_tick / count, count / 1000.0);
+			}
+			g_warm[i][0] = g_warm[i][1] = g_warm[i][2] = 0;
+		}
+		std::printf("%s\n", line);
+	}
 	std::fflush(stdout);
 	g_draws = g_dispatches = g_lean_draws = 0;
 	start_tsc = tsc;
