@@ -10,6 +10,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <source_location>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -248,10 +249,13 @@ public:
 	                     vk::DependencyFlags dependency, uint32_t memory_count,
 	                     const vk::MemoryBarrier* memory, uint32_t buffer_count,
 	                     const vk::BufferMemoryBarrier* buffers, uint32_t image_count,
-	                     const vk::ImageMemoryBarrier* images) const;
-	void pipelineBarrier2(const vk::DependencyInfo& dependency) const;
-	void pipelineBarrier2(const vk::DependencyInfo* dependency) const {
-		pipelineBarrier2(*dependency);
+	                     const vk::ImageMemoryBarrier* images,
+	                     std::source_location where = std::source_location::current()) const;
+	void pipelineBarrier2(const vk::DependencyInfo& dependency,
+	                      std::source_location where = std::source_location::current()) const;
+	void pipelineBarrier2(const vk::DependencyInfo* dependency,
+	                      std::source_location where = std::source_location::current()) const {
+		pipelineBarrier2(*dependency, where);
 	}
 
 	void bindPipeline(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) const {
@@ -383,7 +387,8 @@ public:
 	}
 
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
-	                const vk::BufferCopy* regions) const;
+	                const vk::BufferCopy* regions,
+	                std::source_location where = std::source_location::current()) const;
 	void updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                  const void* data) const;
 	void writeTimestamp(vk::PipelineStageFlagBits stage, vk::QueryPool pool, uint32_t query) const {

@@ -1504,6 +1504,22 @@ Toward 120 fps (2026-10-23):
 * A 3 x 5-minute soak on ee3f53e2: 77.2 / 77.2 / 77.4 fps at 60 Hz; the third match ended in the
   rare guest crash at pc 0x9093c3f41 (`rax=-1`, a UI table of -1 slots; no emulator write within
   0x400 of the pointers among the last 474,845 logged), now seen twice today in about 13 boots.
+* Texture description lookups (`m_texture_descs`) go through a direct-mapped front of 4,096
+  entries by key hash (`FindTextureDesc`): a hit reads only the map entry, which the caller reads
+  anyway; the map's bucket array and chain were about 2% of the execution thread. Paused in-boot
+  A/B: draw 2.967 -> 2.950 us, dispatch 1.989 -> 1.977 us. Dropped (no gain): prefetching only the
+  parts of an upcoming resolution the execution thread reads (3.033 vs 3.019 us), and prefetching
+  the whole queued operation after the next (2.913 vs 2.904 us).
+* GPU time in play (`KYTY_IDLE_TRACE_NO_CMDS`): 10.6 ms per flip at 75 fps (80% busy) with the
+  test settings (no resolution scale), 8.2 ms at 88 fps with the shipped `cfgGlobal.json`
+  (`KYTY_NHL_RES_SCALE=0.6667`, FSR 3): with the shipped settings the GPU just fits 120 fps in that
+  scene and the execution thread is the limit. `KYTY_DBG_COMMAND_SITES=1` counts the barriers and
+  buffer copies the emulator records by the code line that records them (`NHL27SITES` every 5 s):
+  about 1,760 barriers a frame in play, from image layout transitions (`image.cpp`, ~450), label
+  writes into cached buffers (`WriteDataBuffer`: barrier, copy, barrier, ~280), the guest's own
+  cache actions (~230) and CPU-dirty uploads (~100). The label writes' first barrier waiting only
+  for earlier transfers instead of all work: GPU 8.73 vs 8.66 ms per flip, noise, dropped (the
+  per-command timestamps inflate barrier costs).
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
