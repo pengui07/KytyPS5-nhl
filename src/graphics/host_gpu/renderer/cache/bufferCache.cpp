@@ -590,6 +590,7 @@ void BufferCache::Unregister(BufferId id) {
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	++m_registration_generation;
+	FrameBreakdown::VAdd(FrameBreakdown::g_counters.buffer_registrations);
 	auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
@@ -2468,6 +2469,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uin
 		return {&buffer, entry.offset};
 	}
 	FrameBreakdown::VAdd(FrameBreakdown::g_counters.obtain_cache_misses);
+	if (FrameBreakdown::Verbose()) {
+		auto& c = FrameBreakdown::g_counters;
+		FrameBreakdown::VAdd(entry.vaddr != vaddr || entry.size != size         ? c.obtain_miss_slot
+		                     : entry.registration != m_registration_generation ? c.obtain_miss_registration
+		                     : IsBufferInvalid(entry.id) || !m_slot_buffers[entry.id].IsInBounds(vaddr, size)
+		                         ? c.obtain_miss_buffer
+		                         : c.obtain_miss_cpu);
+	}
 	// Stamp before the lookup so a CPU write racing with it forces a recheck on the next hit.
 	const auto registration = m_registration_generation;
 	const auto result       = ObtainBuffer(vaddr, size, false, false, id);
@@ -2477,6 +2486,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uin
 		if (!IsBufferInvalid(found) && &m_slot_buffers[found] == result.first) {
 			entry = {vaddr, size, registration, cpu, found, result.second};
 		}
+	} else if (FrameBreakdown::Verbose()) {
+		auto& c = FrameBreakdown::g_counters;
+		FrameBreakdown::VAdd(result.first == &m_stream_buffer             ? c.obtain_nostore_stream
+		                     : registration != m_registration_generation ? c.obtain_nostore_registration
+		                                                                 : c.obtain_nostore_cpu);
 	}
 	return result;
 }
