@@ -354,6 +354,8 @@ public:
 	// Whether bindings made at texture epoch `epoch` and image set epoch `set_epoch` still hold:
 	// no image changed since, or the set of images did not and none of the stage's direct images did.
 	[[nodiscard]] bool KeptImagesHold(const PreparedBindings& prepared, uint64_t epoch, uint64_t set_epoch);
+	// The same for one binding: the set of images and the binding's image are unchanged.
+	[[nodiscard]] bool KeptImageHolds(const TextureBinding& binding, uint64_t epoch, uint64_t set_epoch);
 	// table_candidate rejects (EXIT) a texture whose guest memory cannot be read, for tables
 	// that keep T#s of freed textures, and declines depth/color conversions. examined receives
 	// the guest range before the lookup depends on the texture cache: a failure without it

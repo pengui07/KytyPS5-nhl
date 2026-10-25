@@ -1423,6 +1423,14 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.lean             = LeanDrawsEnabled() && same_images && memo->holder == &prepared &&
 	                memo->lean_epoch != UINT64_MAX && image_descs.size() == program.info.images.size() &&
 	                KeptImagesHold(prepared, memo->lean_epoch, memo->lean_set_epoch);
+	// A draw that changes some of the T#s: while the bindings of the program's last draw held to its
+	// end and the image set is unchanged, a slot with the same T# keeps its binding as long as its
+	// image did not change either (the rebind and the transitions run for the stage).
+	const bool     slots_held = LeanDrawsEnabled() && !prepared.lean && !same_images && slot_reuse &&
+	                        memo->holder == &prepared && memo->lean_epoch != UINT64_MAX &&
+	                        image_descs.size() == program.info.images.size();
+	const uint64_t held_epoch     = memo->lean_epoch;
+	const uint64_t held_set_epoch = memo->lean_set_epoch;
 	if (!prepared.lean) {
 		if (ExecRegions::Enabled()) {
 			ExecRegions::Note(!same_images                    ? ExecRegions::LeanOtherImages
@@ -1473,6 +1481,26 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		if (!resource.written &&
 		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			auto* derived = image_descs[i];
+			if (slots_held && derived != nullptr && last_images[i] == snapshot.images[i] &&
+			    KeptImageHolds(prepared.images[i], held_epoch, held_set_epoch)) {
+				ExecRegions::Note(ExecRegions::LeanSlots);
+				auto& binding = prepared.images[i];
+				if (LeanVerifyEnabled()) {
+					TextureBinding check;
+					if (!derived->found.valid || !ReuseTextureLookup(*derived, check) ||
+					    check.image_id != binding.image_id || check.image_view != binding.image_view) {
+						EXIT("lean draw: kept image slot %u of shader 0x%016" PRIx64 " no longer reuses its lookup\n",
+						     i, program.shader_hash);
+					}
+				}
+				// As a reuse leaves it, for RebindImages().
+				binding.lookup = derived;
+				binding.reused = true;
+				auto& image              = m_context.GetTextureCache().GetImage(binding.image_id);
+				image.tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
+				BindImage(binding.image_id, false);
+				continue;
+			}
 			if (!same_images && !(slot_reuse && last_images[i] == snapshot.images[i])) {
 				ExecRegions::Note(ExecRegions::ImageMapLookups);
 				ExecRegions::InDraw(ExecRegions::StagesImages);
@@ -2042,6 +2070,14 @@ bool RenderExecutor::KeptImagesHold(const PreparedBindings& prepared, uint64_t e
 		}
 	}
 	return true;
+}
+
+bool RenderExecutor::KeptImageHolds(const TextureBinding& binding, uint64_t epoch, uint64_t set_epoch) {
+	if (g_image_set_epoch.load(std::memory_order_relaxed) != set_epoch) {
+		return false;
+	}
+	const auto* image = m_context.GetTextureCache().m_slot_images.try_get(binding.image_id);
+	return image != nullptr && image->binding_epoch.load(std::memory_order_relaxed) <= epoch;
 }
 
 void RenderExecutor::FinishLeanBindings(std::span<PreparedBindings* const> stages) {

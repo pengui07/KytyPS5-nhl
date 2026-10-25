@@ -1465,6 +1465,16 @@ Toward 120 fps (2026-10-23):
   host copy thread, as the BDA synchronization already did. Samples in play: protect calls 1.9 ->
   0.6% of the thread, `SynchronizeBuffer` 4.8 -> 3.0%. (An in-play in-boot A/B was too noisy:
   scenes ran 47-82 fps.)
+* Per-slot keep, now with the per-image stamps: in a draw that changes some of its T#s, a slot with
+  the same T# keeps its binding (no `ReuseTextureLookup`) while the program's last bindings held to
+  their end, the image set is unchanged and the slot's image did not change (`KeptImageHolds()`);
+  the rebind and transitions run for the stage. `KYTY_LEAN_VERIFY=1` checks each kept slot: clean in
+  the menus and 50 s of play. Paused in-boot A/B: draw 3.117 -> 3.103 us.
+* The shipped `assets/cfgGlobal.json` (which the launcher applies over the user's settings) had
+  `KYTY_PERF_STATS=1`: the statistics timers and counters on every hot path, and BDA batch
+  boundaries emitted as operations of their own. Two boots in play: draw 4.38 vs 3.2-3.5 us,
+  dispatch 2.66 vs 2.1 us; a 3-minute match 55.7 fps at 60 Hz with it, 76-78 without. It is now
+  `0` there (set it to `1` again for the NHL27BDA, NHL27BUFFERS and other per-frame statistics).
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

@@ -65,7 +65,7 @@
       "KYTY_PM4_CLEAN_METADATA": "1",
       "KYTY_PERF_NO_SYNC_READBACK": "1",
       "KYTY_LDS_NO_READBACK": "1",
-      "KYTY_PERF_STATS": "1",
+      "KYTY_PERF_STATS": "0",
       "KYTY_PERF_DRAW_DETAIL": "0",
       "KYTY_PERF_GPU_TIMING": "0",
 
