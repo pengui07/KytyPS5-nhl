@@ -1618,6 +1618,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                         memo.registration)) {
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
+			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[0]);
 			continue;
 		}
 		if (written && memo.buffer != nullptr && memo.written && memo.address == source.address &&
@@ -1627,6 +1628,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			m_context.GetTextureCache().InvalidateMemoryFromGPU(source.address, source.size);
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
+			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[1]);
 			continue;
 		}
 		if (texel && memo.buffer != nullptr && memo.image_version != 0 && memo.address == source.address &&
@@ -1635,7 +1637,40 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                         memo.registration, memo.image_version)) {
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
+			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[2]);
 			continue;
+		}
+		// The same range bound by another slot or draw before (see m_bind_memo).
+		const uint8_t kind      = plain ? 1 : written ? 2 : texel ? 3 : 0;
+		auto&         bind_memo = (*m_bind_memo)[((source.address ^ (source.size << 40u) ^ kind) *
+		                                          0x9E3779B97F4A7C15ull >> 32u) % BindMemoSlots];
+		if (kind != 0 && bind_memo.kind == kind && bind_memo.slot.address == source.address &&
+		    bind_memo.slot.size == source.size && bind_memo.slot.buffer != nullptr) {
+			auto&      global = bind_memo.slot;
+			const bool holds =
+			    kind == 1   ? cache.PlainReadHolds(*global.buffer, source.address, source.size, global.cpu_generation,
+			                                       global.registration)
+			    : kind == 2 ? cache.WrittenBindHolds(*global.buffer, source.address, source.size,
+			                                         global.ranges_version, global.registration)
+			                : cache.TexelReadHolds(*global.buffer, source.address, source.size, global.cpu_generation,
+			                                       global.registration, global.image_version);
+			if (holds) {
+				if (kind == 2) m_context.GetTextureCache().InvalidateMemoryFromGPU(source.address, source.size);
+				prepared.buffers[index] = global.info;
+				pack_memory_offset(index, global.buffer_offset);
+				memo = global;
+				FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_global_hit[kind - 1]);
+				continue;
+			}
+		}
+		if (FrameBreakdown::Verbose() && (plain || written || texel)) {
+			auto&      c    = FrameBreakdown::g_counters;
+			const int  kind = written ? 1 : texel ? 2 : 0;
+			auto&      slot = memo.buffer == nullptr                                         ? c.slot_none[kind]
+			                  : memo.address == source.address && memo.size == source.size ? c.slot_same[kind]
+			                  : memo.buffer->IsInBounds(source.address, source.size)        ? c.slot_inside[kind]
+			                                                                                : c.slot_other[kind];
+			FrameBreakdown::VAdd(slot);
 		}
 		const auto cpu           = cache.CpuModificationGeneration();
 		const auto registration  = cache.RegistrationGeneration();
@@ -1657,6 +1692,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			        .image_version  = image_version,
 			        .info           = prepared.buffers[index],
 			        .buffer_offset  = buffer_offset};
+			bind_memo = {memo, kind};
 		} else {
 			memo.buffer = nullptr;
 		}

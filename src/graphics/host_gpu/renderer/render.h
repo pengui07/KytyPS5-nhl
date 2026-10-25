@@ -446,6 +446,15 @@ private:
 	}
 	// The last TextureDescDerivation::Found::serial given out.
 	uint64_t m_found_serial = 0;
+	// Buffer bindings by range, in front of the lookups a slot memo miss makes: a program's slot sees
+	// a new range almost every draw (meshes' vertex streams: in play 8,500 of the 18,600 texel binds
+	// a frame missed their slot memo), and the same ranges come back every frame (see RebindBuffers()).
+	static constexpr size_t BindMemoSlots = 16384;
+	struct BindMemo {
+		PreparedBindings::BufferSlotMemo slot;
+		uint8_t                          kind = 0; // 1 plain, 2 written, 3 texel
+	};
+	std::unique_ptr<std::array<BindMemo, BindMemoSlots>> m_bind_memo = std::make_unique<std::array<BindMemo, BindMemoSlots>>();
 
 	// The host sampler for a sampler binding; see NativeSampler().
 	[[nodiscard]] vk::Sampler NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
