@@ -1360,6 +1360,36 @@ Toward 120 fps (2026-10-23):
   Loops tested on VCC or EXEC (`d46af19f`'s two step loops) still exit through a ballot. Soak (the first
   boot recompiling every shader): 71.3 / 73.4 / 78.6 fps in 60 Hz play (CPU-bound), 49-51 in the game's
   30 Hz scenes (were 45-48); no errors, frames normal.
+* Merge of `pengui07/KytyPS5-nhl-p` `nhl27-eadb` (Petr's synced nhl27, upstream main, Stage 2):
+  its switches `KYTY_PROGRAM_LOCK_SPLIT`, `KYTY_FILL_PATTERNS`, `KYTY_UNMAP_BUFFER_WAIT`,
+  `KYTY_DIRECT_GPU_READS`, `KYTY_ASYNC_READBACK` and `KYTY_SPECULATE_STRICT` (all default off) had
+  taken experiment bits 38-43, which this line uses, and their defaults would have switched off
+  ExecBranches, BdaLoadGroups and DrawResolver: they are environment-only now
+  (`Experiments::EnvEnabled`). PGO v17 afterwards. Test builds leave out the Slint launcher (it needs
+  Rust and downloads Slint): `-DKYTY_BUILD_LAUNCHER=OFF`.
+* Why the material pixel shaders kept two register sets after SCC branches: in `33037c60` (191
+  VGPRs), replacing the ballots of the branches that skip an "if" on EXEC or VCC (`s_cbranch_execz`)
+  with per-lane tests gave 145 VGPRs; replacing those of the loop exits gave nothing. Such a branch
+  runs the body for every lane whenever one lane needs it, and the body's VGPR writes select the new
+  value against the old one under EXEC, so both stay live through the body.
+* Bit 49 `KYTY_LANE_SKIPS` (default on; key bit 2147483648; was AbPending4, AbPending (38) is the
+  free A/B bit now, its two old alternates removed): such a selection branches per lane where the body
+  cannot tell (`FindLaneSkip` in `spirvEmitterProgram.cpp`): it stays inside the selection, every side
+  effect, ballot, first-lane read and EXEC/VCC branch in it is under an EXEC that implies the lane
+  condition (also through a lane's bit of a saved SGPR mask), it reads no other lane, and every merge
+  value is the old one in the other lanes or is repaired after the merge's phis (a lane mask implied
+  by the condition is cleared there, a value the same in every lane that entered, an SGPR, comes from
+  the first of them). Selections are decided innermost first, as repaired values are uniform again.
+  16463 of 21547 such selections branch per lane. `33037c60` 191 -> 150 VGPRs, 15175 -> 13738
+  instructions; `136eed67` 209 -> 222 VGPRs, 18905 -> 18209; `9eaaf80c` 216 -> 220, 18780 -> 18239
+  (their loops re-enable lanes with `S_ORN2_SAVEEXEC`, so their outer selections keep the ballot, and
+  per-lane bodies under a uniform selection cost registers). Keeping every selection inside a kept one
+  on its ballot made it much worse (`136eed67` 252 VGPRs), so mixed nests stay. Paused GPU A/B, 4
+  settled rounds: -1.8, -5.8, -0.4, -2.7% per flip. In play (CPU-bound) an in-boot A/B, 8 rounds,
+  stayed within scene noise (60 Hz windows 71.9 vs 69.3 fps); soak 73.6 / 72.6 / 73.4 fps at 60 Hz,
+  no errors, frames normal. `KYTY_DBG_LANE_SKIPS=1` prints per shader the
+  selections, those per lane and the repairs (`NHL27LANESKIP`), `=2` also why each other one kept its
+  ballot (`NHL27LANESKIPNO`).
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

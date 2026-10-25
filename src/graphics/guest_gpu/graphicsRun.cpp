@@ -1081,9 +1081,9 @@ void GuestGpu::ResolveThread() {
 			const auto& shaders = *operation->state.shaders;
 			const auto  key     = shaders.GetPs().ps_regs.data_addr ^ shaders.GetVs().gs_regs.data_addr ^
 			                 shaders.GetVs().es_regs.data_addr;
-			// With a third resolver, a third of the draws each (AbPending4: halves, as before it).
+			// With a third resolver, a third of the draws each.
 			const uint64_t hash = (key >> 8u) * 0x9e3779b97f4a7c15ull;
-			const uint32_t part = DrawResolverCount() == 2 && !Common::Experiments::Enabled(Common::Experiments::AbPending4)
+			const uint32_t part = DrawResolverCount() == 2
 			                          ? (hash < 0x5555555555555555ull ? 0u : hash < 0xaaaaaaaaaaaaaaaaull ? 1u : 2u)
 			                          : static_cast<uint32_t>(hash >> 63u);
 			if (part != 0) {
@@ -1875,7 +1875,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		// The pipelined command processor's writes reach here: they take the label path as well
 		// (both copies updated, nothing downloaded), not PrepareGpuWrite, which downloads the
 		// page's GPU-written bytes and waited for their writer, 6-23 ms about once a second in
-		// play (AbPending4: always PrepareGpuWrite).
+		// play.
 		// Execute() did not wait for the host copy queue: the labels go through it, and a write made
 		// here waits for it first.
 		auto* const deferred = m_labels_deferred ? GetScheduler().HostCopies() : nullptr;

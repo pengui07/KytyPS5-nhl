@@ -205,6 +205,13 @@ inline std::atomic<bool> g_shader_ftz32 {false};
 [[nodiscard]] inline bool ShaderSccBranches() {
 	return Common::Experiments::Enabled(Common::Experiments::SccBranches);
 }
+// Codegen option: experiment LaneSkips (key bit 2147483648). A selection skipped by a branch on EXEC
+// or VCC (s_cbranch_execz around an "if") tested its condition through a ballot, so every lane ran
+// the body and selected each VGPR's new value against the old one, which kept both live (33037c60
+// 191 -> 150 VGPRs per lane, paused GPU per flip -2.7%); see FindLaneSkip.
+[[nodiscard]] inline bool ShaderLaneSkips() {
+	return Common::Experiments::Enabled(Common::Experiments::LaneSkips);
+}
 // Codegen option: experiment AlignedBufferOffsets (key bit 8388608). A buffer binding starts at the
 // guest base aligned down to the device's storage offset alignment, and the shader adds the rest
 // (the binding prefix, from the shader data). Scalar buffer reads align the base and the offset
@@ -253,7 +260,7 @@ inline std::atomic<bool> g_shader_storage_align4 {false};
 	       (ShaderAlignedBufferOffsets() ? 8388608u : 0u) | (ShaderNativeFract() ? 16777216u : 0u) |
 	       (ShaderNativeF16Ops() ? 33554432u : 0u) | (ShaderMovRelArrays() ? 67108864u : 0u) |
 	       (ShaderBdaTwoLookups() ? 134217728u : 0u) | (ShaderExecRunConstReads() ? 268435456u : 0u) |
-	       (ShaderSccBranches() ? 536870912u : 0u);
+	       (ShaderSccBranches() ? 536870912u : 0u) | (ShaderLaneSkips() ? 2147483648u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);

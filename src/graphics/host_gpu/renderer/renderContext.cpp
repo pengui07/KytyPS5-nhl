@@ -289,16 +289,17 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		// copies, host-only completions (cache bookkeeping, flips, interrupts) never touch the
 		// range, and completions writing guest memory (downloads) skip what was unmapped since
 		// they were queued (WriteUnlessUnmapped), so without GPU-owned pages or images in the range
-		// the unmap needs no drain (AbPending: it drains for those completions too).
+		// the unmap needs no drain.
 		if (m_command_scheduler.Active()) {
 			m_command_scheduler.PopPendingOperations();
 		}
 		const bool active  = m_command_scheduler.Active();
 		const bool gpu     = active && m_buffer_cache.IsRegionGpuModified(vaddr, size);
 		const bool images  = active && !gpu && m_texture_cache.HasImagesInRegion(vaddr, size);
-		const bool pending = active && !gpu && !images && m_command_scheduler.HasPendingGuestOperations(vaddr, size);
-		bool       drain   = gpu || images ||
-		                   (pending && Common::Experiments::Enabled(Common::Experiments::AbPending));
+		// Ranges with queued guest-memory completions only, for the unmap statistics.
+		const bool pending = CpReadDebugEnabled() && active && !gpu && !images &&
+		                     m_command_scheduler.HasPendingGuestOperations(vaddr, size);
+		bool       drain   = gpu || images;
 		// Experiment UnmapBufferWait: when only GPU-written buffer bytes are in the range, the
 		// write-back below downloads them, and a download already waits for the submission that
 		// last wrote the buffer (or flushes and waits when the writer is still being recorded).
@@ -480,10 +481,9 @@ void RenderContext::PrepareBda() {
 			// Drained regions outside the mapped ranges are dropped, so only memory mapped since the
 			// last synchronization can hold CPU-dirty pages no drain will bring back (pages left for
 			// later epochs are queued again); unmaps leave nothing to upload. The full scan covers
-			// just that memory (AbPending: all mapped ranges after any mapping change).
+			// just that memory.
 			const bool mapping_changed = m_mapping_generation != m_bda_mapping_generation;
-			const bool new_only        = m_operation_epoch_valid &&
-			                      !Common::Experiments::Enabled(Common::Experiments::AbPending);
+			const bool new_only        = m_operation_epoch_valid;
 			const bool full = new_only ? !m_bda_new_ranges.Empty() : mapping_changed;
 			m_bda_stats.full_scans += full;
 			if (full) {
