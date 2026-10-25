@@ -30,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <string>
@@ -2147,6 +2148,16 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	// As for BDA (SynchronizeBuffersInRangesBefore()): the pages this upload watches again are
+	// protected by the host copy thread, before the upload's copies, which it makes as well. In play
+	// the protect calls of uploads went from 1.9% to 0.6% of the execution thread's samples
+	// (SynchronizeBuffer 4.8% -> 3.0%).
+	std::optional<PageManager::DeferredProtectionScope> deferred;
+	if (auto* const host_copies = m_scheduler.HostCopies();
+	    host_copies != nullptr && !PageManager::DeferringProtection() && m_staging_buffer.IsCoherent() &&
+	    GuestGpu::IsGpuThread()) {
+		deferred.emplace(host_copies);
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;

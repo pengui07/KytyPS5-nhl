@@ -1454,6 +1454,17 @@ Toward 120 fps (2026-10-23):
   association) advance `g_image_set_epoch`: kept bindings hold while the set is unchanged and none
   of their own images changed (`KeptImagesHold()`), whatever other images did. `KYTY_LEAN_VERIFY=1`:
   no difference in the menus and 60 s of play. Paused in-boot A/B: draw 3.297 -> 3.278 us.
+* Execution-thread waits in play (sampled): 1.5% in `CommandScheduler::WaitPriorityOperations`
+  from `PopPendingOperations` (a completed pending operation waited for the priority thread's
+  downloads of its tick). Draws and dispatches now call `PopPendingOperations(false)`: such an
+  operation stays queued for a later call. `Image::Transit` returns before `GetBarriers` when the
+  whole image is already in the wanted layout and access. Cold/warm timing (`KYTY_DBG_WARM`):
+  a transition 22 ns, a plain buffer memo check 14 / 10 ns, a texture lookup reuse 51 / 23 ns.
+* Deferred protection for every upload: `SynchronizeBuffer` on the execution thread (host copy
+  thread on, coherent staging) defers the protections of pages that gain write watchers to the
+  host copy thread, as the BDA synchronization already did. Samples in play: protect calls 1.9 ->
+  0.6% of the thread, `SynchronizeBuffer` 4.8 -> 3.0%. (An in-play in-boot A/B was too noisy:
+  scenes ran 47-82 fps.)
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
