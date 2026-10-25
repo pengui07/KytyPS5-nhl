@@ -157,15 +157,18 @@ struct CpuCrumb {
 	const char* kind = nullptr;
 	uint64_t    hash_a = 0, hash_b = 0, info = 0, tick = 0;
 };
-std::array<CpuCrumb, 16384> g_cpu_crumbs;
-std::atomic<uint64_t>       g_cpu_crumb_next {0};
-const MasterSemaphore*      g_crumb_master = nullptr;
+// About a frame of draws and dispatches, small enough to stay in the L2 cache (16384 entries, 640
+// KiB, missed it: 0.9% of the execution thread). The execution thread records them all.
+std::array<CpuCrumb, 4096> g_cpu_crumbs;
+std::atomic<uint64_t>      g_cpu_crumb_next {0};
+const MasterSemaphore*     g_crumb_master = nullptr;
 
 void NoteCpuCrumb(const char* kind, uint64_t hash_a, uint64_t hash_b, uint64_t info) {
 	if (g_crumb_master == nullptr) {
 		return;
 	}
-	const auto n = g_cpu_crumb_next.fetch_add(1, std::memory_order_relaxed);
+	const auto n = g_cpu_crumb_next.load(std::memory_order_relaxed);
+	g_cpu_crumb_next.store(n + 1, std::memory_order_relaxed);
 	g_cpu_crumbs[n % g_cpu_crumbs.size()] = {kind, hash_a, hash_b, info, g_crumb_master->CurrentTick()};
 }
 
@@ -1005,6 +1008,40 @@ void GpuTraceCmdEnd(const CommandRecorder& cmd, uint32_t slot_plus_one) {
 }
 
 } // namespace
+
+uint32_t HostTraceBegin(const CommandRecorder& cmd, const char* kind, uint64_t identity) {
+	static const bool no_cmds = std::getenv("KYTY_IDLE_TRACE_NO_CMDS") != nullptr;
+	if (no_cmds || !Common::EventTrace::g_capturing.load(std::memory_order_relaxed)) {
+		return 0;
+	}
+	std::lock_guard lock(g_gtrace.mutex);
+	// Only once a guest command initialized the trace (it needs the graphics context).
+	if (!g_gtrace.initialized || !g_gtrace.available || g_gtrace.cmd_pool == nullptr) {
+		return 0;
+	}
+	GpuTraceMapCaptureLocked();
+	g_gtrace.shader_rows[GpuTraceShaderKey {kind, identity, 0, 0}]++;
+	const uint32_t index = g_gtrace.cmd_open_count++;
+	if (g_gtrace.cmd_free.empty()) {
+		GpuTracePollLocked();
+		if (g_gtrace.cmd_free.empty()) {
+			g_gtrace.cmd_skipped++;
+			return 0;
+		}
+	}
+	const uint32_t slot = g_gtrace.cmd_free.back();
+	g_gtrace.cmd_free.pop_back();
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkResetQueryPool(static_cast<VkDevice>(g_gtrace.device),
+	                                               static_cast<VkQueryPool>(g_gtrace.cmd_pool),
+	                                               slot * 2u, 2u);
+	g_gtrace.cmd_open.push_back({slot, index, false, identity, 0});
+	cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, g_gtrace.cmd_pool, slot * 2u);
+	return slot + 1u;
+}
+
+void HostTraceEnd(const CommandRecorder& cmd, uint32_t slot_plus_one) {
+	GpuTraceCmdEnd(cmd, slot_plus_one);
+}
 
 namespace {
 

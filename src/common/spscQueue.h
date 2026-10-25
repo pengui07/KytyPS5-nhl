@@ -209,6 +209,18 @@ public:
 		return Take(head);
 	}
 
+	// Consumer: the element `ahead` places after the next one Pop() returns, if it is there yet.
+	[[nodiscard]] const T* Peek(uint64_t ahead) {
+		const auto head = m_head.load(std::memory_order_relaxed) + ahead;
+		if (m_consumer_tail <= head) {
+			m_consumer_tail = m_tail.load(std::memory_order_acquire);
+			if (m_consumer_tail <= head) {
+				return nullptr;
+			}
+		}
+		return Element(head);
+	}
+
 	// Returns nothing when the ring is empty.
 	[[nodiscard]] std::optional<T> TryPop() {
 		const auto head = m_head.load(std::memory_order_relaxed);

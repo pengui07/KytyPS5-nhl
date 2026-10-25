@@ -134,6 +134,9 @@ struct GpuOperation {
 	// The command processor processed a WAIT_REG_MEM since the previous operation: the guest may
 	// have written memory the operations before it read.
 	bool after_wait = false;
+	// A KYTY_BDA_BATCH boundary was passed since the previous draw or dispatch (it is executed
+	// before this one instead of as an operation of its own).
+	bool bda_boundary = false;
 	// The write epoch when the command processor emitted the operation (see RegionManager).
 	uint32_t write_epoch = 0;
 	// KYTY_IDLE_TRACE: the PM4 packet that produced the operation (opcode | IT_NOP R code << 8,

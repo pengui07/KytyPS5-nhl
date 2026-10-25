@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <unordered_map>
 #include <cstdarg>
 #include <cstdio>
@@ -222,35 +223,87 @@ struct PageManager::Impl {
 	struct Region {
 		std::atomic_flag                    lock = ATOMIC_FLAG_INIT;
 		std::array<PageState, REGION_PAGES> pages;
-		// Deferred protection: pages whose protection the host copy thread still has to apply
-		// (from their watchers then), and whether an apply call is queued.
+		// Pages whose protection still has to be applied (from their watchers then), and whether
+		// the host copy thread has an apply call queued (deferred protection).
 		std::array<uint64_t, (REGION_PAGES + 63) / 64> stale {};
 		std::atomic<bool>                               apply_queued {false};
-		uint64_t                                        base = 0;
+		// Held across an apply, protection calls included, so applies of a region run one at a
+		// time and the last one sees the latest watchers. The spin lock is held only to read them.
+		std::mutex apply_mutex;
+		uint64_t   base = 0;
 	};
 	inline static thread_local HostCopyQueue* t_deferred_queue = nullptr;
+	// ReleaseScope: the regions whose released pages the scope applies when it ends (zeroed:
+	// thread storage).
+	struct ReleaseList {
+		std::array<Region*, 8> regions;
+		size_t                 count;
+		bool                   active;
+	};
+	inline static thread_local ReleaseList t_release;
 
 	// Host copy thread: protects the region's stale pages as their watchers want now.
 	static void ApplyStale(void* argument) noexcept {
 		auto& region = *static_cast<Region*>(argument);
 		region.apply_queued.store(false, std::memory_order_release);
-		SpinGuard lock(region.lock);
-		size_t page = 0;
-		while (page < REGION_PAGES) {
-			if ((region.stale[page / 64] >> (page % 64) & 1u) == 0) {
-				page++;
-				continue;
+		ApplyStaleNow(region);
+	}
+
+	// Protects the region's stale pages as their watchers want now: runs of pages with the same
+	// protection are collected under the spin lock and protected after it is released.
+	static void ApplyStaleNow(Region& region) noexcept {
+		struct Run {
+			size_t                      first = 0;
+			size_t                      count = 0;
+			Common::VirtualMemory::Mode perms = Common::VirtualMemory::Mode::NoAccess;
+		};
+		std::lock_guard     apply_lock(region.apply_mutex);
+		std::array<Run, 16> runs;
+		for (size_t page = 0; page < REGION_PAGES;) {
+			size_t count = 0;
+			{
+				SpinGuard lock(region.lock);
+				while (page < REGION_PAGES && count < runs.size()) {
+					const auto word = region.stale[page / 64] >> (page % 64);
+					if (word == 0) {
+						page = (page / 64 + 1) * 64;
+						continue;
+					}
+					page += static_cast<size_t>(std::countr_zero(word));
+					const auto perms = region.pages[page].Perms();
+					size_t     end   = page;
+					while (end < REGION_PAGES && (region.stale[end / 64] >> (end % 64) & 1u) != 0 &&
+					       region.pages[end].Perms() == perms) {
+						region.stale[end / 64] &= ~(uint64_t {1} << (end % 64));
+						end++;
+					}
+					runs[count++] = {page, end - page, perms};
+					page          = end;
+				}
 			}
-			const auto perms = region.pages[page].Perms();
-			size_t     end   = page;
-			while (end < REGION_PAGES && (region.stale[end / 64] >> (end % 64) & 1u) != 0 &&
-			       region.pages[end].Perms() == perms) {
-				region.stale[end / 64] &= ~(uint64_t {1} << (end % 64));
-				end++;
+			for (size_t i = 0; i < count; i++) {
+				Protect(region.base + runs[i].first * PAGE_SIZE, runs[i].count * PAGE_SIZE,
+				        runs[i].perms);
 			}
-			Protect(region.base + page * PAGE_SIZE, (end - page) * PAGE_SIZE, perms);
-			page = end;
 		}
+	}
+
+	// Whether the calling thread's ReleaseScope takes the region (false: apply it now).
+	static bool DeferRelease(Region& region) noexcept {
+		auto& list = t_release;
+		if (!list.active) {
+			return false;
+		}
+		for (size_t i = 0; i < list.count; i++) {
+			if (list.regions[i] == &region) {
+				return true;
+			}
+		}
+		if (list.count == list.regions.size()) {
+			return false;
+		}
+		list.regions[list.count++] = &region;
+		return true;
 	}
 
 	Impl() {
@@ -325,20 +378,33 @@ struct PageManager::Impl {
 	template <bool track, bool is_read, bool masked>
 	void UpdateRegionWatchers(Region& region, uint64_t base_addr, size_t first, size_t last,
 	                          const RegionBits* mask = nullptr) {
-		// Deferred protection: only pages gaining write watchers (see DeferredProtectionScope).
-		auto* const deferred = track && !is_read ? t_deferred_queue : nullptr;
-		bool        apply    = false;
+		bool apply = false;
 		UpdateRegionWatchersLocked<track, is_read, masked>(region, base_addr, first, last, mask,
-		                                                     deferred != nullptr, apply);
-		// Queued after the lock is released: the copy thread takes it to apply.
-		if (apply && !region.apply_queued.exchange(true, std::memory_order_acq_rel)) {
-			deferred->Call(&ApplyStale, &region);
+		                                                     apply);
+		if (!apply) {
+			return;
 		}
+		// Deferred protection: only pages gaining write watchers (see DeferredProtectionScope).
+		// Queued after the lock is released: the copy thread takes it to apply.
+		if constexpr (track && !is_read) {
+			if (auto* const deferred = t_deferred_queue; deferred != nullptr) {
+				if (!region.apply_queued.exchange(true, std::memory_order_acq_rel)) {
+					deferred->Call(&ApplyStale, &region);
+				}
+				return;
+			}
+		}
+		if constexpr (!track) {
+			if (DeferRelease(region)) {
+				return;
+			}
+		}
+		ApplyStaleNow(region);
 	}
 
 	template <bool track, bool is_read, bool masked>
 	void UpdateRegionWatchersLocked(Region& region, uint64_t base_addr, size_t first, size_t last,
-	                                const RegionBits* mask, bool defer, bool& apply) {
+	                                const RegionBits* mask, bool& apply) {
 		SpinGuard lock(region.lock);
 		auto      perms                 = region.pages[first].Perms();
 		uint64_t  range_begin           = 0;
@@ -348,14 +414,10 @@ struct PageManager::Impl {
 
 		const auto release_pending = [&] {
 			if (range_bytes != 0) {
-				if (defer) {
-					for (auto page = range_begin; page < range_begin + range_bytes / PAGE_SIZE; page++) {
-						region.stale[page / 64] |= uint64_t {1} << (page % 64);
-					}
-					apply = true;
-				} else {
-					Protect(base_addr + range_begin * PAGE_SIZE, range_bytes, perms);
+				for (auto page = range_begin; page < range_begin + range_bytes / PAGE_SIZE; page++) {
+					region.stale[page / 64] |= uint64_t {1} << (page % 64);
 				}
+				apply                 = true;
 				range_bytes           = 0;
 				potential_range_bytes = 0;
 			}
@@ -444,6 +506,41 @@ PageManager::DeferredProtectionScope::~DeferredProtectionScope() {
 
 bool PageManager::DeferringProtection() noexcept {
 	return Impl::t_deferred_queue != nullptr;
+}
+
+PageManager::ReleaseScope::ReleaseScope(bool enable) noexcept
+    : m_owner(enable && !Impl::t_release.active) {
+	if (m_owner) {
+		Impl::t_release.active = true;
+	}
+}
+
+PageManager::ReleaseScope::~ReleaseScope() {
+	if (!m_owner) {
+		return;
+	}
+	auto& list  = Impl::t_release;
+	list.active = false;
+	for (size_t i = 0; i < list.count; i++) {
+		Impl::ApplyStaleNow(*list.regions[i]);
+	}
+	list.count = 0;
+}
+
+bool PageManager::ApplyPending(uint64_t vaddr) {
+	auto* region = m_impl->FindRegion(vaddr);
+	if (region == nullptr) {
+		return false;
+	}
+	const auto page = static_cast<size_t>((vaddr % REGION_SIZE) / PAGE_SIZE);
+	{
+		SpinGuard lock(region->lock);
+		if ((region->stale[page / 64] >> (page % 64) & 1u) == 0) {
+			return false;
+		}
+	}
+	Impl::ApplyStaleNow(*region);
+	return true;
 }
 
 PageManager::~PageManager() = default;

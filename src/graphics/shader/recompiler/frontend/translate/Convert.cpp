@@ -23,6 +23,8 @@ void Translator::V_CVT_F32_I32(const Decoder::Instruction& inst) {
 	             ir.Emit(IR::ValueOpcode::ConvertF32S32, {ReadU32(SourceAt(inst, 0))}));
 }
 
+// ConvertU32F32 / ConvertS32F32 saturate to the full 32-bit range like the guest (NaN gives 0;
+// see EmitF32ToU32): clamping before them as well doubled the code of each conversion.
 void Translator::V_CVT_U32_F32(const Decoder::Instruction& inst) {
 	const auto value = IR::F32(ReadOperand(SourceAt(inst, 0), IR::Type::F32));
 	WriteOperand(DestinationOperand(inst), ir.Emit(IR::ValueOpcode::ConvertU32F32, {value}));

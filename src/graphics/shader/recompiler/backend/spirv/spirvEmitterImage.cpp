@@ -280,6 +280,22 @@ uint32_t ResultVector(ValueEmitContext& ctx, uint32_t value,
 					                              pair);
 					return bits;
 				};
+				if (ShaderF16ImagePack()) {
+					// The lanes as f16 (v_cvt_f16_f32, to nearest even), one register: see
+					// ShaderF16Converts.
+					ctx.state.builder.RequireCapability(spv::CapabilityFloat16);
+					const auto half   = ctx.state.builder.Type(spv::OpTypeFloat, 16u);
+					const auto low_h  = Unary(ctx.state, spv::OpFConvert, half, low);
+					const auto high_h = high_index < mem.component_count
+					                        ? Unary(ctx.state, spv::OpFConvert, half, high)
+					                        : ctx.state.builder.Constant(spv::OpConstant, half, 0u);
+					const auto pair   = ctx.state.builder.AllocateId();
+					ctx.state.builder.AddFunction(spv::OpCompositeConstruct,
+					                              ctx.state.builder.Type(spv::OpTypeVector, half, 2u), pair,
+					                              low_h, high_h);
+					packed[word] = Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state), pair);
+					continue;
+				}
 				packed[word] = pack_lane(low);
 				if (high_index < mem.component_count) {
 					packed[word] = Binary(ctx.state, spv::OpBitwiseOr, TypeU32(ctx.state),

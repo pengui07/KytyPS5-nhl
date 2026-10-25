@@ -72,13 +72,17 @@ inline std::atomic<uint64_t> g_operation {0};
 
 inline void SetOperation(uint64_t sequence) {
 	t_operation = sequence;
-	g_operation.store(sequence, std::memory_order_relaxed);
+	// Stored before the operation's completion is published (GuestGpu's executed counter).
+	g_operation.store(sequence, std::memory_order_release);
 }
 
 [[nodiscard]] inline uint64_t CurrentOperation() {
-	// Writes of other threads (completions, guest calls) are not ordered with the operations: those
-	// pages are checked from then on.
-	return t_operation != 0 ? t_operation : ~uint64_t {0};
+	// Writes of other threads (labels the copy thread writes, download publishes) belong after the
+	// operation the execution thread runs now: a resolve that read the bytes before them had seen at
+	// most the completion of an operation before that one. (Raising them to "always check" kept
+	// every read ahead on their pages from ever being skipped: all of a dispatch's reads and five of
+	// a draw's 35.)
+	return t_operation != 0 ? t_operation : g_operation.load(std::memory_order_acquire) + 1;
 }
 
 // Records that operation `sequence` writes [vaddr, vaddr + size).

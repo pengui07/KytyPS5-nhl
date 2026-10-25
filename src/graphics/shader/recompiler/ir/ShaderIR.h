@@ -619,6 +619,8 @@ struct ShaderInfo {
 	bool                            function_lds_lane_slots       = false;
 	uint32_t                        function_lds_dwords           = 0;
 	bool                            function_scratch              = false;
+	// Experiment MovRelArrays: the register arrays (RegArrayLoad/Store immediates) the program uses.
+	std::vector<uint32_t>           reg_arrays;
 	bool                            pixel_valid_mask              = false;
 	bool                            buffer_int64_atomics          = false;
 	bool                            buffer_u8                     = false;

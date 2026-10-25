@@ -60,6 +60,8 @@ public:
 	// without_faults: bytes the GPU may have written since fail the check instead of being read back
 	// (a plain load of their page would fault and wait for all queued GPU work).
 	[[nodiscard]] bool StillValid(bool without_faults = false) const;
+	// Execution thread, before the operation that checks it: pulls its arrays into the cache.
+	void Prefetch() const;
 	// NHL27AHEAD (KYTY_PERF_STATS): how ahead resolutions end. Resolve thread: a finished
 	// resolution (ok or why it failed). Execution thread: a draw without a resolution.
 	static void NoteResolved(const GuestReadLog& log);
@@ -114,6 +116,9 @@ struct ProgramResolution {
 		reads.Clear();
 		stages = 0;
 	}
+	// Execution thread, before the operation that uses it: step 0 pulls this structure (the
+	// snapshot and log headers) into the cache, step 1 the arrays they point to.
+	void Prefetch(int step) const;
 };
 
 struct GraphicContext;

@@ -24,6 +24,7 @@
 #include "graphics/host_gpu/renderer/depthAliasLog.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
+#include <xmmintrin.h>
 #include <chrono>
 #include <fmt/format.h>
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -505,6 +506,26 @@ struct RenderExecutor::ResolvedDrawRing {
 	std::array<ResolvedDraw, Size> draws;
 	size_t                         next = 0;
 };
+
+void RenderExecutor::PrefetchResolvedDraw(const ResolvedDraw* resolved, int step) {
+	resolved->programs.Prefetch(step);
+	if (step != 0) {
+		return;
+	}
+	// The parts of the draw state the execution thread reads first (the state is 36 KB).
+	const auto lines = [](const void* data, size_t bytes) {
+		const auto* p = static_cast<const char*>(data);
+		for (size_t at = 0; at < bytes; at += 64) {
+			_mm_prefetch(p + at, _MM_HINT_T0);
+		}
+	};
+	const auto& state = resolved->storage.state;
+	lines(&state.programs, sizeof(state.programs));
+	lines(&state.depth_info, sizeof(state.depth_info));
+	lines(&state.color_info[0], std::min(sizeof(state.color_info), size_t {1024}));
+	lines(&state.vertex_info[0], std::min(sizeof(state.vertex_info[0]), size_t {1024}));
+	lines(&state.ps_input_info, std::min(sizeof(state.ps_input_info), size_t {512}));
+}
 
 void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {
 	resolved->busy.store(false, std::memory_order_release);
@@ -1540,7 +1561,9 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 	                        vs.hs_regs.data_addr, shaders.GetPs().ps_regs.data_addr})) {
 		return nullptr;
 	}
-	auto& ring_storage = ring_index == 0 ? m_resolved_ring : m_resolved_ring_second;
+	auto& ring_storage = ring_index == 0   ? m_resolved_ring
+	                     : ring_index == 1 ? m_resolved_ring_second
+	                                       : m_resolved_ring_third;
 	if (ring_storage == nullptr) {
 		ring_storage = {new ResolvedDrawRing {}, [](ResolvedDrawRing* ring) { delete ring; }};
 	}
@@ -1870,6 +1893,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
+	const bool                       repeats     = DrawRepeats::Enabled();
+	if (repeats) DrawRepeats::DrawBegin();
 	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
 		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
 		descriptor_stages[stage_count++] = &bindings.vertex[i];
@@ -1879,6 +1904,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
 		descriptor_stages[stage_count++] = &*bindings.pixel;
 	}
+	if (repeats) DrawRepeats::DrawEnd();
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	if (emit.indirect_stage != nullptr && state.vertex_info[0].stage.program->info.native_draw &&
 	    emit.indirect_stage->snapshot->HasDeviceAddress()) {

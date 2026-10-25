@@ -12,7 +12,9 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -80,6 +82,8 @@ struct ProgramImageMemo {
 	const void*                 holder = nullptr;
 };
 
+struct ProgramBufferMemo;
+
 struct PreparedBindings {
 	struct BufferSource {
 		uint64_t address = 0;
@@ -138,6 +142,23 @@ struct PreparedBindings {
 	std::vector<ShaderRecompiler::IR::DescriptorValue> last_samplers;
 	// The image memo of `last_program` (RenderExecutor::m_program_image_memos).
 	ProgramImageMemo* image_memo = nullptr;
+	// The buffer memo of `last_program` (RenderExecutor::m_program_buffer_memos).
+	ProgramBufferMemo* buffer_memo = nullptr;
+};
+
+// A program's buffer slots (sources, V# keys and bind memos) while another program uses its stage:
+// swapped with the PreparedBindings ones, which `holder` has meanwhile.
+struct ProgramBufferMemo {
+	std::vector<PreparedBindings::BufferSource>   buffer_sources;
+	std::vector<PreparedBindings::BufferSlotKey>  buffer_keys;
+	std::vector<PreparedBindings::BufferSlotMemo> buffer_memos;
+	const void*                                   holder = nullptr;
+
+	void Swap(PreparedBindings& prepared) noexcept {
+		buffer_sources.swap(prepared.buffer_sources);
+		buffer_keys.swap(prepared.buffer_keys);
+		buffer_memos.swap(prepared.buffer_memos);
+	}
 };
 
 [[nodiscard]] vk::DescriptorType
@@ -159,6 +180,15 @@ template <typename T>
                                                    bool r128 = false);
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size);
+
+// KYTY_DBG_DRAW_REPEATS=1: how each draw's stage resources compare with the last use of the same
+// program (NHL27REPEATS every 5 s). Begin/End bracket the stages of one draw.
+namespace DrawRepeats {
+[[nodiscard]] bool Enabled();
+void DrawBegin();
+void DrawEnd();
+} // namespace DrawRepeats
+
 
 } // namespace Libs::Graphics
 

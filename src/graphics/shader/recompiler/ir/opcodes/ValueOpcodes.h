@@ -16,6 +16,9 @@ enum class ValueOpcode : uint16_t {
 	Count,
 };
 
+// The operations of FPUnary16Low (an immediate).
+enum class F16UnaryOp : uint32_t { Recip, Sqrt, RecipSqrt, Log2, Exp2, Floor, Ceil, Trunc, RoundEven, Fract };
+
 enum class BufferAccess { None, Read, Write, Atomic };
 enum class SharedAccess { None, Read, Write, Atomic, Append, Consume };
 enum class AddressAccess { None, Read, Write };

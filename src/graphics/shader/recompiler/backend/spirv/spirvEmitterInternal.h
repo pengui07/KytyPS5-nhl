@@ -132,6 +132,8 @@ struct EmitterState {
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
+	// Experiment MovRelArrays: the function-local variable of each register array, per lane half.
+	std::unordered_map<uint32_t, std::array<uint32_t, 2>> reg_array_variables;
 	std::array<ImageDefinition, IR::ImageBindingCount> images {};
 	std::array<ImageDefinition, IR::ImageBindingCount> heap_images {};
 	uint32_t                   sampler_variable                      = 0;

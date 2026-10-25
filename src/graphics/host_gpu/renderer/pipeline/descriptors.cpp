@@ -40,8 +40,10 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <tuple>
 #include <fmt/format.h>
 #include <cstdlib>
 #include <functional>
@@ -49,6 +51,7 @@
 #include <mutex>
 #include <span>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -759,12 +762,13 @@ bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureB
 	auto&       found         = derived.found;
 	auto*       image         = texture_cache.m_slot_images.try_get(found.id);
 	const auto& range         = found.desc.info.data;
-	if (image == nullptr || !image->registered || image->binding.needs_rebind ||
+	// Null images (no guest range) are never registered and depend on no guest pages.
+	if (image == nullptr || (!image->registered && !range.Empty()) || image->binding.needs_rebind ||
 	    ImageLookupState::Of(found.id, *image) != found.state) {
 		found.valid = false;
 		return false;
 	}
-	if (const auto set_epoch = texture_cache.ImageSetEpoch(); found.image_set_epoch != set_epoch) {
+	if (const auto set_epoch = texture_cache.ImageSetEpoch(); found.image_set_epoch != set_epoch && !range.Empty()) {
 		if (texture_cache.ImageEpochInRegion(range.address, range.size) > found.image_set_epoch) {
 			found.valid = false;
 			return false;
@@ -805,6 +809,32 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	auto& texture_cache = m_context.GetTextureCache();
 	if (descriptor.IsNull()) {
+		// Sampled null T#s go through the description memo like the others, so later draws reuse
+		// the lookup and its view (each draw built the null description, looked up its image and
+		// then its view again: about 1% of the execution thread in play).
+		if (!storage && !table_candidate && examined == nullptr &&
+		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
+			const auto key    = MakeTextureDescKey(resource, value);
+			auto       cached = m_texture_descs.find(key);
+			if (cached == m_texture_descs.end()) {
+				TextureDescDerivation derived;
+				derived.desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
+				if (m_texture_descs.size() >= MaxTextureDescs) {
+					m_clear_texture_descs = true;
+				}
+				cached = m_texture_descs.emplace(key, std::move(derived)).first;
+			}
+			auto& derived = cached->second;
+			if (derived.found.valid) {
+				TextureBinding binding;
+				if (ReuseTextureLookup(derived, binding)) {
+					return binding;
+				}
+			}
+			TextureBinding binding {texture_cache.FindImage(derived.desc), nullptr, derived.desc};
+			binding.lookup = &derived;
+			return binding;
+		}
 		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                                    : TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);
@@ -1083,6 +1113,25 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+// A stage's flattened SRT and shader data in one stream reservation: one map and one commit
+// instead of two (the uploads were 1.8% of the execution thread).
+static std::pair<vk::DescriptorBufferInfo, vk::DescriptorBufferInfo>
+NativeUploadPair(RenderContext& context, std::span<const uint32_t> first, std::span<const uint32_t> second) {
+	EXIT_IF(first.empty() || second.empty());
+	auto& command_buffer = context.GetCommandScheduler().Current();
+	EXIT_IF(command_buffer.IsInvalid());
+	auto&            buffer       = context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream);
+	constexpr uint64_t Alignment  = 256;
+	const uint64_t   second_start = (first.size_bytes() + Alignment - 1) & ~(Alignment - 1);
+	const auto [data, offset]     = buffer.Map(second_start + second.size_bytes(), Alignment);
+	EXIT_IF(data == nullptr);
+	std::memcpy(data, first.data(), first.size_bytes());
+	std::memcpy(data + second_start, second.data(), second.size_bytes());
+	buffer.Commit();
+	return {vk::DescriptorBufferInfo {buffer.Handle(), offset, first.size_bytes()},
+	        vk::DescriptorBufferInfo {buffer.Handle(), offset + second_start, second.size_bytes()}};
+}
+
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	if (!id) {
 		return;
@@ -1150,7 +1199,118 @@ bool DrawPrepDeltaVerifyEnabled() {
 	return enabled;
 }
 
+// DrawRepeats: per program, the resources of its last use.
+struct RepeatLast {
+	std::vector<ShaderRecompiler::IR::DescriptorValue> buffers, images, samplers;
+	std::vector<uint32_t>                              user_data, flattened_srt;
+};
+struct RepeatCounters {
+	uint64_t stages = 0, first = 0, images = 0, samplers = 0, buffers = 0, user = 0, srt = 0, all = 0;
+	uint64_t buffer_slots = 0, buffer_slots_changed = 0, image_slots = 0, image_slots_changed = 0;
+	uint64_t draws = 0, draws_all = 0, draws_but_buffers = 0, draws_but_buffers_user = 0;
+};
+std::unordered_map<const void*, RepeatLast> g_repeat_last;
+RepeatCounters                              g_repeat;
+uint32_t                                    g_repeat_draw_flags = 0;
+bool                                        g_repeat_in_draw    = false;
+
+// Bits: 1 images, 2 samplers, 4 buffers, 8 user data, 16 flattened SRT the same as last time.
+void RepeatStage(const void* program, const ShaderRecompiler::IR::ResourceSnapshot& snapshot) {
+	auto& c     = g_repeat;
+	auto  found = g_repeat_last.find(program);
+	c.stages++;
+	uint32_t flags = 0;
+	if (found == g_repeat_last.end()) {
+		c.first++;
+		found = g_repeat_last.emplace(program, RepeatLast {}).first;
+	} else {
+		const auto& last = found->second;
+		flags |= last.images == snapshot.images ? 1u : 0u;
+		flags |= last.samplers == snapshot.samplers ? 2u : 0u;
+		flags |= last.buffers == snapshot.buffers ? 4u : 0u;
+		flags |= last.user_data == snapshot.user_data ? 8u : 0u;
+		flags |= last.flattened_srt == snapshot.flattened_srt ? 16u : 0u;
+		c.images += flags & 1u;
+		c.samplers += (flags >> 1u) & 1u;
+		c.buffers += (flags >> 2u) & 1u;
+		c.user += (flags >> 3u) & 1u;
+		c.srt += (flags >> 4u) & 1u;
+		c.all += flags == 31u ? 1u : 0u;
+		if (last.buffers.size() == snapshot.buffers.size()) {
+			for (size_t i = 0; i < snapshot.buffers.size(); i++) {
+				c.buffer_slots++;
+				c.buffer_slots_changed += last.buffers[i] == snapshot.buffers[i] ? 0u : 1u;
+			}
+		}
+		if (last.images.size() == snapshot.images.size()) {
+			for (size_t i = 0; i < snapshot.images.size(); i++) {
+				c.image_slots++;
+				c.image_slots_changed += last.images[i] == snapshot.images[i] ? 0u : 1u;
+			}
+		}
+	}
+	if (g_repeat_in_draw) g_repeat_draw_flags &= flags;
+	auto& last         = found->second;
+	last.buffers       = snapshot.buffers;
+	last.images        = snapshot.images;
+	last.samplers      = snapshot.samplers;
+	last.user_data     = snapshot.user_data;
+	last.flattened_srt = snapshot.flattened_srt;
+}
+
+void RepeatPrint() {
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(5)) return;
+	last          = now;
+	const auto& c = g_repeat;
+	const auto  pct = [](uint64_t part, uint64_t whole) { return whole != 0 ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0; };
+	const auto  seen = c.stages - c.first;
+	std::printf("NHL27REPEATS stages=%llu first=%llu same: images=%.1f%% samplers=%.1f%% buffers=%.1f%% user=%.1f%% srt=%.1f%% "
+	            "all=%.1f%% | buffer slots changed %.1f%% of %llu, image slots changed %.1f%% of %llu | draws=%llu all-same=%.1f%% "
+	            "all-but-buffers=%.1f%% all-but-buffers-and-user=%.1f%%\n",
+	            static_cast<unsigned long long>(c.stages), static_cast<unsigned long long>(c.first), pct(c.images, seen),
+	            pct(c.samplers, seen), pct(c.buffers, seen), pct(c.user, seen), pct(c.srt, seen), pct(c.all, seen),
+	            pct(c.buffer_slots_changed, c.buffer_slots), static_cast<unsigned long long>(c.buffer_slots),
+	            pct(c.image_slots_changed, c.image_slots), static_cast<unsigned long long>(c.image_slots),
+	            static_cast<unsigned long long>(c.draws), pct(c.draws_all, c.draws), pct(c.draws_but_buffers, c.draws),
+	            pct(c.draws_but_buffers_user, c.draws));
+	std::fflush(stdout);
+	g_repeat = {};
+}
+
 } // namespace
+
+bool DrawRepeats::Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_DRAW_REPEATS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+void DrawRepeats::DrawBegin() {
+	g_repeat_in_draw    = true;
+	g_repeat_draw_flags = 31u;
+}
+
+void DrawRepeats::DrawEnd() {
+	g_repeat_in_draw = false;
+	auto& c          = g_repeat;
+	c.draws++;
+	c.draws_all += g_repeat_draw_flags == 31u ? 1u : 0u;
+	c.draws_but_buffers += (g_repeat_draw_flags | 4u) == 31u ? 1u : 0u;
+	c.draws_but_buffers_user += (g_repeat_draw_flags | 4u | 8u | 16u) == 31u ? 1u : 0u;
+	RepeatPrint();
+}
+
+// Descriptor value arrays compared as bytes (DescriptorValue has no padding): the element-wise
+// compares of a stage's T#s and S#s against its last draw's were 1.4% of the execution thread.
+static bool SameDescriptorValues(const std::vector<ShaderRecompiler::IR::DescriptorValue>& a,
+                                 const std::vector<ShaderRecompiler::IR::DescriptorValue>& b) {
+	return a.size() == b.size() &&
+	       (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0);
+}
 
 void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
                                      PreparedBindings& prepared) {
@@ -1158,6 +1318,9 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	EXIT_IF(!runtime);
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
+	if (DrawRepeats::Enabled()) {
+		RepeatStage(&program, snapshot);
+	}
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
@@ -1172,7 +1335,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	// the execution thread).
 	auto* memo = prepared.last_program == &program ? prepared.image_memo : nullptr;
 	if (memo == nullptr) {
-		memo = &m_program_image_memos[&program];
+		memo = ProgramMemosOf(&program).image;
 	}
 	// The program's own image bindings come back with it: a slot reusing the lookup its last draw
 	// made already holds the description (ReuseTextureLookup copied one for most slots of
@@ -1187,10 +1350,28 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 	prepared.image_memo    = memo;
 	prepared.images.resize(program.info.images.size());
+	// The program's buffer slots come back with it as well: FindBuffers and RebindBuffers compare a
+	// slot with what it bound the last time, and with programs alternating on a stage that was
+	// mostly another program's draw (half the buffer bindings looked up again; 40% of the slots had
+	// a new V# for their program).
+	auto* buffer_memo = prepared.last_program == &program ? prepared.buffer_memo : nullptr;
+	if (buffer_memo == nullptr) {
+		buffer_memo = ProgramMemosOf(&program).buffer;
+	}
+	if (prepared.buffer_memo != buffer_memo &&
+	    (buffer_memo->holder == nullptr || buffer_memo->holder == &prepared)) {
+		if (prepared.buffer_memo != nullptr && prepared.buffer_memo->holder == &prepared) {
+			prepared.buffer_memo->Swap(prepared);
+			prepared.buffer_memo->holder = nullptr;
+		}
+		buffer_memo->Swap(prepared);
+		buffer_memo->holder = &prepared;
+	}
+	prepared.buffer_memo = buffer_memo;
 	auto&      last_images = memo->images;
 	auto&      image_descs = memo->image_descs;
 	const bool same_descs  = memo->descs_generation == m_texture_descs_generation;
-	const bool same_images = same_descs && last_images == snapshot.images;
+	const bool same_images = same_descs && SameDescriptorValues(last_images, snapshot.images);
 	// Draws of a program change some T#s and keep the others: a slot whose T# is unchanged keeps
 	// its description instead of looking it up again.
 	const bool slot_reuse = same_descs && last_images.size() == snapshot.images.size() &&
@@ -1261,7 +1442,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	// Samplers live as long as the sampler cache: the same S#s of the same program give the same
 	// samplers.
 	if (!same_program || prepared.samplers.size() != program.info.samplers.size() ||
-	    prepared.last_samplers != snapshot.samplers) {
+	    !SameDescriptorValues(prepared.last_samplers, snapshot.samplers)) {
 		prepared.samplers.clear();
 		prepared.samplers.reserve(program.info.samplers.size());
 		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
@@ -1437,6 +1618,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                         memo.registration)) {
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
+			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[0]);
 			continue;
 		}
 		if (written && memo.buffer != nullptr && memo.written && memo.address == source.address &&
@@ -1446,6 +1628,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			m_context.GetTextureCache().InvalidateMemoryFromGPU(source.address, source.size);
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
+			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[1]);
 			continue;
 		}
 		if (texel && memo.buffer != nullptr && memo.image_version != 0 && memo.address == source.address &&
@@ -1454,7 +1637,40 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                         memo.registration, memo.image_version)) {
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
+			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[2]);
 			continue;
+		}
+		// The same range bound by another slot or draw before (see m_bind_memo).
+		const uint8_t kind      = plain ? 1 : written ? 2 : texel ? 3 : 0;
+		auto&         bind_memo = (*m_bind_memo)[((source.address ^ (source.size << 40u) ^ kind) *
+		                                          0x9E3779B97F4A7C15ull >> 32u) % BindMemoSlots];
+		if (kind != 0 && bind_memo.kind == kind && bind_memo.slot.address == source.address &&
+		    bind_memo.slot.size == source.size && bind_memo.slot.buffer != nullptr) {
+			auto&      global = bind_memo.slot;
+			const bool holds =
+			    kind == 1   ? cache.PlainReadHolds(*global.buffer, source.address, source.size, global.cpu_generation,
+			                                       global.registration)
+			    : kind == 2 ? cache.WrittenBindHolds(*global.buffer, source.address, source.size,
+			                                         global.ranges_version, global.registration)
+			                : cache.TexelReadHolds(*global.buffer, source.address, source.size, global.cpu_generation,
+			                                       global.registration, global.image_version);
+			if (holds) {
+				if (kind == 2) m_context.GetTextureCache().InvalidateMemoryFromGPU(source.address, source.size);
+				prepared.buffers[index] = global.info;
+				pack_memory_offset(index, global.buffer_offset);
+				memo = global;
+				FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_global_hit[kind - 1]);
+				continue;
+			}
+		}
+		if (FrameBreakdown::Verbose() && (plain || written || texel)) {
+			auto&      c    = FrameBreakdown::g_counters;
+			const int  kind = written ? 1 : texel ? 2 : 0;
+			auto&      slot = memo.buffer == nullptr                                         ? c.slot_none[kind]
+			                  : memo.address == source.address && memo.size == source.size ? c.slot_same[kind]
+			                  : memo.buffer->IsInBounds(source.address, source.size)        ? c.slot_inside[kind]
+			                                                                                : c.slot_other[kind];
+			FrameBreakdown::VAdd(slot);
 		}
 		const auto cpu           = cache.CpuModificationGeneration();
 		const auto registration  = cache.RegistrationGeneration();
@@ -1476,17 +1692,25 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			        .image_version  = image_version,
 			        .info           = prepared.buffers[index],
 			        .buffer_offset  = buffer_offset};
+			bind_memo = {memo, kind};
 		} else {
 			memo.buffer = nullptr;
 		}
 	}
 	lookup_timer.Stop();
 	FrameBreakdown::Timer upload_timer(FrameBreakdown::g_counters.dp_rebind_upload_ns);
-	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
-	}
-	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0) {
-		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
+	const bool srt  = layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0;
+	const bool data = layout.descriptor_counts[static_cast<size_t>(BindingKind::ShaderData)] != 0;
+	if (srt && data && !snapshot.flattened_srt.empty() && !prepared.shader_data.empty()) {
+		std::tie(prepared.flattened_srt, prepared.shader_data_buffer) =
+		    NativeUploadPair(m_context, snapshot.flattened_srt, prepared.shader_data);
+	} else {
+		if (srt) {
+			prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		}
+		if (data) {
+			prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
+		}
 	}
 }
 
@@ -2019,9 +2243,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			for (auto& write: m_descriptor_writes) {
 				write.dstSet = set;
 			}
-			m_context.GetGraphics().device.updateDescriptorSets(
-			    static_cast<uint32_t>(m_descriptor_writes.size()), m_descriptor_writes.data(), 0,
-			    nullptr);
+			// On the recording thread, before the bind (vkUpdateDescriptorSets was 2.9% of the
+			// execution thread in play).
+			vk_buffer.updateDescriptorSets(m_context.GetGraphics().device,
+			                               static_cast<uint32_t>(m_descriptor_writes.size()),
+			                               m_descriptor_writes.data());
 			InvalidateRedundantBinds();
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 0, 1, &set,
 			                             0, nullptr);

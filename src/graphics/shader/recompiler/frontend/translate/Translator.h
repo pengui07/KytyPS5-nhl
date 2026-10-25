@@ -5,7 +5,9 @@
 
 #include <array>
 #include <cstdint>
+#include <algorithm>
 #include <map>
+#include <unordered_map>
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
@@ -28,6 +30,8 @@ public:
 	      flush_f32_inputs(flush_f32_inputs), graphics_compute(graphics_compute), fp16_coverage(fp16_coverage) {}
 
 	void TranslateInstruction(const Decoder::Instruction& inst);
+	// The registers each V_MOVRELS/D_B32 reaches from its base, by pc (MovRelExtents).
+	void SetMovRelExtents(const std::unordered_map<uint32_t, uint32_t>* extents) { movrel_extents = extents; }
 	void TranslateEmbeddedFetch(const Decoder::Instruction& inst, uint32_t attribute,
 	                            uint32_t component_count, const ShaderBufferResource& resource);
 	void AddBranchCondition(const CFG::Graph& graph, const CFG::BasicBlock& source,
@@ -41,6 +45,10 @@ private:
 	Decoder::Operand PlainOperand(const Decoder::Operand& operand);
 	void NativeScalarF16Lanes(const Decoder::Instruction& inst, IR::ValueOpcode native, bool subtract, bool three,
 	                          const Decoder::Operand* const* srcs);
+	IR::U32 NativeF16Lane(const Decoder::Operand& op);
+	void    WriteNativeF16Lane(const Decoder::Instruction& inst, IR::U32 result);
+	bool    NativeF16Unary(const Decoder::Instruction& inst, IR::F16UnaryOp op);
+	bool    NativeF16MinMax(const Decoder::Instruction& inst, bool max, bool packed);
 	std::array<IR::U32, 2> BallotMask(IR::U1 value);
 	IR::U32                ReadRawU32(const Decoder::Operand& operand);
 	IR::U32                ReadScalarCode(uint32_t code);
@@ -280,6 +288,18 @@ private:
 	Decoder::Opcode current_opcode       = Decoder::Opcode::UNKNOWN;
 	uint32_t        current_pc           = 0;
 	uint32_t        current_vector_limit = 1;
+	const std::unordered_map<uint32_t, uint32_t>* movrel_extents = nullptr;
+	uint32_t        next_reg_array = 0; // experiment MovRelArrays
+	// Experiment MovRelArrays: the registers [base, end) stored into a new register array.
+	[[nodiscard]] IR::U32 StoreRegArray(uint32_t base, uint32_t end);
+	[[nodiscard]] uint32_t MovRelEnd(const Decoder::Instruction& inst, uint32_t base) const {
+		if (movrel_extents != nullptr) {
+			if (const auto found = movrel_extents->find(inst.pc); found != movrel_extents->end()) {
+				return std::min(current_vector_limit, base + found->second);
+			}
+		}
+		return current_vector_limit;
+	}
 	bool            flush_f32_inputs;
 	bool            graphics_compute;
 	Fp16Coverage*   fp16_coverage = nullptr;

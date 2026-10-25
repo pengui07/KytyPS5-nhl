@@ -158,7 +158,6 @@ GuestGpu::GuestGpu(RenderContext& renderer)
       m_pipelined((Config::GpuPipelineStages() & Config::GPU_PIPELINE_COMMAND_PROCESSOR) != 0),
       m_resolving(m_pipelined && (Config::GpuPipelineStages() & Config::GPU_PIPELINE_RESOLVE) != 0),
       m_operations(OperationQueueSize), m_resolved(ResolvedQueueSize), m_dispatch_jobs(DispatchSlotCount),
-      m_draw_jobs(DrawSlotCount),
       m_neutral_state {&m_neutral_context, &m_neutral_user_config, &m_neutral_shaders} {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	GraphicsInitJmpTables();
@@ -171,8 +170,10 @@ GuestGpu::GuestGpu(RenderContext& renderer)
 		if (m_resolving) {
 			m_dispatch_slots    = std::make_unique<GpuDispatchSlot[]>(DispatchSlotCount);
 			m_dispatch_resolver = std::jthread([this] { DispatchResolveThread(); });
-			m_draw_slots        = std::make_unique<GpuDrawSlot[]>(DrawSlotCount);
-			m_draw_resolver     = std::jthread([this] { DrawResolveThread(); });
+			for (uint32_t which = 0; which < DrawResolverCount(); which++) {
+				m_draw_resolvers[which].slots  = std::make_unique<GpuDrawSlot[]>(DrawSlotCount);
+				m_draw_resolvers[which].thread = std::jthread([this, which] { DrawResolveThread(which); });
+			}
 			m_resolver          = std::jthread([this] { ResolveThread(); });
 		}
 	}
@@ -683,10 +684,12 @@ static void PrintStageStats() {
 	            items != 0 ? (busy - ms[StageStats::ExecProgramLock]) * 1e3 * seconds / static_cast<double>(items) : 0.0,
 	            ms[StageStats::ResolveProgramLock], ms[StageStats::ResolveQueueFull], ms[StageStats::ResolveIdle],
 	            1000.0 - ms[StageStats::ResolveQueueFull] - ms[StageStats::ResolveIdle]);
-	std::printf("NHL27EXECIDLE ms/s: resolve=%.1f cp-busy=%.1f no-submission=%.1f blocked=%.1f "
-	            "cp-decision-wait=%.1f cp-other-wait=%.1f | bda syncs/s=%.0f flushes/s=%.0f (callbacks %.0f batch %.0f guest-reads %.0f flips %.0f)"
+	std::printf("NHL27EXECIDLE ms/s: resolve=%.1f draw-slot=%.1f dispatch-slot=%.1f (after flips %.1f) cp-busy=%.1f "
+	            "no-submission=%.1f blocked=%.1f cp-decision-wait=%.1f cp-other-wait=%.1f | bda syncs/s=%.0f flushes/s=%.0f (callbacks %.0f batch %.0f guest-reads %.0f flips %.0f)"
 	            " | asked by other %.0f submission %.0f interrupt %.0f suspend %.0f split %.0f\n",
-	            ms[StageStats::ExecIdleResolve], ms[StageStats::ExecIdleCp], ms[StageStats::ExecIdleNoWork],
+	            ms[StageStats::ExecIdleResolve], ms[StageStats::ExecIdleDrawSlot],
+	            ms[StageStats::ExecIdleDispatchSlot], ms[StageStats::ExecIdleEarly], ms[StageStats::ExecIdleCp],
+	            ms[StageStats::ExecIdleNoWork],
 	            ms[StageStats::ExecIdleBlocked], ms[StageStats::ExecIdleDecision], ms[StageStats::ExecIdleOther],
 	            static_cast<double>(StageStats::g_bda_syncs.exchange(0, std::memory_order_relaxed)) / seconds,
 	            static_cast<double>(g_scheduler_flushes.exchange(0, std::memory_order_relaxed)) / seconds,
@@ -887,6 +890,7 @@ void GuestGpu::ExecutionThread() {
 	constexpr uint32_t NotifyInterval = 16;
 	uint32_t           unnotified     = 0;
 	auto&              operations     = m_resolving ? m_resolved : m_operations;
+	uint32_t           since_flip     = 0; // operations since the last flip (stats only)
 	for (;;) {
 		if (m_urgent_pending.load(std::memory_order_relaxed) != 0) {
 			RunUrgentCommands();
@@ -902,6 +906,7 @@ void GuestGpu::ExecutionThread() {
 				operation        = operations.Pop();
 				StageStats::Add(StageStats::ExecIdle, start);
 				StageStats::Add(cause, start);
+				if (since_flip < 256) StageStats::Add(StageStats::ExecIdleEarly, start);
 				PrintStageStats();
 			} else {
 				operation = operations.Pop();
@@ -909,6 +914,42 @@ void GuestGpu::ExecutionThread() {
 			Common::EventTrace::Record(Common::EventTrace::EXEC_WAIT_END);
 			if (!operation) {
 				break;
+			}
+		}
+		// The resolutions of the next operations into this core's cache: the resolvers wrote them on
+		// other cores, and their first reads here missed (in-boot A/Bs: draws -2.7 to -3.6%).
+		{
+			const auto resolution = [](const GpuOperation* next) -> const RenderExecutor::ResolvedDraw* {
+				if (next == nullptr) return nullptr;
+				if (next->kind != GpuOperationKind::DrawIndex && next->kind != GpuOperationKind::DrawAuto) return nullptr;
+				if (next->resolved != nullptr) return next->resolved;
+				if (next->draw_slot != nullptr && next->draw_slot->state.load(std::memory_order_acquire) == 2) {
+					return next->draw_slot->result;
+				}
+				return nullptr;
+			};
+			const auto dispatch_resolution = [](const GpuOperation* next) -> const RenderExecutor::ResolvedDispatch* {
+				if (next == nullptr) return nullptr;
+				if (next->kind != GpuOperationKind::DispatchDirect && next->kind != GpuOperationKind::DispatchIndirect) {
+					return nullptr;
+				}
+				if (next->resolved_dispatch != nullptr) return next->resolved_dispatch;
+				if (next->dispatch_slot != nullptr && next->dispatch_slot->state.load(std::memory_order_acquire) == 2) {
+					return next->dispatch_slot->result;
+				}
+				return nullptr;
+			};
+			const auto* soon = operations.Peek(1);
+			const auto* next = operations.Peek(0);
+			if (const auto* draw = resolution(soon)) {
+				RenderExecutor::PrefetchResolvedDraw(draw, 0);
+			} else if (const auto* dispatch = dispatch_resolution(soon)) {
+				RenderExecutor::PrefetchResolvedDispatch(dispatch, 0);
+			}
+			if (const auto* draw = resolution(next)) {
+				RenderExecutor::PrefetchResolvedDraw(draw, 1);
+			} else if (const auto* dispatch = dispatch_resolution(next)) {
+				RenderExecutor::PrefetchResolvedDispatch(dispatch, 1);
 			}
 		}
 		// KYTY_IDLE_TRACE: operations taking 20 us or more, recorded when they end
@@ -931,7 +972,8 @@ void GuestGpu::ExecutionThread() {
 				}
 				if (StageStats::Enabled()) {
 					StageStats::Add(StageStats::ExecIdle, start);
-					StageStats::Add(StageStats::ExecIdleResolve, start);
+					StageStats::Add(StageStats::ExecIdleDispatchSlot, start);
+					if (since_flip < 256) StageStats::Add(StageStats::ExecIdleEarly, start);
 				}
 			}
 			operation->resolved_dispatch = slot->result;
@@ -949,7 +991,8 @@ void GuestGpu::ExecutionThread() {
 				}
 				if (StageStats::Enabled()) {
 					StageStats::Add(StageStats::ExecIdle, start);
-					StageStats::Add(StageStats::ExecIdleResolve, start);
+					StageStats::Add(StageStats::ExecIdleDrawSlot, start);
+					if (since_flip < 256) StageStats::Add(StageStats::ExecIdleEarly, start);
 				}
 			}
 			operation->resolved = slot->result;
@@ -991,6 +1034,9 @@ void GuestGpu::ExecutionThread() {
 			}
 		}
 		const auto sequence = operation->sequence;
+		since_flip = operation->kind == GpuOperationKind::Callback && operation->callback_tag == GpuCallbackTag::Flip
+		                 ? 0
+		                 : since_flip + 1;
 		// Destroy the callback before the command processor may reuse what it references.
 		operation.reset();
 		m_executed.Publish(sequence);
@@ -1035,8 +1081,13 @@ void GuestGpu::ResolveThread() {
 			const auto& shaders = *operation->state.shaders;
 			const auto  key     = shaders.GetPs().ps_regs.data_addr ^ shaders.GetVs().gs_regs.data_addr ^
 			                 shaders.GetVs().es_regs.data_addr;
-			if (((key >> 8u) * 0x9e3779b97f4a7c15ull) >> 63u) {
-				QueueDrawResolution(*operation);
+			// With a third resolver, a third of the draws each.
+			const uint64_t hash = (key >> 8u) * 0x9e3779b97f4a7c15ull;
+			const uint32_t part = DrawResolverCount() == 2
+			                          ? (hash < 0x5555555555555555ull ? 0u : hash < 0xaaaaaaaaaaaaaaaaull ? 1u : 2u)
+			                          : static_cast<uint32_t>(hash >> 63u);
+			if (part != 0) {
+				QueueDrawResolution(*operation, part - 1);
 			} else {
 				operation->resolved =
 				    executor.ResolveDrawAhead(*operation->state.context, *operation->state.user_config,
@@ -1114,9 +1165,25 @@ void GuestGpu::QueueDispatchResolution(GpuOperation& operation, bool indirect) {
 	operation.dispatch_slot = &slot;
 }
 
-void GuestGpu::QueueDrawResolution(GpuOperation& operation) {
-	auto& slot       = m_draw_slots[m_draw_slot_next];
-	m_draw_slot_next = (m_draw_slot_next + 1) % DrawSlotCount;
+// Draw resolvers besides the resolve thread (experiment DrawResolver): KYTY_DRAW_RESOLVERS (1 or 2),
+// by default 2 on 16 logical CPUs or more. Once the execution thread's draws got cheaper (ThinLTO)
+// it waited ~110 ms/s on the resolvers in 60 Hz play; a third resolver (on the dispatch resolver's
+// CPU) took it to 77.3 / 82.3 fps from 73.1 / 78.6 in two in-boot A/Bs, while a draw cost the
+// execution thread 3-5% more.
+uint32_t GuestGpu::DrawResolverCount() {
+	static const uint32_t count = [] {
+		if (const char* value = std::getenv("KYTY_DRAW_RESOLVERS"); value != nullptr) {
+			return std::strtoul(value, nullptr, 10) >= 2 ? 2u : 1u;
+		}
+		return std::thread::hardware_concurrency() >= 16 ? 2u : 1u;
+	}();
+	return count;
+}
+
+void GuestGpu::QueueDrawResolution(GpuOperation& operation, uint32_t which) {
+	auto& resolver     = m_draw_resolvers[which];
+	auto& slot         = resolver.slots[resolver.slot_next];
+	resolver.slot_next = (resolver.slot_next + 1) % DrawSlotCount;
 	// The execution thread frees the slots in order.
 	for (Common::SpinWait wait; slot.state.load(std::memory_order_acquire) != 0;) {
 		if (!wait.Spin()) {
@@ -1125,7 +1192,7 @@ void GuestGpu::QueueDrawResolution(GpuOperation& operation) {
 	}
 	slot.result = nullptr;
 	slot.state.store(1, std::memory_order_relaxed);
-	m_draw_jobs.Push(DrawJob {.slot        = &slot,
+	resolver.jobs.Push(DrawJob {.slot        = &slot,
 	                          .context     = operation.state.context,
 	                          .user_config = operation.state.user_config,
 	                          .shaders     = operation.state.shaders});
@@ -1134,17 +1201,19 @@ void GuestGpu::QueueDrawResolution(GpuOperation& operation) {
 
 // Experiment DrawResolver: resolves the draws the resolve thread passes on, in order, into a
 // resolution ring of its own.
-void GuestGpu::DrawResolveThread() {
+void GuestGpu::DrawResolveThread(uint32_t which) {
 	KYTY_PROFILER_THREAD("Thread_GpuResolveDraw");
-	Config::ConfigureGpuStageThread(Config::GpuStageThread::DrawResolve);
+	Config::ConfigureGpuStageThread(which == 0 ? Config::GpuStageThread::DrawResolve
+	                                           : Config::GpuStageThread::DrawResolve2);
 	auto& executor = m_renderer.GetRenderExecutor();
+	auto& jobs     = m_draw_resolvers[which].jobs;
 	for (;;) {
-		auto job = m_draw_jobs.Pop();
+		auto job = jobs.Pop();
 		if (!job) {
 			break;
 		}
 		GuestReadLog::SetResolveBase(m_executed.Load());
-		job->slot->result = executor.ResolveDrawAhead(*job->context, *job->user_config, *job->shaders, 1);
+		job->slot->result = executor.ResolveDrawAhead(*job->context, *job->user_config, *job->shaders, which + 1);
 		job->slot->state.store(2, std::memory_order_release);
 	}
 }
@@ -1183,9 +1252,11 @@ void GuestGpu::StopExecution() {
 	if (m_dispatch_resolver.joinable()) {
 		m_dispatch_resolver.join();
 	}
-	m_draw_jobs.Stop();
-	if (m_draw_resolver.joinable()) {
-		m_draw_resolver.join();
+	for (auto& resolver: m_draw_resolvers) {
+		resolver.jobs.Stop();
+		if (resolver.thread.joinable()) {
+			resolver.thread.join();
+		}
 	}
 	if (m_executor.joinable()) {
 		m_executor.join();
@@ -1308,13 +1379,26 @@ GpuRegisterState CommandProcessor::SnapshotState(uint64_t sequence) {
 // last BDA boundary emitted: one command processor thread emits them all.
 static uint64_t g_work_emitted     = 0;
 static uint64_t g_bda_work_emitted = ~uint64_t {0};
+// Whether an operation that may record GPU work was emitted since the last global barrier (see
+// EmitGlobalBarrier): not a barrier, BDA boundary, end-of-pipe label or interrupt, or WRITE_DATA.
+static bool g_work_since_barrier = true;
+// A BDA boundary the next draw or dispatch carries (see BdaBoundary).
+static bool g_bda_boundary_pending = false;
 
 uint64_t CommandProcessor::Emit(GpuOperation&& operation) {
 	if (m_pipeline != nullptr) {
 		EXIT_IF(operation.kind != GpuOperationKind::Callback &&
 		        m_pipeline->NextSequence() !=
 		            m_ctx_snapshots.last_use[m_ctx_snapshots.current]);
-		g_work_emitted += operation.kind != GpuOperationKind::Callback ? 1u : 0u;
+		if (operation.kind != GpuOperationKind::Callback) {
+			++g_work_emitted;
+			operation.bda_boundary = std::exchange(g_bda_boundary_pending, false);
+		}
+		g_work_since_barrier = g_work_since_barrier || operation.kind != GpuOperationKind::Callback ||
+		                       (operation.callback_tag != GpuCallbackTag::Barrier &&
+		                        operation.callback_tag != GpuCallbackTag::Bda &&
+		                        operation.callback_tag != GpuCallbackTag::Eop &&
+		                        operation.callback_tag != GpuCallbackTag::WriteData);
 		return m_pipeline->EmitOperation(std::move(operation));
 	}
 	Execute(operation);
@@ -1358,6 +1442,12 @@ void CommandProcessor::BdaBoundary(RenderContext::BdaBoundary kind) {
 		return;
 	}
 	g_bda_work_emitted = g_work_emitted;
+	// Only the next draw or dispatch synchronizes (PrepareBda): it executes the boundary first
+	// (20k boundary operations a second).
+	if (!FrameBreakdown::Enabled()) {
+		g_bda_boundary_pending = true;
+		return;
+	}
 	// KYTY_BDA_BATCH orders boundaries with the draws and dispatches that execute around them.
 	const auto saved_trace_op = g_trace_op;
 	g_trace_op                = static_cast<uint16_t>(g_trace_op | 0x4000u);
@@ -1374,6 +1464,9 @@ uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback, GpuCallbackTag t
 
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
+	if (operation.bda_boundary) {
+		m_renderer.BdaBatchBoundary(RenderContext::BdaBoundary::Other);
+	}
 	m_renderer.SetOperationWriteEpoch(operation.write_epoch);
 	BindState(operation.state);
 	auto& executor = m_renderer.GetRenderExecutor();
@@ -1394,10 +1487,19 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		// Neither have BDA boundaries, barriers and cache events (the occlusion dump is tagged
 		// Other): two thirds of the callbacks in play, and the waits before them were 4.5% of this
 		// thread.
+		// End-of-pipe labels reach guest memory through the copy queue, after its copies (see
+		// ExecuteWriteAtEndOfPipe): the waits before them were 7% of this thread.
+		// WRITE_DATA writes take that path too, and a submission does not wait here: the recording
+		// thread submits after the copies queued before it.
+		m_labels_deferred = operation.kind == GpuOperationKind::Callback &&
+		                    (operation.callback_tag == GpuCallbackTag::Eop ||
+		                     operation.callback_tag == GpuCallbackTag::WriteData);
+		const bool submission = operation.kind == GpuOperationKind::Callback &&
+		                        operation.callback_tag == GpuCallbackTag::Flush;
 		const bool invisible =
 		    operation.kind == GpuOperationKind::Callback &&
 		    (operation.callback_tag == GpuCallbackTag::Bda || operation.callback_tag == GpuCallbackTag::Barrier ||
-		     operation.callback_tag == GpuCallbackTag::Event);
+		     operation.callback_tag == GpuCallbackTag::Event || m_labels_deferred || submission);
 		if (auto* copies = GetScheduler().HostCopies();
 		    copies != nullptr && !invisible &&
 		    (!dispatch || Common::Experiments::Enabled(Common::Experiments::CpuCopyForward))) {
@@ -1773,15 +1875,22 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		// The pipelined command processor's writes reach here: they take the label path as well
 		// (both copies updated, nothing downloaded), not PrepareGpuWrite, which downloads the
 		// page's GPU-written bytes and waited for their writer, 6-23 ms about once a second in
-		// play (AbPending4: always PrepareGpuWrite).
-		if (Common::RuntimeFlags::Current().pm4_write_data_fast &&
-		    !Common::Experiments::Enabled(Common::Experiments::AbPending4)) {
+		// play.
+		// Execute() did not wait for the host copy queue: the labels go through it, and a write made
+		// here waits for it first.
+		auto* const deferred = m_labels_deferred ? GetScheduler().HostCopies() : nullptr;
+		const auto  drain    = [deferred] {
+			if (deferred != nullptr) {
+				deferred->Drain();
+			}
+		};
+		if (Common::RuntimeFlags::Current().pm4_write_data_fast) {
 			auto& cache = m_renderer.GetBufferCache();
 			if (write_one_address) {
 				uint32_t written = 0;
 				while (written < dw_num) {
 					const uint32_t value = src[written];
-					if (!cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), &value, sizeof(value))) {
+					if (!cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), &value, sizeof(value), deferred)) {
 						break;
 					}
 					written++;
@@ -1789,6 +1898,7 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 				if (written == dw_num) {
 					return;
 				}
+				drain();
 				m_renderer.PrepareGpuWrite(dst, sizeof(uint32_t));
 				for (uint32_t i = written; i < dw_num; i++) {
 					dst[0] = src[i];
@@ -1799,11 +1909,12 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 				std::array<uint32_t, 64> values {};
 				std::memcpy(values.data(), src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
 				if (cache.TryWriteLabel(reinterpret_cast<uint64_t>(dst), values.data(),
-				                        static_cast<uint64_t>(dw_num) * sizeof(uint32_t))) {
+				                        static_cast<uint64_t>(dw_num) * sizeof(uint32_t), deferred)) {
 					return;
 				}
 			}
 		}
+		drain();
 		m_renderer.PrepareGpuWrite(dst, uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t));
 		if (write_one_address) {
 			for (uint32_t i = 0; i < dw_num; i++) {
@@ -3631,14 +3742,28 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 		const char* setting = std::getenv("KYTY_EOP_DIRECT_LABELS");
 		return setting != nullptr && setting[0] == '1';
 	}();
+	// Execute() did not wait for the host copy queue (m_labels_deferred): the label is written after
+	// its copies, by the copy thread, unless the guest learns of it now (a direct interrupt).
+	auto* const copies = GetScheduler().HostCopies();
+	if (m_labels_deferred && copies != nullptr &&
+	    (!direct_labels || (with_interrupt && Common::RuntimeFlags::Current().direct_eop_interrupts))) {
+		// The label must be in guest memory before a direct interrupt (or is written by the
+		// execution thread itself): earlier copies first.
+		copies->Drain();
+		m_labels_deferred = false;
+	}
 	auto write_label = [&](void* destination, const void* data, uint64_t bytes) {
 		Common::EventTrace::Record(Common::EventTrace::LABEL_WRITE,
 		                           reinterpret_cast<uint64_t>(destination) & 0xffffffffu,
 		                           m_renderer.GetCommandScheduler().CurrentTick());
+		auto* const deferred = m_labels_deferred ? copies : nullptr;
 		// The exact-range label write goes first: preparing the page for a host store downloads
 		// and unprotects it, waiting for all queued GPU work.
 		if (!direct_labels || !m_renderer.GetBufferCache().TryWriteLabel(
-		        reinterpret_cast<uint64_t>(destination), data, bytes)) {
+		        reinterpret_cast<uint64_t>(destination), data, bytes, deferred)) {
+			if (deferred != nullptr) {
+				deferred->Drain();
+			}
 			// A store into a watched page would fault: download its GPU-written bytes first. A
 			// direct label write goes through the backing and the label's GPU copy instead, so the
 			// other GPU-written bytes of the page stay where they are and nothing waits for the
@@ -3810,7 +3935,18 @@ void CommandProcessor::WriteAtEndOfPipe64(uint32_t cache_policy, uint32_t event_
 }
 
 void CommandProcessor::EmitGlobalBarrier() {
+	// A barrier with no operation since the previous one that may record GPU work orders nothing
+	// more: the execution thread skipped it (KYTY_GUEST_BARRIER_DEDUP: no draw, dispatch or helper
+	// pass since), after its trip through the pipeline (in play 118k barrier and flush-event operations a
+	// second for 13k recorded barriers; skipping just back-to-back ones, in-boot A/B: operations
+	// -12%, execution 3.52 vs 3.65 us per draw).
+	if (m_pipeline != nullptr && Common::RuntimeFlags::Current().guest_barrier_dedup) {
+		if (!g_work_since_barrier) {
+			return;
+		}
+	}
 	EmitCallback([this] { ExecuteGlobalBarrier(); }, GpuCallbackTag::Barrier);
+	g_work_since_barrier = false;
 }
 
 void CommandProcessor::ExecuteGlobalBarrier() {
@@ -3880,6 +4016,11 @@ void CommandProcessor::DeferEopInterrupt(uint32_t interrupt_context_id) {
 	// label instead of after host completion. CPU reads of GPU-written memory still wait for the
 	// host GPU through the page tracking.
 	if (Common::RuntimeFlags::Current().direct_eop_interrupts) {
+		// The guest learns of the end of pipe now: the copies of earlier work complete first (the
+		// operation did not wait for them, see Execute()).
+		if (auto* copies = GetScheduler().HostCopies(); m_labels_deferred && copies != nullptr) {
+			copies->Drain();
+		}
 		FrameBreakdown::Add(FrameBreakdown::g_counters.port_eop_direct);
 		Common::EventTrace::Record(Common::EventTrace::EOP_TRIGGER,
 		                           static_cast<uint64_t>(m_interrupt_event_id),
@@ -3907,6 +4048,35 @@ void CommandProcessor::TriggerEvent(uint32_t event_type, uint32_t event_index,
 		     event_type, event_index, event_address);
 	}
 
+	const bool cache_event = event_index == 0x00000000 || event_index == 0x00000007;
+	switch (event_type) {
+		// The partial flushes and cache write-backs are global barriers (ExecuteTriggerEvent).
+		case 0x00000007:
+		case 0x0000000f:
+		case 0x00000010: EmitGlobalBarrier(); return;
+		case 0x00000016:
+		case 0x00000031:
+		case 0x0000002a:
+		case 0x0000002c:
+		case 0x0000002e:
+			if (cache_event) {
+				EmitGlobalBarrier();
+				return;
+			}
+			break;
+		// Ignored (ExecuteTriggerEvent): no operation.
+		case 0x0000000d:
+		case 0x0000000e:
+		case 0x00000012:
+		case 0x00000017:
+		case 0x00000018:
+		case 0x00000019:
+		case 0x0000001a:
+		case 0x0000001b:
+		case 0x00000038:
+		case 0x0000003a: return;
+		default: break;
+	}
 	// The occlusion counter dump writes guest memory (see CommandProcessor::Execute()).
 	const auto sequence = EmitCallback([this, event_type, event_index, event_address] {
 		ExecuteTriggerEvent(event_type, event_index, event_address);

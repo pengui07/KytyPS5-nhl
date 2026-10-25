@@ -116,6 +116,15 @@ struct Counters {
 	std::atomic<uint64_t> dp_rebind_upload_ns {0}; // RebindBuffers: NativeUpload of SRT and shader data
 	std::atomic<uint64_t> obtain_cache_hits {0};   // KYTY_BUFFER_FAST: ObtainBuffer result cache hits
 	std::atomic<uint64_t> obtain_cache_misses {0}; // KYTY_BUFFER_FAST: lookups that went to ObtainBuffer
+	// Why (verbose): another range in the slot, buffers registered since, buffer gone or too small, range
+	// CPU-written; and misses not stored: stream buffer, registration during the lookup, still CPU-written.
+	std::atomic<uint64_t> obtain_miss_slot {0}, obtain_miss_registration {0}, obtain_miss_buffer {0},
+	    obtain_miss_cpu {0}, obtain_nostore_stream {0}, obtain_nostore_registration {0}, obtain_nostore_cpu {0},
+	    buffer_registrations {0};
+	// RebindBuffers slot memos (verbose): hits, misses by the slot's last range (none, the same range
+	// whose check failed, another range in the same buffer, another buffer), by plain/written/texel.
+	std::atomic<uint64_t> slot_hit[3] {}, slot_none[3] {}, slot_same[3] {}, slot_inside[3] {}, slot_other[3] {},
+	    slot_global_hit[3] {};
 	std::atomic<uint64_t> dp_descriptors_ns {0};  // CommitBindings (descriptor writes)
 	std::atomic<uint64_t> dp_pipeline_ns {0};     // pipeline lookup, render targets, dynamic state, draw emit
 	// NHL27MATERIALIZE: MaterializeResourcesImpl split. total is the whole call; flat, eval, indirect and
@@ -250,6 +259,7 @@ inline PipelineStats g_pl;
 struct BufStats {
 	// ObtainBuffer (rebind scope)
 	std::atomic<uint64_t> ob_calls {0}, ob_written {0}, ob_stream {0}, ob_find_calls {0}, ob_syncs {0};
+	std::atomic<uint64_t> ob_clean {0}; // reads of CPU-clean ranges that skipped SynchronizeBuffer
 	std::atomic<uint64_t> ob_stream_check_ns {0};  // stream fast-path GPU/CPU-modified walks (tracker)
 	std::atomic<uint64_t> ob_stream_copy_ns {0};   // stream Map + memcpy + Commit
 	std::atomic<uint64_t> ob_find_ns {0};          // FindBuffer when the supplied id was not usable
@@ -917,6 +927,19 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t dp_rebind_upload_ns = Take(c.dp_rebind_upload_ns);
 	const uint64_t obtain_cache_hits   = Take(c.obtain_cache_hits);
 	const uint64_t obtain_cache_misses = Take(c.obtain_cache_misses);
+	const uint64_t om_slot = Take(c.obtain_miss_slot), om_reg = Take(c.obtain_miss_registration);
+	const uint64_t om_buf = Take(c.obtain_miss_buffer), om_cpu = Take(c.obtain_miss_cpu);
+	const uint64_t on_stream = Take(c.obtain_nostore_stream), on_reg = Take(c.obtain_nostore_registration);
+	const uint64_t on_cpu = Take(c.obtain_nostore_cpu), b_regs = Take(c.buffer_registrations);
+	uint64_t       slot_counts[6][3] {};
+	for (int k = 0; k < 3; k++) {
+		slot_counts[5][k] = Take(c.slot_global_hit[k]);
+		slot_counts[0][k] = Take(c.slot_hit[k]);
+		slot_counts[1][k] = Take(c.slot_none[k]);
+		slot_counts[2][k] = Take(c.slot_same[k]);
+		slot_counts[3][k] = Take(c.slot_inside[k]);
+		slot_counts[4][k] = Take(c.slot_other[k]);
+	}
 	const uint64_t dc_total_ns       = Take(c.dc_total_ns);
 	const uint64_t dc_materialize_ns = Take(c.dc_materialize_ns);
 	const uint64_t dc_textures_ns    = Take(c.dc_textures_ns);
@@ -1257,16 +1280,26 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 			            ms(c_get), ms(c_prep), ms(c_bind), per(c_n), per(c_rep), per(c_b), per(c_sk));
 			auto& bf = g_buf;
 			const uint64_t o_calls = Take(bf.ob_calls), o_wr = Take(bf.ob_written), o_st = Take(bf.ob_stream);
-			const uint64_t o_fc = Take(bf.ob_find_calls), o_sy = Take(bf.ob_syncs);
+			const uint64_t o_fc = Take(bf.ob_find_calls), o_sy = Take(bf.ob_syncs), o_cl = Take(bf.ob_clean);
 			const uint64_t o_sck = Take(bf.ob_stream_check_ns), o_scp = Take(bf.ob_stream_copy_ns);
 			const uint64_t o_fn = Take(bf.ob_find_ns), o_tn = Take(bf.ob_touch_ns), o_sn = Take(bf.ob_sync_ns);
 			const uint64_t o_bk = Take(bf.ob_book_ns), o_inv = Take(bf.ob_invalidate_ns);
 			std::printf("NHL27BUFFERS2 rebind_lookup=%.2fms obtain: calls=%.1f written=%.1f stream_path=%.1f "
-			            "find_calls=%.1f syncs=%.1f stream_check=%.2fms stream_copy=%.2fms find=%.2fms touch=%.2fms "
-			            "sync=%.2fms book=%.2fms invalidate_gpu=%.2fms\n",
-			            ms(dp_rebind_lookup_ns), per(o_calls), per(o_wr), per(o_st), per(o_fc), per(o_sy), ms(o_sck),
+			            "find_calls=%.1f syncs=%.1f clean=%.1f stream_check=%.2fms stream_copy=%.2fms find=%.2fms "
+			            "touch=%.2fms sync=%.2fms book=%.2fms invalidate_gpu=%.2fms\n",
+			            ms(dp_rebind_lookup_ns), per(o_calls), per(o_wr), per(o_st), per(o_fc), per(o_sy), per(o_cl), ms(o_sck),
 			            ms(o_scp), ms(o_fn), ms(o_tn), ms(o_sn), ms(o_bk), ms(o_inv));
-			std::printf("NHL27BUFFERS2 obtain_cache: hits=%.1f misses=%.1f\n", per(obtain_cache_hits), per(obtain_cache_misses));
+			std::printf("NHL27BUFFERS2 obtain_cache: hits=%.1f misses=%.1f (slot=%.1f registration=%.1f buffer=%.1f "
+			            "cpu=%.1f; not stored: stream=%.1f registration=%.1f cpu=%.1f) registrations=%.1f\n",
+			            per(obtain_cache_hits), per(obtain_cache_misses), per(om_slot), per(om_reg), per(om_buf),
+			            per(om_cpu), per(on_stream), per(on_reg), per(on_cpu), per(b_regs));
+			static const char* const slot_kind[3] = {"plain", "written", "texel"};
+			for (int k = 0; k < 3; k++) {
+				std::printf("NHL27SLOTMEMO %s: hit=%.1f by-range=%.1f; missed: none=%.1f same=%.1f inside=%.1f "
+				            "other=%.1f\n",
+				            slot_kind[k], per(slot_counts[0][k]), per(slot_counts[5][k]), per(slot_counts[1][k]),
+				            per(slot_counts[2][k]), per(slot_counts[3][k]), per(slot_counts[4][k]));
+			}
 			static const char* const sb_name[2] = {"rebind", "bda"};
 			const uint64_t bda_syncs = Take(bf.bda_syncs);
 			(void)Take(bf.bda_drain_ns);

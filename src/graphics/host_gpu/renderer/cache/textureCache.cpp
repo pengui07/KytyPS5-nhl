@@ -1495,7 +1495,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 	// bytes differ, so no slice holds one repeated clear code: nothing to materialize, and no
 	// readback is needed to find that out.
 	if (!shadowed && selected_size != 0 && desc.type != BindingType::VideoOut &&
-	    Common::Experiments::Enabled(Common::Experiments::FillPatterns) &&
+	    Common::Experiments::EnvEnabled(Common::Experiments::EnvBit::FillPatterns) &&
 	    BufferCache::PerfNoSyncReadback() &&
 	    m_buffer_cache.HasGpuDirtyBytes(selected_address, selected_size) &&
 	    m_buffer_cache.GpuFillCoversNonUniform(selected_address, selected_size)) {
@@ -1547,27 +1547,34 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		if (!DecodeColorClear(desc, code, clear.color)) {
 			continue;
 		}
-		std::vector<uint8_t> bytes(slice_size);
 		if (shadowed) {
 			// A repeated dword is one repeated byte only when all four of its bytes agree.
 			if (shadow_value != static_cast<uint32_t>(code) * 0x01010101u) {
 				continue;
 			}
 		} else {
-			if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
-				EXIT("TextureCache: failed to read color metadata slice\n");
+			// Compared in the backing store, eight bytes at a time, up to the first other byte:
+			// copying the slice (tens of KiB) first, for render targets whose first metadata byte is
+			// a clear code but whose slice is not uniform, ran on every lookup of them (with a heap
+			// allocation, 1.7% of the execution thread in play).
+			std::vector<uint8_t> copy;
+			const auto*          bytes = static_cast<const uint8_t*>(LibKernel::Memory::FindBackingPointer(address, slice_size));
+			if (bytes == nullptr) {
+				copy.resize(slice_size);
+				if (!LibKernel::Memory::TryReadBacking(address, copy.data(), copy.size())) {
+					EXIT("TextureCache: failed to read color metadata slice\n");
+				}
+				bytes = copy.data();
 			}
-			// Eight bytes at a time: metadata slices are tens of KiB (1.5% of the execution thread
-			// when compared bytewise).
 			const uint64_t pattern = uint64_t {code} * 0x0101010101010101ull;
 			size_t         at      = 0;
 			bool           uniform = true;
-			for (; uniform && at + sizeof(uint64_t) <= bytes.size(); at += sizeof(uint64_t)) {
+			for (; uniform && at + sizeof(uint64_t) <= slice_size; at += sizeof(uint64_t)) {
 				uint64_t word = 0;
-				std::memcpy(&word, bytes.data() + at, sizeof(word));
+				std::memcpy(&word, bytes + at, sizeof(word));
 				uniform = word == pattern;
 			}
-			for (; uniform && at < bytes.size(); ++at) {
+			for (; uniform && at < slice_size; ++at) {
 				uniform = bytes[at] == code;
 			}
 			if (!uniform) {
@@ -1590,7 +1597,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 		// Publish the conversion's expanded keys without treating them as guest writes
 		// to overlapping image data, and without reading GPU-owned metadata back first.
 		if (desc.type != BindingType::VideoOut) {
-			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
+			const std::vector<uint8_t> bytes(slice_size, uint8_t {0xff});
 			if (shadowed) {
 				// The expanded keys below replace the GPU's fill, so there is nothing to download.
 				m_buffer_cache.DiscardGpuModified(address, slice_size);

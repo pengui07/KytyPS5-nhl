@@ -29,6 +29,7 @@ namespace Libs::Graphics {
 
 struct GraphicContext;
 class CommandScheduler;
+class HostCopyQueue;
 class TextureCache;
 
 using BufferId = Common::SlotId;
@@ -65,8 +66,17 @@ public:
 	~BufferCache();
 	KYTY_CLASS_NO_COPY(BufferCache);
 
-	// Writes a small CPU-visible label into an existing buffer without a page readback.
-	bool                   TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size);
+	// Writes a small CPU-visible label into an existing buffer without a page readback. With
+	// `deferred`, a label of up to 16 bytes reaches guest memory from the host copy thread, after the
+	// copies queued before it (the guest cannot reuse what earlier draws read before they are done),
+	// instead of the caller draining that queue first.
+	bool TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size, HostCopyQueue* deferred = nullptr);
+	// A label the host copy thread writes into guest memory (TryWriteLabel with a queue).
+	struct DeferredLabel {
+		uint64_t                vaddr = 0;
+		uint64_t                size  = 0;
+		std::array<uint8_t, 16> bytes {};
+	};
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	// See MemoryTracker::MarkCpuDirtyAhead.
 	uint64_t MarkCpuDirtyAhead(uint64_t vaddr, uint64_t size) noexcept {
@@ -539,6 +549,9 @@ private:
 	static constexpr size_t                                  ObtainMemoSlots = 4096;
 	std::unique_ptr<std::array<ObtainMemo, ObtainMemoSlots>> m_obtain_memo =
 	    std::make_unique<std::array<ObtainMemo, ObtainMemoSlots>>();
+	static constexpr size_t                    DeferredLabelSlots = 4096;
+	std::unique_ptr<DeferredLabel[]>           m_deferred_labels = std::make_unique<DeferredLabel[]>(DeferredLabelSlots);
+	uint64_t                                   m_deferred_labels_queued = 0;
 	uint64_t m_trigger_gc_memory  = 1ull * 1024 * 1024 * 1024;
 	uint64_t m_critical_gc_memory = 2ull * 1024 * 1024 * 1024;
 	uint64_t m_gc_tick            = 0;

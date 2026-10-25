@@ -516,6 +516,10 @@ struct RenderExecutor::ResolvedDispatch {
 	std::atomic_bool       busy {false};
 };
 
+void RenderExecutor::PrefetchResolvedDispatch(const ResolvedDispatch* resolved, int step) {
+	resolved->programs.Prefetch(step);
+}
+
 // Diagnostic only (KYTY_FSR2_CAPTURE=1): finds the dispatches of NHL's AMD FSR2 passes by
 // comparing their bound buffers with the guest's own copy of cbFSR2 (see Fsr2Capture), then
 // prints the raw block, decoded fields, shader and every bound image. The emulator's GPU thread
@@ -1106,7 +1110,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (known_fill_size == 0 && BufferCache::PerfNoSyncReadback() &&
 	    resources.specialization_reads.empty() &&
 	    resources.uniform_pattern.kind == ShaderRecompiler::IR::UniformFillKind::Buffer &&
-	    Common::Experiments::Enabled(Common::Experiments::FillPatterns)) {
+	    Common::Experiments::EnvEnabled(Common::Experiments::EnvBit::FillPatterns)) {
 		const char* pattern_why = "ok";
 		if (ResolveComputeBufferPattern(input_info, thread_group_x, thread_group_y, thread_group_z,
 		                                mode, known_pattern_address, known_pattern_size,

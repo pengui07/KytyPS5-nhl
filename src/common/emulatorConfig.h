@@ -188,7 +188,8 @@ enum class GpuStageThread : uint32_t {
 	Resolve          = 3,
 	HostCopy         = 4,
 	DispatchResolve  = 5,
-	DrawResolve      = 6
+	DrawResolve      = 6,
+	DrawResolve2     = 7
 };
 // Applies the priority and affinity of `stage` to the calling thread.
 void ConfigureGpuStageThread(GpuStageThread stage);

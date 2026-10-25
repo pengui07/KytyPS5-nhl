@@ -19,6 +19,7 @@
 #include "common/experiments.h"
 #include "graphics/shader/recompiler/ir/passes/ExecSelectElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
+#include "graphics/shader/shader.h"
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
 
@@ -967,7 +968,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(ir.blocks.size()), phase_ms());
-	IR::RewriteToSsa(ir.blocks);
+	IR::RewriteToSsa(ir.blocks, ShaderUndefVgprs());
 	const auto simplify = [&ir] {
 		IR::ConstantPropagationPass(ir.blocks, ir.wave_size);
 		IR::RemoveIdentities(ir);
