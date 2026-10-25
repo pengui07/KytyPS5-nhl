@@ -2282,6 +2282,27 @@ void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t
 			copies->Copy(destination, source, size);
 			return;
 		}
+		// A range no single mapping holds: a page at a time (mappings hold whole pages), so the
+		// copies still go to the copy thread instead of waiting for all of its work (in-play A/B:
+		// draw 3.572 -> 3.342 us, dispatch 2.304 -> 2.231 us).
+		if (deferring) {
+			constexpr uint64_t Page = 0x1000;
+			bool               all  = true;
+			for (uint64_t at = vaddr; at < vaddr + size && all;) {
+				const auto chunk = std::min((at & ~(Page - 1)) + Page, vaddr + size) - at;
+				all              = Libs::LibKernel::Memory::FindBackingPointer(at, chunk) != nullptr;
+				at += chunk;
+			}
+			if (all) {
+				for (uint64_t at = vaddr; at < vaddr + size;) {
+					const auto chunk = std::min((at & ~(Page - 1)) + Page, vaddr + size) - at;
+					copies->Copy(destination + (at - vaddr), Libs::LibKernel::Memory::FindBackingPointer(at, chunk),
+					             chunk);
+					at += chunk;
+				}
+				return;
+			}
+		}
 	}
 	if (deferring && copies != nullptr) {
 		copies->Drain();
