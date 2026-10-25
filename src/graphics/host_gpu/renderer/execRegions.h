@@ -1,0 +1,245 @@
+#ifndef EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_EXECREGIONS_H_
+#define EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_EXECREGIONS_H_
+
+#include <chrono>
+#include <cinttypes>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <intrin.h>
+
+// KYTY_DBG_EXEC_REGIONS=1: the execution thread's time by region of the draw and dispatch paths,
+// from the time stamp counter (a few cycles per region), every 5 s as ms per second (NHL27REGIONS).
+namespace Libs::Graphics::ExecRegions {
+
+enum Region : uint32_t {
+	PrePending,      // DrawIndex: pending operations and the context lock.
+	PreSpecial,      // DrawIndex: metadata, depth copy and resolve draws.
+	EntryPre,        // DrawIndex up to AcquireDrawRenderState: special draws, topology, indices.
+	EntryAcquire,    // AcquireDrawRenderState: the resolution and its guest read check.
+	StateMasks,      // PrepareDrawRenderState: output masks (and shaders when not resolved).
+	EntryState,      // PrepareDrawRenderState: shaders, render target memo or lookup.
+	DrawEntry,       // From there up to the stages' PrepareBindings.
+	StagesMemo,      // PrepareBindings: the program memos.
+	StagesImages,    // PrepareBindings: direct images.
+	StagesResolve,   // PrepareBindings: ResolveTexture of direct images.
+	StagesMap,       // PrepareBindings: description lookups of direct images.
+	StagesTables,    // PrepareBindings: image tables.
+	StagesSamplers,  // PrepareBindings: samplers.
+	DrawStages,      // PrepareBindings: user data, and between the stages.
+	DrawFindBuffers, // PrepareGraphicsBindings: FindBuffers, DMA bases.
+	DrawHeap,        // PrepareGraphicsBindings: image heap rebind.
+	DrawImages,      // PrepareGraphicsBindings: RebindImages, render target rediscovery.
+	BuffersMemo,     // RebindBuffers: slots whose memo held.
+	BuffersObtain,   // RebindBuffers: slots looked up.
+	DrawBuffers,     // PrepareGraphicsBindings: RebindBuffers (the rest: setup, uploads).
+	DrawVertex,      // Vertex and index buffers, indirect arguments.
+	DrawPipeline,    // GetGraphicsPipeline.
+	DrawTargets,     // AcquireRenderTargets.
+	CommitSetup,     // CommitBindings: counts, scalar read check, image heap.
+	CommitTransit,   // CommitBindings: image layout transitions.
+	CommitWrites,    // CommitBindings: descriptor writes and image infos.
+	DrawDescriptors, // CommitBindings: push constants and descriptors.
+	DrawRecord,      // Dynamic state, barriers, rendering, the draw.
+	DrawExit,        // After ExecutePreparedDraw.
+	DispProgram,     // DispatchDirect: up to the program (resolved ahead or looked up).
+	DispFill,        // DispatchDirect: fill, clear, pattern and copy recognition.
+	DispPipeline,    // DispatchDirect: GetComputePipeline.
+	DispStages,      // DispatchDirect: PrepareBindings.
+	DispFind,        // DispatchDirect: FindBuffers, indirect write targets, DMA.
+	DispImages,      // DispatchDirect: RebindImages.
+	DBufPlain,       // RebindBuffers in a dispatch: plain-read slot memo hits.
+	DBufWritten,     // ... written slot memo hits.
+	DBufTexel,       // ... texel-read slot memo hits.
+	DBufGlobal,      // ... by-range memo hits.
+	DBufObtain,      // ... slots looked up.
+	DispBuffers,     // DispatchDirect: shared memory, RebindBuffers (the rest).
+	DispCommit,      // DispatchDirect: CommitBindings.
+	Dispatch,        // DispatchDirect / DispatchIndirect: the rest.
+	Count
+};
+
+inline const char* const Names[Count] = {"pending", "special", "pre", "acquire", "masks", "state", "entry", "memo", "simages", "sresolve", "smap",
+                                         "tables", "samplers", "stages", "find", "heap", "images", "bmemo", "bobtain", "buffers", "vertex",
+                                         "pipeline", "targets", "csetup", "ctransit", "cwrites", "descriptors", "record", "exit",
+                                         "dprogram", "dfill", "dpipeline", "dstages", "dfind", "dimages", "dbplain",
+                                         "dbwritten", "dbtexel", "dbglobal", "dbobtain", "dbuffers",
+                                         "dcommit", "dispatch"};
+
+// Built only with the CMake option KYTY_EXEC_REGIONS: otherwise every mark compiles to nothing.
+#if defined(KYTY_EXEC_REGIONS) && KYTY_EXEC_REGIONS
+[[nodiscard]] inline bool Enabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_EXEC_REGIONS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+#else
+[[nodiscard]] constexpr bool Enabled() {
+	return false;
+}
+#endif
+
+inline uint64_t g_ticks[Count] {};
+inline uint64_t g_counts[Count] {};
+inline bool     g_in_draw = false;
+// Draws that repeat the draw before them (same programs, T#s, S#s and targets) are charged apart.
+inline bool     g_lean = false;
+inline uint64_t g_lean_ticks[Count] {};
+inline uint64_t g_lean_counts[Count] {};
+inline uint64_t g_lean_draws = 0;
+// Event counts (per second in the line).
+enum Event : uint32_t {
+	ImageSlots,
+	ImageMemoDesc,
+	ImageMapLookups,
+	ImageReused,
+	ImageResolved,
+	FindSlots,
+	FindSame,
+	FindEpochs,
+	ResolveWritten,
+	ResolveDynamic,
+	ResolveNoDesc,
+	ResolveInvalid,
+	ReuseNoImage,
+	ReuseRebind,
+	ReuseState,
+	ReuseEpoch,
+	HeapRebinds,
+	HeapCommits,
+	HeapEpochs,
+	HeapAway,
+	HeapActive,
+	BufferSlots,
+	BufferMemoHits,
+	BufferGlobalHits,
+	BufferObtains,
+	SameContext,
+	SamePrograms,
+	SameTextures,
+	SameBufferVs,
+	SameUserData,
+	SameAllButData,
+	TargetsReused,
+	LeanStages,
+	LeanSlots,
+	EventCount
+};
+inline const char* const EventNames[EventCount] = {"img_slots", "img_memo",  "img_map",   "img_reused",
+                                                   "img_resolved", "find_slots", "find_same", "find_epochs",
+                                                   "r_written", "r_dynamic", "r_nodesc", "r_invalid",
+                                                   "u_noimage", "u_rebind", "u_state", "u_epoch",
+                                                   "h_rebinds", "h_commits", "h_epochs", "h_away", "h_active",
+                                                   "b_slots", "b_memo", "b_global", "b_obtain",
+                                                   "same_ctx", "same_prog", "same_tex", "same_vs", "same_user",
+                                                   "same_but_data", "rt_reused", "lean_stages", "lean_slots"};
+inline uint64_t          g_events[EventCount] {};
+inline void              Note(Event event) {
+	if (Enabled() && g_in_draw) g_events[event]++;
+}
+inline uint64_t g_draws      = 0;
+inline uint64_t g_dispatches = 0;
+
+inline void Print() {
+	static uint64_t start_tsc = __rdtsc();
+	static auto     start     = std::chrono::steady_clock::now();
+	const auto      now       = std::chrono::steady_clock::now();
+	if (now - start < std::chrono::seconds(5)) {
+		return;
+	}
+	const auto   tsc = __rdtsc();
+	const double ns  = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count());
+	// ms of the region per second of wall time.
+	const double scale = 1000.0 / static_cast<double>(tsc - start_tsc);
+	char         line[4096];
+	size_t       at     = 0;
+	const auto   append = [&](const char* format, auto... values) {
+		if (at < sizeof(line)) {
+			const int written = std::snprintf(line + at, sizeof(line) - at, format, values...);
+			at += written > 0 ? static_cast<size_t>(written) : 0;
+		}
+	};
+	append("NHL27REGIONS draws/s=%.0f dispatches/s=%.0f", static_cast<double>(g_draws) * 1e9 / ns,
+	       static_cast<double>(g_dispatches) * 1e9 / ns);
+	double total = 0;
+	for (uint32_t i = 0; i < Count; i++) {
+		const double ms = static_cast<double>(g_ticks[i]) * scale;
+		total += ms;
+		append(" %s=%.0f/%.0fk", Names[i], ms, static_cast<double>(g_counts[i]) * 1e6 / ns);
+		g_ticks[i] = g_counts[i] = 0;
+	}
+	for (uint32_t i = 0; i < EventCount; i++) {
+		append(" %s=%.0fk", EventNames[i], static_cast<double>(g_events[i]) * 1e6 / ns);
+		g_events[i] = 0;
+	}
+	std::printf("%s total=%.0f (ms/s)\n", line, total);
+	at = 0;
+	append("NHL27REGIONSLEAN draws/s=%.0f", static_cast<double>(g_lean_draws) * 1e9 / ns);
+	total = 0;
+	for (uint32_t i = 0; i < Count; i++) {
+		const double ms = static_cast<double>(g_lean_ticks[i]) * scale;
+		total += ms;
+		append(" %s=%.0f/%.0fk", Names[i], ms, static_cast<double>(g_lean_counts[i]) * 1e6 / ns);
+		g_lean_ticks[i] = g_lean_counts[i] = 0;
+	}
+	std::printf("%s total=%.0f (ms/s)\n", line, total);
+	std::fflush(stdout);
+	g_draws = g_dispatches = g_lean_draws = 0;
+	start_tsc = tsc;
+	start     = now;
+}
+
+// The execution thread alone charges regions: Begin() starts a draw or dispatch, To() charges the
+// time since the last mark to a region.
+inline uint64_t g_last = 0;
+
+inline void Begin() {
+	if (Enabled()) g_last = __rdtsc();
+}
+
+inline void To(Region region) {
+	if (!Enabled()) return;
+	const auto now = __rdtsc();
+	(g_lean ? g_lean_ticks : g_ticks)[region] += now - g_last;
+	(g_lean ? g_lean_counts : g_counts)[region]++;
+	g_last = now;
+}
+
+// Marks inside functions that dispatches share.
+inline void InDraw(Region region) {
+	if (Enabled() && g_in_draw) To(region);
+}
+
+// A mark with one region for draws and one for dispatches.
+inline void InOp(Region draw, Region dispatch) {
+	if (Enabled()) To(g_in_draw ? draw : dispatch);
+}
+
+// A draw or dispatch: the time after its last mark goes to `last`.
+class Scope {
+public:
+	explicit Scope(Region last): m_last(last) {
+		if (!Enabled()) return;
+		Begin();
+		g_in_draw = last != Dispatch;
+	}
+	~Scope() {
+		if (!Enabled()) return;
+		g_in_draw = false;
+		To(m_last);
+		(m_last == Dispatch ? g_dispatches : g_lean ? g_lean_draws : g_draws)++;
+		g_lean = false;
+		Print();
+	}
+	Scope(const Scope&)            = delete;
+	Scope& operator=(const Scope&) = delete;
+
+private:
+	Region m_last;
+};
+
+} // namespace Libs::Graphics::ExecRegions
+
+#endif /* EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_EXECREGIONS_H_ */

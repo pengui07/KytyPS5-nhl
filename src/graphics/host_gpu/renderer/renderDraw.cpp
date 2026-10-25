@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthAliasLog.h"
+#include "graphics/host_gpu/renderer/execRegions.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include <xmmintrin.h>
@@ -1620,6 +1621,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 		}
 	}
 	mrt_mask &= color_output_mask;
+	ExecRegions::InDraw(ExecRegions::StateMasks);
 	m_render_targets_reused =
 	    TryReuseRenderTargets(buffer.GetRegisters(), mrt_mask, render_target_slice_offset, state);
 	if (!m_render_targets_reused) {
@@ -1889,6 +1891,44 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
+	// KYTY_DBG_EXEC_REGIONS: how much a draw repeats the draw before it.
+	if (ExecRegions::Enabled()) {
+		struct Last {
+			uint64_t                                           context = 0;
+			std::array<const void*, 5>                         programs {};
+			std::array<std::vector<ShaderRecompiler::IR::DescriptorValue>, 5> images, samplers, buffers;
+			std::array<std::vector<uint32_t>, 5>               user;
+		};
+		static Last last;
+		std::array<const ShaderStageRuntime*, 5> runtimes {};
+		for (uint32_t i = 0; i < vertex_stages.size() && i < 4; i++) runtimes[i] = &state.vertex_info[i].stage;
+		if (state.ps_active) runtimes[4] = &state.ps_input_info.stage;
+		bool same_programs = true, same_textures = true, same_buffers = true, same_user = true;
+		for (uint32_t i = 0; i < 5; i++) {
+			const void* program = runtimes[i] != nullptr ? runtimes[i]->program : nullptr;
+			same_programs &= program == last.programs[i];
+			last.programs[i] = program;
+			if (runtimes[i] == nullptr) continue;
+			const auto& snapshot = *runtimes[i]->resources;
+			same_textures &= snapshot.images == last.images[i] && snapshot.samplers == last.samplers[i];
+			same_buffers &= snapshot.buffers == last.buffers[i];
+			same_user &= snapshot.user_data == last.user[i];
+			last.images[i]   = snapshot.images;
+			last.samplers[i] = snapshot.samplers;
+			last.buffers[i]  = snapshot.buffers;
+			last.user[i]     = snapshot.user_data;
+		}
+		if (m_context_id != 0 && m_context_id == last.context) ExecRegions::Note(ExecRegions::SameContext);
+		last.context = m_context_id;
+		if (same_programs) ExecRegions::Note(ExecRegions::SamePrograms);
+		if (same_programs && same_textures) ExecRegions::Note(ExecRegions::SameTextures);
+		if (same_programs && same_buffers) ExecRegions::Note(ExecRegions::SameBufferVs);
+		if (same_programs && same_user) ExecRegions::Note(ExecRegions::SameUserData);
+		if (same_programs && same_textures && m_render_targets_reused) ExecRegions::Note(ExecRegions::SameAllButData);
+		if (m_render_targets_reused) ExecRegions::Note(ExecRegions::TargetsReused);
+		ExecRegions::g_lean = same_programs && same_textures && m_render_targets_reused;
+	}
+	ExecRegions::To(ExecRegions::DrawEntry);
 	BufferCache::PerfTimerScope section(BufferCache::PerfTimer::DrawBindPrepare);
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
@@ -1924,8 +1964,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (source.count_addr != 0) (void)cache.FindBuffer(source.count_addr, sizeof(uint32_t));
 	}
 	section.Stop();
+	ExecRegions::To(ExecRegions::DrawStages);
 	BufferCache::PerfTimerScope resolve_section(BufferCache::PerfTimer::DrawBindResolve);
 	PrepareGraphicsBindings(stages, std::span {state.colors, state.color_count});
+	ExecRegions::To(ExecRegions::DrawBuffers);
 	resolve_section.Stop();
 	BufferCache::PerfTimerScope vertex_section(BufferCache::PerfTimer::DrawVertex);
 	PreparedVertexBuffers vertex_bindings;
@@ -1983,6 +2025,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        {}, 1, &copied, 0, nullptr, 0, nullptr);
 	}
 	vertex_section.Stop();
+	ExecRegions::To(ExecRegions::DrawVertex);
 	BufferCache::PerfTimerScope pipeline_section(BufferCache::PerfTimer::DrawPipeline);
 	// Pipeline bucket: paused around CommitBindings (its own bucket) and stopped after the draw.
 	std::optional<FrameBreakdown::Timer> pipeline_timer;
@@ -1992,6 +2035,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
 	pipeline_section.Stop();
+	ExecRegions::To(ExecRegions::DrawPipeline);
 	BufferCache::PerfTimerScope attachments_section(BufferCache::PerfTimer::DrawAttachments);
 	vk::ImageAspectFlags feedback_aspects;
 	FrameBreakdown::Timer targets_timer(FrameBreakdown::g_pl.targets_ns, FrameBreakdown::Verbose());
@@ -1999,6 +2043,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    AcquireRenderTargets(buffer, state.colors, state.color_count, *state.depth,
 	                         feedback_aspects, stages);
 	attachments_section.Stop();
+	// The attachments and their layouts, and whether the draw binds a storage image: the layouts
+	// its textures take depend on them (see CommitBindings()).
+	{
+		uint64_t signature = m_bound_storage ? 0x9e3779b97f4a7c15ull : 0x2545f4914f6cdd1dull;
+		const auto mix = [&signature](uint64_t value) { signature = (signature ^ value) * 0x100000001b3ull; };
+		for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
+			const auto& attachment = rendering.color_attachments[i];
+			mix(reinterpret_cast<uint64_t>(static_cast<VkImageView>(attachment.image_view)));
+			mix(static_cast<uint64_t>(attachment.image_layout));
+		}
+		mix(reinterpret_cast<uint64_t>(static_cast<VkImageView>(rendering.depth_stencil_attachment.image_view)));
+		mix(static_cast<uint64_t>(rendering.depth_stencil_attachment.image_layout));
+		m_lean_targets = signature;
+	}
+	ExecRegions::To(ExecRegions::DrawTargets);
 	BufferCache::PerfTimerScope commit_section(BufferCache::PerfTimer::DrawCommit);
 	targets_timer.Stop();
 
@@ -2018,7 +2077,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	pipeline_timer.reset();
 	{
 		FrameBreakdown::Timer descriptors_timer(FrameBreakdown::g_counters.dp_descriptors_ns);
+		ExecRegions::To(ExecRegions::DrawRecord);
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+		FinishLeanBindings(stages);
+		ExecRegions::To(ExecRegions::DrawDescriptors);
 	}
 	pipeline_timer.emplace(FrameBreakdown::g_counters.dp_pipeline_ns);
 	std::optional<FrameBreakdown::Timer> vcommit2_timer;
@@ -2309,6 +2371,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
 	}
+	ExecRegions::To(ExecRegions::DrawRecord);
 }
 
 // DIAGNOSTIC (KYTY_DBG_ZERO_INSTANCE): a draw dropped by the zero index/vertex or instance
@@ -2419,6 +2482,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	ExecRegions::Scope regions(ExecRegions::DrawExit);
 	std::optional<DrawCostScope> draw_cost;
 	if (DrawCostScope::Enabled()) {
 		const auto& vs_info = buffer.GetShaders().GetVs();
@@ -2442,6 +2506,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		                    args.instance_source, args.instance_args_addr);
 		return true;
 	}
+	ExecRegions::To(ExecRegions::PrePending);
 
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
 	    DepthStencilCopy(buffer) ||
@@ -2450,6 +2515,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return true;
 	}
+	ExecRegions::To(ExecRegions::PreSpecial);
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		return true;
@@ -2520,13 +2586,16 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
 	bool               shaders_resolved = false;
+	ExecRegions::To(ExecRegions::EntryPre);
 	auto& state = AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch,
 	                                     shaders_resolved);
+	ExecRegions::To(ExecRegions::EntryAcquire);
 	if (!PrepareDrawRenderState(buffer, shaders_resolved, draw, args.render_target_slice_offset,
 	                            state)) {
 		ResetBindings();
 		return true;
 	}
+	ExecRegions::To(ExecRegions::EntryState);
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);

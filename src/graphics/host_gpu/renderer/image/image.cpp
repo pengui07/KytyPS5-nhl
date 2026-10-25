@@ -239,6 +239,14 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	    })) {
 		HeapChanged();
 	}
+	// A barrier between writes that keeps the layout and access (storage images, written every
+	// dispatch) changes nothing texture bindings depend on.
+	if (has_subresource_states != !subresource_states.empty() ||
+	    std::ranges::any_of(barriers, [](const vk::ImageMemoryBarrier2& barrier) {
+		    return barrier.oldLayout != barrier.newLayout || barrier.srcAccessMask != barrier.dstAccessMask;
+	    })) {
+		TextureStateChanged();
+	}
 	state = {destination_stage, destination_access, destination_layout};
 	return barriers;
 }
@@ -795,6 +803,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
       m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
 	ImageOps::Validate(info);
+	TextureStateChanged();
 	m_cpu_dirty =
 	    !info.data.Empty() && info.metadata.compression == VideoOutCompression::Uncompressed;
 	if (info.pixel_format == vk::Format::eUndefined) {
@@ -1039,6 +1048,7 @@ void Image::FlushShadowStorage() {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
+	TextureStateChanged();
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
 			m_graphics.device.destroyImageView(cached.view, nullptr);

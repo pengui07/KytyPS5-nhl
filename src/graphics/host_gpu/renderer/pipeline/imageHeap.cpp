@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/execRegions.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -473,7 +474,9 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 	KYTY_PROFILER_FUNCTION();
 	auto&      textures = m_context.GetTextureCache();
 	const auto epoch    = Image::heap_epoch.load(std::memory_order_relaxed);
+	ExecRegions::Note(ExecRegions::HeapCommits);
 	for (auto* view: m_active) {
+		ExecRegions::Note(ExecRegions::HeapActive);
 		if (view->dirty_begin != view->dirty_end) {
 			const auto slots = std::span(view->slots).subspan(view->dirty_begin,
 			                                                  view->dirty_end - view->dirty_begin);
@@ -485,6 +488,7 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 		}
 		Retire(*view);
 		if (view->layout_epoch != epoch) {
+			ExecRegions::Note(ExecRegions::HeapEpochs);
 			view->layout_epoch = epoch;
 			view->away.clear();
 			for (const auto& [value, index]: view->elements) view->away.push_back(index);
@@ -492,6 +496,7 @@ void ImageHeap::Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point,
 		// This draw's own bindings own the layouts of its attachments and storage images. An image
 		// this draw's discovery replaced lives until the tick ends, and its slots still select it.
 		std::erase_if(view->away, [&](uint32_t index) {
+			ExecRegions::Note(ExecRegions::HeapAway);
 			const auto& element = m_elements[index];
 			auto*       image   = textures.m_slot_images.try_get(element.binding.image_id);
 			if (element.refs == 0u || image == nullptr) return true;

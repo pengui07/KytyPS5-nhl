@@ -345,6 +345,9 @@ public:
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	// After a draw's bindings were committed: the stages whose texture bindings held to here may be
+	// kept by the next draw of their program (ProgramImageMemo::lean_epoch).
+	void FinishLeanBindings(std::span<PreparedBindings* const> bindings);
 	// table_candidate rejects (EXIT) a texture whose guest memory cannot be read, for tables
 	// that keep T#s of freed textures, and declines depth/color conversions. examined receives
 	// the guest range before the lookup depends on the texture cache: a failure without it
@@ -455,6 +458,9 @@ private:
 		uint8_t                          kind = 0; // 1 plain, 2 written, 3 texel
 	};
 	std::unique_ptr<std::array<BindMemo, BindMemoSlots>> m_bind_memo = std::make_unique<std::array<BindMemo, BindMemoSlots>>();
+	BindMemo& BindMemoOf(uint64_t address, uint64_t size, uint8_t kind) {
+		return (*m_bind_memo)[((address ^ (size << 40u) ^ kind) * 0x9E3779B97F4A7C15ull >> 32u) % BindMemoSlots];
+	}
 
 	// The host sampler for a sampler binding; see NativeSampler().
 	[[nodiscard]] vk::Sampler NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
@@ -536,6 +542,10 @@ private:
 	std::shared_ptr<Nhl27Fsr3>           m_nhl27_fsr3;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	// Whether the operation binds a storage image, and a signature of the draw's attachments and
+	// their layouts: the layouts kept bindings need depend on both (see CommitBindings()).
+	bool     m_bound_storage = false;
+	uint64_t m_lean_targets  = 0;
 	// ResolveTexture: memoized pure descriptor -> ImageDesc decode (direct-mapped).
 	struct TextureDescMemo {
 		bool                                valid = false;

@@ -19,6 +19,14 @@
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
+// commandRecorder.cpp's host-time trace scopes (commandScheduler.cpp, not linked here).
+namespace Libs::Graphics {
+uint32_t HostTraceBegin(const CommandRecorder& /*cmd*/, const char* /*kind*/, uint64_t /*identity*/) {
+	return 0;
+}
+void HostTraceEnd(const CommandRecorder& /*cmd*/, uint32_t /*slot*/) {}
+} // namespace Libs::Graphics
+
 namespace {
 
 using Libs::Graphics::CommandChunkQueue;
@@ -291,6 +299,37 @@ void TestProgressCounter() {
 	lazy.WaitFor(Rounds);
 	publisher.join();
 	Check(lazy.Load() == Rounds, "published final value");
+
+	// Several waiters with different targets at once (the host copy counter: the recording thread
+	// and the execution thread's Drain()): each wakes once the value reaches its own target. With a
+	// single shared target a waiter that finished cleared another's, which then slept for good.
+	Common::ProgressCounter shared;
+	std::atomic<uint64_t>   finished {0};
+	{
+		std::vector<std::jthread> waiters;
+		for (uint64_t waiter = 0; waiter < 5; waiter++) {
+			waiters.emplace_back([&, waiter] {
+				for (uint64_t target = 1 + waiter * 13; target <= Rounds; target += 1009 + waiter * 211) {
+					shared.WaitFor(target);
+				}
+				shared.WaitFor(Rounds);
+				finished.fetch_add(1);
+			});
+		}
+		// Slow enough that the waiters sleep (past their spin budget) between targets.
+		for (uint64_t i = 1; i <= Rounds / 10; i++) {
+			shared.Publish(i);
+			if (i % 16 == 0) {
+				shared.Notify();
+			}
+			if (i % 64 == 0) {
+				Stall(std::chrono::microseconds(200));
+			}
+		}
+		shared.Publish(Rounds);
+		shared.Notify();
+	}
+	Check(finished.load() == 5, "every waiter of a shared counter finished");
 }
 
 // Small callables live in place, large ones on the heap; both move and destroy once.
@@ -368,7 +407,9 @@ void TestHostCopyQueue() {
 	queue.Drain();
 	stop.store(true, std::memory_order_release);
 	waiter.join();
-	Check(queue.Flush() == Copies, "every copy is counted");
+	// Drain() makes the copies not handed over yet itself, uncounted (Flush() counts only the
+	// handed-over ones).
+	Check(queue.Flush() <= Copies, "no copy is counted twice");
 	Check(drained, "Drain() waits for every queued copy");
 	Check(seen, "WaitFor() on another thread sees the copies before its target");
 	Check(targets == sources, "every copy lands");

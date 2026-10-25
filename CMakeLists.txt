@@ -976,6 +976,12 @@ option(KYTY_LINE_TABLES "Emit line tables for the emulator (profiling; no codege
 if (KYTY_LINE_TABLES AND KYTY_CLANG_CL)
 	target_compile_options(kyty_emulator PRIVATE "-gline-tables-only")
 endif()
+# The execution thread's time by region of the draw and dispatch paths (KYTY_DBG_EXEC_REGIONS=1 at
+# run time prints NHL27REGIONS); without the option the marks compile to nothing.
+option(KYTY_EXEC_REGIONS "Execution-thread region timers (diagnostics)" OFF)
+if (KYTY_EXEC_REGIONS)
+	target_compile_definitions(kyty_emulator PRIVATE KYTY_EXEC_REGIONS=1)
+endif()
 # Profile-guided optimization of the emulator and common (clang-cl). KYTY_PGO=generate builds an
 # instrumented emulator that writes LLVM_PROFILE_FILE every 30 s (creating "pgo.reset" in the
 # working directory drops the counts so far, e.g. the boot); merge the .profraw with
