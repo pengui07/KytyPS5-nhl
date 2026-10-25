@@ -13,7 +13,8 @@
 namespace Libs::Graphics::ExecRegions {
 
 enum Region : uint32_t {
-	PrePending,      // DrawIndex: pending operations and the context lock.
+	PrePending,      // DrawIndex: pending operations.
+	PreLock,         // DrawIndex: debug info and the context lock.
 	PreSpecial,      // DrawIndex: metadata, depth copy and resolve draws.
 	EntryPre,        // DrawIndex up to AcquireDrawRenderState: special draws, topology, indices.
 	EntryAcquire,    // AcquireDrawRenderState: the resolution and its guest read check.
@@ -28,7 +29,8 @@ enum Region : uint32_t {
 	StagesSamplers,  // PrepareBindings: samplers.
 	DrawStages,      // PrepareBindings: user data, and between the stages.
 	DrawFindBuffers, // PrepareGraphicsBindings: FindBuffers.
-	DrawDma,         // PrepareGraphicsBindings: DMA bases and the BDA synchronization.
+	DrawDma,         // PrepareGraphicsBindings: DMA bases.
+	DrawBda,         // PrepareGraphicsBindings: the BDA synchronization (PrepareBda).
 	DrawHeap,        // PrepareGraphicsBindings: image heap rebind.
 	DrawImages,      // PrepareGraphicsBindings: RebindImages, render target rediscovery.
 	BuffersMemo,     // RebindBuffers: slots whose memo held.
@@ -60,8 +62,8 @@ enum Region : uint32_t {
 	Count
 };
 
-inline const char* const Names[Count] = {"pending", "special", "pre", "acquire", "masks", "state", "entry", "memo", "simages", "sresolve", "smap",
-                                         "tables", "samplers", "stages", "find", "dma", "heap", "images", "bmemo", "bobtain", "buffers", "vertex",
+inline const char* const Names[Count] = {"pending", "lock", "special", "pre", "acquire", "masks", "state", "entry", "memo", "simages", "sresolve", "smap",
+                                         "tables", "samplers", "stages", "find", "dma", "bda", "heap", "images", "bmemo", "bobtain", "buffers", "vertex",
                                          "pipeline", "targets", "csetup", "ctransit", "cwrites", "descriptors", "record", "exit",
                                          "dprogram", "dfill", "dpipeline", "dstages", "dfind", "dimages", "dbplain",
                                          "dbwritten", "dbtexel", "dbglobal", "dbobtain", "dbuffers",
@@ -149,6 +151,7 @@ enum Event : uint32_t {
 	LeanNotHeld,
 	LeanEpochMoved,
 	DmaStages,
+	DmaMemoHits,
 	EventCount
 };
 inline const char* const EventNames[EventCount] = {"img_slots", "img_memo",  "img_map",   "img_reused",
@@ -161,7 +164,7 @@ inline const char* const EventNames[EventCount] = {"img_slots", "img_memo",  "im
                                                    "same_but_data", "rt_reused", "lean_stages", "lean_slots",
                                                    "o_nokind", "o_plain", "o_written", "o_texel", "o_nomemo",
                                                    "o_notkept", "o_stream", "o_dirty", "o_evicted", "o_slotsame",
-                                                   "l_images", "l_holder", "l_notheld", "l_epoch", "dma_stages"};
+                                                   "l_images", "l_holder", "l_notheld", "l_epoch", "dma_stages", "dma_hits"};
 // Ranges bound before (diagnostics of the by-range memo's evictions): a direct-mapped set of 1M keys.
 inline bool SeenRange(uint64_t address, uint64_t size, uint8_t kind) {
 	static auto* keys = new uint64_t[1u << 20u] {};
@@ -185,8 +188,8 @@ inline uint64_t g_dispatches = 0;
 // KYTY_DBG_WARM=1: an operation timed twice in a row (first call, then again with its data in the
 // cache): how much of its cost is waiting for memory. Per kind: [0] first ticks, [1] second ticks,
 // [2] count.
-enum WarmKind : uint32_t { WarmReuse, WarmFindSlot, WarmCount };
-inline const char* const WarmNames[WarmCount] = {"reuse", "findslot"};
+enum WarmKind : uint32_t { WarmReuse, WarmFindSlot, WarmTransit, WarmPlain, WarmCount };
+inline const char* const WarmNames[WarmCount] = {"reuse", "findslot", "transit", "plain"};
 inline uint64_t          g_warm[WarmCount][3] {};
 [[nodiscard]] inline bool WarmEnabled() {
 	static const bool enabled = [] {

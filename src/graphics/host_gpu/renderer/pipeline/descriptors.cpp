@@ -1707,6 +1707,7 @@ void RenderExecutor::CacheDmaBases(PreparedBindings& prepared) {
 		       prepared.dma_bases[i * 2u + 1u] == dword(registers[i], 1);
 	}
 	if (same) {
+		ExecRegions::Note(ExecRegions::DmaMemoHits);
 		return;
 	}
 	m_context.CacheDmaBases(runtime);
@@ -1767,8 +1768,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                   source.size != 0;
 		if (plain && memo.buffer != nullptr && !memo.written && memo.image_version == 0 &&
 		    memo.address == source.address && memo.size == source.size &&
-		    cache.PlainReadHolds(*memo.buffer, source.address, source.size, memo.cpu_generation,
-		                         memo.registration)) {
+		    ExecRegions::TimedTwice(ExecRegions::WarmPlain, [&] {
+			    return cache.PlainReadHolds(*memo.buffer, source.address, source.size, memo.cpu_generation,
+			                                memo.registration);
+		    })) {
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
 			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[0]);
@@ -2072,8 +2075,9 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		}
 		uses_image_heap |= stage->runtime->program->info.uses_image_heap;
 	}
-	if (uses_dma) m_context.PrepareBda();
 	ExecRegions::To(ExecRegions::DrawDma);
+	if (uses_dma) m_context.PrepareBda();
+	ExecRegions::To(ExecRegions::DrawBda);
 	if (uses_image_heap) {
 		ExecRegions::Note(ExecRegions::HeapRebinds);
 		m_context.GetImageHeap().Rebind(*this);
@@ -2315,7 +2319,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			// looks up the null images again, which resets theirs).
 			const auto& kept_layouts = descriptors.lean_layouts;
 			for (auto& binding: descriptors.images) {
-				transit(binding);
+				// KYTY_DBG_WARM: sampled bindings' transitions repeat without effect.
+				if (ExecRegions::Enabled() && binding.desc.type != TextureCache::BindingType::Storage) {
+					(void)ExecRegions::TimedTwice(ExecRegions::WarmTransit, [&] {
+						transit(binding);
+						return true;
+					});
+				} else {
+					transit(binding);
+				}
 			}
 			for (auto& binding: descriptors.table_images) {
 				transit(binding);

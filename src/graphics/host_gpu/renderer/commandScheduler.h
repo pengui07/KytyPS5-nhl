@@ -70,7 +70,10 @@ public:
 	// the priority runner cannot join itself.
 	void                      Shutdown();
 	void                      Wait(uint64_t tick);
-	void                      PopPendingOperations();
+	// Runs the pending operations whose ticks completed. Each waits for the priority operations of
+	// its tick or earlier; with `wait_priority` false (draws and dispatches) one that would wait
+	// stays queued for a later call instead.
+	void                      PopPendingOperations(bool wait_priority = true);
 	void                      DrainPriorityOperations();
 	// Whether a deferred or priority operation that may write guest memory in
 	// [address, address + size) is queued or running.

@@ -253,6 +253,16 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 
 void Image::Transit(vk::ImageLayout destination_layout, vk::AccessFlags2 destination_access,
                     std::optional<ImageSubresourceRange> range, CommandRecorder command_buffer) {
+	// Most transitions find the whole image in that state already (textures sampled draw after draw,
+	// 880,000 transitions a second in play): GetBarriers() would return none and change nothing.
+	constexpr auto write_access =
+	    vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eMemoryWrite;
+	if (backing.subresource_states.empty() && backing.state.layout == destination_layout &&
+	    backing.state.access_mask == destination_access && !(destination_access & write_access) &&
+	    (!range || (!info.IsVolume() && range->base_level == 0 && range->base_layer == 0 &&
+	                range->level_count >= info.HostLevels() && range->layer_count == info.resources.layers))) {
+		return;
+	}
 	const auto transfer_access =
 	    vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite;
 	vk::PipelineStageFlags2 destination_stage {};
