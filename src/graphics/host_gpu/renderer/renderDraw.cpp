@@ -2030,10 +2030,52 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Pipeline bucket: paused around CommitBindings (its own bucket) and stopped after the draw.
 	std::optional<FrameBreakdown::Timer> pipeline_timer;
 	pipeline_timer.emplace(FrameBreakdown::g_counters.dp_pipeline_ns);
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
-	    std::span {state.colors, state.color_count}, *state.depth, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	// A draw with the register snapshot (context id), programs, topology, attachment formats and no
+	// fixed-function vertex input of the draw before it gets that draw's pipeline: every input of
+	// the pipeline key is the same (GetGraphicsPipeline builds a key of several hundred bytes and
+	// compares it). KYTY_PIPELINE_FRONT_VERIFY=1 looks the pipeline up anyway and compares.
+	struct PipelineFront {
+		uint64_t                 context_id = 0;
+		std::array<uint64_t, 4>  programs {};
+		uint64_t                 attachments = 0;
+		uint32_t                 topology    = 0;
+		PipelineCache::Pipeline* pipeline    = nullptr;
+	};
+	static PipelineFront front;
+	static const bool    front_verify = std::getenv("KYTY_PIPELINE_FRONT_VERIFY") != nullptr;
+	const auto&          front_vs     = vertex_stages.front();
+	uint64_t             attachments  = 0;
+	{
+		const auto mix = [&attachments](uint64_t value) { attachments = (attachments ^ value) * 0x100000001b3ull; };
+		mix(state.color_count);
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto& color = state.colors[i];
+			mix((uint64_t {color.target_slot} << 48u) | (uint64_t {color.export_mapping.packed} << 40u) |
+			    (uint64_t {color.desc.info.samples} << 32u) | static_cast<uint64_t>(color.desc.view_info.format));
+			mix(static_cast<uint64_t>(color.desc.info.guest_format));
+		}
+		mix((static_cast<uint64_t>(state.depth->image_id ? 1 : 0) << 63u) |
+		    (uint64_t {state.depth->depth_test_enable} << 62u) | (uint64_t {state.depth->desc.info.samples} << 32u) |
+		    static_cast<uint64_t>(state.depth->desc.view_info.format));
+	}
+	const std::array<uint64_t, 4> front_programs {state.programs.vertex[0].id, state.programs.vertex[1].id,
+	                                              state.programs.vertex[2].id,
+	                                              state.ps_active ? state.programs.pixel.id : ~uint64_t {0}};
+	const uint32_t                front_topology = static_cast<uint32_t>(topology) | (primitive_restart_enable ? 0x100u : 0u);
+	const bool front_hit = m_context_id != 0 && front.pipeline != nullptr && front.context_id == m_context_id &&
+	                       front.programs == front_programs && front.attachments == attachments &&
+	                       front.topology == front_topology && front_vs.buffers_num == 0 &&
+	                       front_vs.resources_num == 0;
+	auto& pipeline = front_hit && !front_verify
+	                     ? *front.pipeline
+	                     : m_context.GetPipelineCache().GetGraphicsPipeline(
+	                           std::span {state.colors, state.color_count}, *state.depth, vertex_stages, buffer,
+	                           state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
+	                           state.programs);
+	if (front_hit && front_verify && &pipeline != front.pipeline) {
+		EXIT("pipeline front: draw with the last draw's context, programs and attachments needs another pipeline\n");
+	}
+	front = {m_context_id, front_programs, attachments, front_topology, &pipeline};
 	pipeline_section.Stop();
 	ExecRegions::To(ExecRegions::DrawPipeline);
 	BufferCache::PerfTimerScope attachments_section(BufferCache::PerfTimer::DrawAttachments);
@@ -2159,8 +2201,30 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (foreign_state) {
 			dynamic_state.Invalidate();
 		}
-		UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), *state.depth,
-		                           rendering);
+		// A draw's dynamic state follows from the registers (the context id), the last vertex
+		// stage's program (indexed viewports) and the attachments (m_lean_targets: their views
+		// give the extent): with those of the draw that last set it, it holds the same values.
+		// Only this function writes them (an invalidation marks them all to be recorded again).
+		// KYTY_DYNAMIC_STATE_VERIFY=1 sets them anyway and exits if one changed.
+		static uint64_t    dynamic_context = 0;
+		static const void* dynamic_program = nullptr;
+		static uint64_t    dynamic_targets = 0;
+		static const bool  dynamic_verify  = std::getenv("KYTY_DYNAMIC_STATE_VERIFY") != nullptr;
+		const void*        last_program    = vertex_stages.back().stage.program;
+		const bool         dynamic_same    = m_context_id != 0 && m_context_id == dynamic_context &&
+		                          last_program == dynamic_program && m_lean_targets == dynamic_targets;
+		if (!dynamic_same || dynamic_verify) {
+			const auto dirty_before = dynamic_state.dirty_state;
+			UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), *state.depth,
+			                           rendering);
+			if (dynamic_same &&
+			    std::memcmp(&dirty_before, &dynamic_state.dirty_state, sizeof(dirty_before)) != 0) {
+				EXIT("dynamic state: draw with the last draw's context, program and attachments changed it\n");
+			}
+			dynamic_context = m_context_id;
+			dynamic_program = last_program;
+			dynamic_targets = m_lean_targets;
+		}
 		dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 		dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 	}

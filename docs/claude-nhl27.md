@@ -1492,6 +1492,15 @@ Toward 120 fps (2026-10-23):
   descriptor mask every draw (paused A/B: draw 3.018 -> 3.006 us, about noise); statistics timers
   that are off write only their flag. The region-timer build is now configured without PGO
   (`-DKYTY_PGO=none`): every profile refresh made its ThinLTO link fail on mixed profile summaries.
+* Draws that repeat the draw before them's register snapshot (context id): the pipeline comes from
+  the last draw when the context, the programs, topology and restart, the attachment formats
+  (target slots, export mappings, samples, depth format and test) are the same and the vertex
+  stage has no fixed-function vertex input (`KYTY_PIPELINE_FRONT_VERIFY=1` looks it up anyway and
+  compares); the dynamic state is not computed again when the context, the last vertex stage's
+  program and the attachments (`m_lean_targets`) are those of the draw that last set it
+  (`KYTY_DYNAMIC_STATE_VERIFY=1` sets it anyway and exits if a value changed). Both verify modes and
+  `KYTY_LEAN_VERIFY` clean in the menus and 60 s of play. Paused in-boot A/B, both together: draw
+  3.119 -> 3.070 us.
 * A 3 x 5-minute soak on ee3f53e2: 77.2 / 77.2 / 77.4 fps at 60 Hz; the third match ended in the
   rare guest crash at pc 0x9093c3f41 (`rax=-1`, a UI table of -1 slots; no emulator write within
   0x400 of the pointers among the last 474,845 logged), now seen twice today in about 13 boots.
