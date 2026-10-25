@@ -114,6 +114,14 @@ struct PreparedBindings {
 		uint64_t                              generation = 0;
 	};
 	std::vector<BufferSlotKey> buffer_keys;
+	// CommitBindings(): the descriptor writes and image descriptors of `commit_program`, and its
+	// shader stage.
+	const void* commit_program = nullptr;
+	struct CommitCounts {
+		uint32_t             writes = 0;
+		uint32_t             images = 0;
+		vk::ShaderStageFlags stage;
+	} commit_counts;
 	// The DMA base registers' dwords the stage last found buffers for, with its program and the
 	// generations then (see RenderExecutor::CacheDmaBases()).
 	const void*           dma_program    = nullptr;

@@ -39,7 +39,9 @@ enum Region : uint32_t {
 	DrawVertex,      // Vertex and index buffers, indirect arguments.
 	DrawPipeline,    // GetGraphicsPipeline.
 	DrawTargets,     // AcquireRenderTargets.
-	CommitSetup,     // CommitBindings: counts, scalar read check, image heap.
+	CommitStart,     // CommitBindings: up to the per-stage counts.
+	CommitCounts,    // CommitBindings: the per-stage counts.
+	CommitSetup,     // CommitBindings: scalar read check, image heap.
 	CommitTransit,   // CommitBindings: image layout transitions.
 	CommitWrites,    // CommitBindings: descriptor writes and image infos.
 	DrawDescriptors, // CommitBindings: push constants and descriptors.
@@ -64,7 +66,7 @@ enum Region : uint32_t {
 
 inline const char* const Names[Count] = {"pending", "lock", "special", "pre", "acquire", "masks", "state", "entry", "memo", "simages", "sresolve", "smap",
                                          "tables", "samplers", "stages", "find", "dma", "bda", "heap", "images", "bmemo", "bobtain", "buffers", "vertex",
-                                         "pipeline", "targets", "csetup", "ctransit", "cwrites", "descriptors", "record", "exit",
+                                         "pipeline", "targets", "cstart", "ccounts", "csetup", "ctransit", "cwrites", "descriptors", "record", "exit",
                                          "dprogram", "dfill", "dpipeline", "dstages", "dfind", "dimages", "dbplain",
                                          "dbwritten", "dbtexel", "dbglobal", "dbobtain", "dbuffers",
                                          "dcommit", "dispatch"};

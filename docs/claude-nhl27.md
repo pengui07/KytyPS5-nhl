@@ -1475,12 +1475,26 @@ Toward 120 fps (2026-10-23):
   boundaries emitted as operations of their own. Two boots in play: draw 4.38 vs 3.2-3.5 us,
   dispatch 2.66 vs 2.1 us; a 3-minute match 55.7 fps at 60 Hz with it, 76-78 without. It is now
   `0` there (set it to `1` again for the NHL27BDA, NHL27BUFFERS and other per-frame statistics).
+  A match with every variable of `cfgGlobal.json` on top of `play-nhl.ps1`'s (render scale 0.6667,
+  FSR3, loop cap 65536, skipped bounds checks...): 77.4 fps at 60 Hz once its programs were in the
+  store; the first boot with those code-generation settings compiles them (34 fps, then 10 fps on a
+  30 Hz screen, and the rare guest crash at pc 0x9093c3f41).
 * The first access to a range's by-range memo entry in `RebindBuffers` (a random entry of the 6.8
   MB table) was the hottest single line of the execution thread (4.4% of its samples in play).
   `FindBuffers` now prefetches the entry when a slot gets a new range, several hundred ns before
   `RebindBuffers` reads it. Paused in-boot A/B: draw 3.404 -> 3.336 us, dispatch 2.493 -> 2.440 us.
   The same before a non-lean stage's image slots (each description's last lookup and the image's
-  lookup-state lines, for all slots first): 3.117 / 3.114 us, no effect, dropped.
+  lookup-state lines, for all slots first): 3.117 / 3.114 us, no effect, dropped. Prefetching the
+  upcoming operations one further ahead (the third operation's resolution, the second's snapshot
+  arrays): draw 3.004 vs 3.014 us, fps 73.3 vs 71.5, dropped.
+* `CommitBindings` keeps each stage's descriptor write and image descriptor counts and its shader
+  stage for the stage's program (`PreparedBindings::commit_counts`) instead of walking the
+  descriptor mask every draw (paused A/B: draw 3.018 -> 3.006 us, about noise); statistics timers
+  that are off write only their flag. The region-timer build is now configured without PGO
+  (`-DKYTY_PGO=none`): every profile refresh made its ThinLTO link fail on mixed profile summaries.
+* A 3 x 5-minute soak on ee3f53e2: 77.2 / 77.2 / 77.4 fps at 60 Hz; the third match ended in the
+  rare guest crash at pc 0x9093c3f41 (`rax=-1`, a UI table of -1 slots; no emulator write within
+  0x400 of the pointers among the last 474,845 logged), now seen twice today in about 13 boots.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

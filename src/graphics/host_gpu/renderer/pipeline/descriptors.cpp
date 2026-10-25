@@ -2195,25 +2195,34 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	vk::ShaderStageFlags push_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
 	                                       ? vk::ShaderStageFlagBits::eFragment
 	                                       : vk::ShaderStageFlags {};
-	for (const auto* prepared: prepared_bindings) {
+	ExecRegions::InDraw(ExecRegions::CommitStart);
+	for (auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		const auto& program = *prepared->runtime->program;
-		write_count += std::popcount(program.bindings.descriptor_mask);
-		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
-			const auto index = std::countr_zero(mask);
-			const auto count = program.bindings.descriptor_counts[index];
-			if (index >= ShaderRecompiler::IR::FirstImageBinding &&
-			    index <= static_cast<size_t>(BindingKind::Samplers)) {
-				image_descriptor_count += count;
+		// The counts are the program's: worked out again only when the stage's program changes.
+		if (prepared->commit_program != &program) {
+			auto& counts  = prepared->commit_counts;
+			counts.writes = static_cast<uint32_t>(std::popcount(program.bindings.descriptor_mask));
+			counts.images = 0;
+			for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
+				const auto index = std::countr_zero(mask);
+				if (index >= ShaderRecompiler::IR::FirstImageBinding &&
+				    index <= static_cast<size_t>(BindingKind::Samplers)) {
+					counts.images += program.bindings.descriptor_counts[index];
+				}
 			}
+			counts.stage = NativeShaderStage(program.stage);
+			EXIT_IF((pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
+			         (counts.stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
+			        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
+			         counts.stage != vk::ShaderStageFlagBits::eCompute));
+			prepared->commit_program = &program;
 		}
-		const auto shader_stage = NativeShaderStage(program.stage);
-		push_stages |= shader_stage;
-		EXIT_IF((pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
-		         (shader_stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
-		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
-		         shader_stage != vk::ShaderStageFlagBits::eCompute));
+		write_count += prepared->commit_counts.writes;
+		image_descriptor_count += prepared->commit_counts.images;
+		push_stages |= prepared->commit_counts.stage;
 	}
+	ExecRegions::InDraw(ExecRegions::CommitCounts);
 	// The written ranges do not depend on the read, so collect them once per commit
 	// (bound images can number in the hundreds; slot lookups per read dominated here).
 	bool     written_ready = false;
