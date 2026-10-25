@@ -89,7 +89,7 @@ constexpr ControlDef kControls[] = {
     {"Options", "Options", "Return", "Start", System},
     {"TouchPad", "Touch pad click", "Backspace", "Touchpad", System},
     {"TouchPadRight", "Touch pad right", "Tab", nullptr, System},
-    {"GyroToggle", "Gyro emulation toggle", "", "Back", System},
+    {"GyroToggle", "Gyro emulation toggle", "", "", System},
     {"TouchPadMode", "Emulated touch pad mode", "F6", "", System},
     {"LeftStickUp", "Up", "W", nullptr, LeftStick},
     {"LeftStickDown", "Down", "S", nullptr, LeftStick},
