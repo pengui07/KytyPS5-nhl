@@ -428,6 +428,18 @@ private:
 	[[nodiscard]] bool ReuseTextureLookup(TextureDescDerivation& derived, TextureBinding& binding);
 	static constexpr size_t MaxTextureDescs = size_t {1} << 16u;
 	std::unordered_map<TextureDescKey, TextureDescDerivation, TextureDescKeyHash> m_texture_descs;
+	using TextureDescEntry = std::unordered_map<TextureDescKey, TextureDescDerivation, TextureDescKeyHash>::value_type;
+	// The descriptions by key hash, direct-mapped in front of the map: a hit reads only the
+	// entry, which the caller reads anyway (the map's bucket array and chain were 2% of the
+	// execution thread). Map elements stay in place; cleared with the map.
+	struct TextureDescFront {
+		uint64_t          hash  = 0;
+		TextureDescEntry* entry = nullptr;
+	};
+	static constexpr size_t TextureDescFrontSize = 4096;
+	std::array<TextureDescFront, TextureDescFrontSize> m_texture_desc_front {};
+	[[nodiscard]] TextureDescEntry* FindTextureDesc(const TextureDescKey& key);
+	TextureDescEntry*               AddTextureDesc(const TextureDescKey& key, TextureDescDerivation&& derived);
 	// Bindings point into m_texture_descs until their views are acquired: a full map is cleared
 	// once the bindings of the operation are reset.
 	bool m_clear_texture_descs = false;

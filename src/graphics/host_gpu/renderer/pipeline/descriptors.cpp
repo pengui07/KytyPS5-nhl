@@ -763,6 +763,35 @@ RenderExecutor::MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   
 	return key;
 }
 
+static size_t TextureDescFrontSlot(uint64_t hash, size_t size) {
+	return static_cast<size_t>((hash ^ (hash >> 29u)) & (size - 1));
+}
+
+RenderExecutor::TextureDescEntry* RenderExecutor::FindTextureDesc(const TextureDescKey& key) {
+	const uint64_t hash  = TextureDescKeyHash {}(key);
+	auto&          front = m_texture_desc_front[TextureDescFrontSlot(hash, TextureDescFrontSize)];
+	if (front.entry != nullptr && front.hash == hash && front.entry->first == key) {
+		return front.entry;
+	}
+	const auto found = m_texture_descs.find(key);
+	if (found == m_texture_descs.end()) {
+		return nullptr;
+	}
+	front = {hash, &*found};
+	return &*found;
+}
+
+RenderExecutor::TextureDescEntry* RenderExecutor::AddTextureDesc(const TextureDescKey& key,
+                                                                 TextureDescDerivation&& derived) {
+	if (m_texture_descs.size() >= MaxTextureDescs) {
+		m_clear_texture_descs = true;
+	}
+	auto*          entry = &*m_texture_descs.emplace(key, std::move(derived)).first;
+	const uint64_t hash  = TextureDescKeyHash {}(key);
+	m_texture_desc_front[TextureDescFrontSlot(hash, TextureDescFrontSize)] = {hash, entry};
+	return entry;
+}
+
 bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureBinding& binding) {
 	auto&       texture_cache = m_context.GetTextureCache();
 	auto&       found         = derived.found;
@@ -825,14 +854,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (!storage && !table_candidate && examined == nullptr &&
 		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			const auto key    = MakeTextureDescKey(resource, value);
-			auto       cached = m_texture_descs.find(key);
-			if (cached == m_texture_descs.end()) {
+			auto*      cached = FindTextureDesc(key);
+			if (cached == nullptr) {
 				TextureDescDerivation derived;
 				derived.desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
-				if (m_texture_descs.size() >= MaxTextureDescs) {
-					m_clear_texture_descs = true;
-				}
-				cached = m_texture_descs.emplace(key, std::move(derived)).first;
+				cached       = AddTextureDesc(key, std::move(derived));
 			}
 			auto& derived = cached->second;
 			if (derived.found.valid) {
@@ -853,15 +879,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 
 	// The description is computed once per T# and view of it; images are looked up every time.
 	const auto key    = MakeTextureDescKey(resource, value);
-	auto       cached = m_texture_descs.find(key);
-	if (cached == m_texture_descs.end()) {
+	auto*      cached = FindTextureDesc(key);
+	if (cached == nullptr) {
 		// Derived before insertion: a derivation that exits (softly, for table candidates) leaves
 		// nothing behind.
-		auto derived = DeriveTextureDesc(resource, descriptor);
-		if (m_texture_descs.size() >= MaxTextureDescs) {
-			m_clear_texture_descs = true;
-		}
-		cached = m_texture_descs.emplace(key, std::move(derived)).first;
+		cached = AddTextureDesc(key, DeriveTextureDesc(resource, descriptor));
 	}
 	auto& derived = cached->second;
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
@@ -1173,6 +1195,7 @@ void RenderExecutor::ResetBindings() {
 	if (m_clear_texture_descs) {
 		m_clear_texture_descs = false;
 		m_texture_descs.clear();
+		m_texture_desc_front.fill({});
 		m_texture_descs_generation++;
 	}
 }
@@ -1505,9 +1528,8 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			if (!same_images && !(slot_reuse && last_images[i] == snapshot.images[i])) {
 				ExecRegions::Note(ExecRegions::ImageMapLookups);
 				ExecRegions::InDraw(ExecRegions::StagesImages);
-				const auto cached =
-				    m_texture_descs.find(MakeTextureDescKey(resource, snapshot.images[i]));
-				derived = cached != m_texture_descs.end() ? &cached->second : nullptr;
+				auto* const cached = FindTextureDesc(MakeTextureDescKey(resource, snapshot.images[i]));
+				derived            = cached != nullptr ? &cached->second : nullptr;
 				ExecRegions::InDraw(ExecRegions::StagesMap);
 			} else {
 				ExecRegions::Note(ExecRegions::ImageMemoDesc);
