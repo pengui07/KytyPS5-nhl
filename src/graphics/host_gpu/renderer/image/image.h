@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <array>
 #include <atomic>
 #include <compare>
 #include <limits>
@@ -78,7 +79,34 @@ public:
 	[[nodiscard]] vk::ImageView PrepareShadowStorage(const ImageViewInfo& view_info);
 	// Copies shadow subresources prepared since the last flush back into the block image.
 	void FlushShadowStorage();
-	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
+	// Transitions mostly need one barrier: up to Inline of them stay in the object (a heap
+	// allocation per transition was about 0.5% of the execution thread).
+	class Barriers {
+	public:
+		static constexpr size_t Inline = 2;
+		void push_back(const vk::ImageMemoryBarrier2& barrier) {
+			if (m_size < Inline) {
+				m_inline[m_size] = barrier;
+			} else {
+				if (m_size == Inline) m_heap.assign(m_inline.begin(), m_inline.end());
+				m_heap.push_back(barrier);
+			}
+			m_size++;
+		}
+		[[nodiscard]] bool                           empty() const noexcept { return m_size == 0; }
+		[[nodiscard]] size_t                         size() const noexcept { return m_size; }
+		[[nodiscard]] const vk::ImageMemoryBarrier2* data() const noexcept {
+			return m_size > Inline ? m_heap.data() : m_inline.data();
+		}
+		[[nodiscard]] const vk::ImageMemoryBarrier2* begin() const noexcept { return data(); }
+		[[nodiscard]] const vk::ImageMemoryBarrier2* end() const noexcept { return data() + m_size; }
+		[[nodiscard]] const vk::ImageMemoryBarrier2& operator[](size_t index) const noexcept { return data()[index]; }
+
+	private:
+		std::array<vk::ImageMemoryBarrier2, Inline> m_inline {};
+		std::vector<vk::ImageMemoryBarrier2>        m_heap;
+		size_t                                      m_size = 0;
+	};
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,

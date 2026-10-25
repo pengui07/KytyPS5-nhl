@@ -1426,6 +1426,12 @@ Toward 120 fps (2026-10-23):
   3.433 us (-1.8%), fps 65.3 -> 66.8. `KYTY_LEAN_VERIFY=1` runs the full lookup for every kept slot,
   the skipped rebind and transitions, and exits on any difference: none in 30 s of play and a
   3-minute match.
+* Tried: the same for each unchanged slot of a draw that changes some of its T#s (the slot keeps its
+  binding while the epoch holds, the rebind and transitions run). Verified clean in play, but the
+  paused in-boot A/B (6 rounds) was 3.290 vs 3.276 us a draw: dropped.
+* `Image::GetBarriers` keeps up to two barriers in the object instead of a vector (a heap allocation
+  per transition that needed one was about 0.5% of the execution thread).
+* PGO v18 (2026-10-25, recorded on f1541bf1, the merge of the 14 newer upstream commits).
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
@@ -1581,7 +1587,8 @@ the buffer slot memos, texel version table, unmap log and guest CPU sets had cha
 batching, the second draw resolver and the label path of `WRITE_DATA` since v11). Profile v17
 (2026-10-25, recorded on bc8b1125, the merge of nhl27-eadb: the merged build had kept profile data
 for only part of its functions, 1107 mismatches): three 3-minute matches 78.4 / 76.3 / 69.9 fps at
-60 Hz (the merge on v16: 71.0 with a cold shader cache / 67.0 / 70.7).
+60 Hz (the merge on v16: 71.0 with a cold shader cache / 67.0 / 70.7). Profile v18 (2026-10-25,
+recorded on f1541bf1: lean draws, the region timers and the merge of 14 more upstream commits).
 
 Single fixed-save matches of the same build differ by up to 5 fps at 60 Hz (52.2 and 57.1 within
 an hour): compare builds with `exe-ab.sh` (per-draw cost in paused boots), not one match each.
