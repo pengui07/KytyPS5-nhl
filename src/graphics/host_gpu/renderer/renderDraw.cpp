@@ -499,10 +499,12 @@ struct RenderExecutor::ResolvedDraw {
 	std::atomic_bool  busy {false};
 };
 
-// More resolutions than operations can wait between the resolve and execution threads, so the
-// resolve thread only ever waits for room in that queue.
+// A resolver that gets this far ahead of the execution thread waits for the oldest resolution to be
+// released. Each resolution is about 38 KB: 320 of them (12 MB) did not stay in cache or in the TLB's
+// reach, and the execution thread read them cold (paused in-boot A/B, 48 per draw resolver instead of
+// 160: draw -1.2%, dispatch -1.9%; 24 let the resolvers fall behind).
 struct RenderExecutor::ResolvedDrawRing {
-	static constexpr size_t Size = 320;
+	static constexpr size_t Size = 96;
 
 	std::array<ResolvedDraw, Size> draws;
 	size_t                         next = 0;
