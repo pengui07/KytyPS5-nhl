@@ -6,7 +6,7 @@ void CheckPipelineWarmup(VulkanHarness& vulkan) {
   const auto path = std::filesystem::temp_directory_path() /
       ("kyty-warmup-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
   {
-    PipelineCache cache(graphics);
+    PipelineCache cache(graphics, nullptr);
     vk::PipelineCache driver;
     vk::PipelineCacheCreateInfo create{};
     Require(name, "driver cache creation",

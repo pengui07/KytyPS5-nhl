@@ -1,5 +1,6 @@
 #include "common/hostException.h"
 #include "common/virtualMemory.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/rangeSet.h"
 
@@ -40,6 +41,12 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
+
+namespace Libs::Graphics {
+// Unit-test stub: the test process has no GPU thread, so page-protection
+// stats attribute to the calling (non-GPU) thread.
+bool GuestGpu::IsGpuThread() noexcept { return false; }
+} // namespace Libs::Graphics
 
 namespace {
 

@@ -29,6 +29,8 @@ jobs:
 
   windows:
     name: Build KytyPS5 (Windows)
+    # The glslang vcpkg install costs ~25 min on a cold cache; the cache key above
+    # keeps it warm after the first run.
     needs: metadata
     runs-on: windows-2022
 
@@ -41,42 +43,27 @@ jobs:
       - name: Setup Visual Studio environment
         uses: ilammy/msvc-dev-cmd@v1
 
-      - name: Locate vcpkg
-        id: vcpkg
-        shell: pwsh
-        run: |
-          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
-          $portHash = (Get-FileHash "$vcpkgRoot\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash
-          "root=$vcpkgRoot" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "port_hash=$($portHash.ToLowerInvariant())" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      - name: Cache glslang
-        id: glslang_cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
-          key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
-
       - name: Install glslang
         shell: pwsh
         run: |
-          $vcpkgRoot = "${{ steps.vcpkg.outputs.root }}"
-          if ("${{ steps.glslang_cache.outputs.cache-hit }}" -ne "true") {
-            vcpkg install glslang[tools,opt]:x64-windows
+          # Prebuilt Khronos binary instead of the vcpkg port: building glslang from
+          # source cost ~20 min per run and that cache never populated, so every
+          # Windows run spent its first half hour here before reaching the build.
+          $version = "16.6.0"
+          $url = "https://github.com/KhronosGroup/glslang/releases/download/$version/glslang-$version-windows-x86_64-release.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "glslang.zip"
+          $dir = Join-Path $env:RUNNER_TEMP "glslang-$version"
+          curl.exe --silent --show-error --fail --location --retry 3 --output $zip $url
+          Expand-Archive $zip -DestinationPath $dir -Force
+          $bin = Join-Path $dir "bin"
+          if (-not (Test-Path (Join-Path $bin "glslang.exe"))) {
+            throw "glslang.exe is missing from $url"
           }
-          "$vcpkgRoot\installed\x64-windows\tools\glslang" |
-            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & (Join-Path $bin "glslang.exe") --version
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Install Qt 6.10.3
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.10.3"
-          host: windows
-          target: desktop
-          arch: win64_msvc2022_64
-          cache: true
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
@@ -88,8 +75,9 @@ jobs:
           cmake --version
           ninja --version
           clang-cl --version
-          glslangValidator --version
-          echo Qt6_DIR=%Qt6_DIR%
+          glslang --version
+          cargo --version
+          rustc --version
 
       - name: Configure
         shell: cmd
@@ -104,13 +92,12 @@ jobs:
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
             -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_PREFIX_PATH="%Qt6_DIR%"
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
       - name: Build
         shell: cmd
         run: |
-          cmake --build _Build/windows --target launcher ^
+          cmake --build _Build/windows --target launcher kyty_emulator kyty_updater ^
             audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
@@ -202,7 +189,7 @@ jobs:
         shell: bash
         run: |
           cmake --build _Build/macos \
-            --target launcher audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+            --target launcher kyty_emulator kyty_updater audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
@@ -310,241 +297,6 @@ jobs:
             clang \
             glslang-tools \
             libasound2-dev \
-            libdbus-1-dev \
-            libgl1-mesa-dev \
-            libpulse-dev \
-            libudev-dev \
-            libwayland-dev \
-            libx11-dev \
-            libxcursor-dev \
-            libxext-dev \
-            libxfixes-dev \
-            libxi-dev \
-            libxkbcommon-dev \
-            libxrandr-dev \
-            libxss-dev \
-            libxtst-dev \
-            lld \
-            pkg-config \
-            wayland-protocols
-
-      - name: Install Qt 6.10.3
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.10.3"
-          host: linux
-          target: desktop
-          arch: linux_gcc_64
-          cache: true
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-
-      - name: Verify toolchain
-        shell: bash
-        run: |
-          git --version
-          cmake --version
-          ninja --version
-          clang++ --version
-          ld.lld --version
-          glslangValidator --version
-          echo "Qt6_DIR=$Qt6_DIR"
-
-      - name: Configure
-        shell: bash
-        run: |
-          mkdir -p _Build
-          cmake -S . -B _Build/linux \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
-            -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
-            -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
-            -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
-            -DCMAKE_C_COMPILER=clang \
-            -DCMAKE_CXX_COMPILER=clang++ \
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_PREFIX_PATH="$Qt6_DIR" 2>&1 | tee _Build/configure.log
-          exit "${PIPESTATUS[0]}"
-
-      - name: Verify SDL3 backends
-        shell: bash
-        run: |
-          status=0
-          for feature in SDL_ALSA SDL_PULSEAUDIO SDL_WAYLAND SDL_X11 SDL_LIBUDEV SDL_DBUS; do
-            if grep -qE "^--   ${feature} +\\(Wanted: ON\\): ON" _Build/configure.log; then
-              echo "ok   ${feature}"
-            else
-              echo "FAIL ${feature} is not enabled"
-              status=1
-            fi
-          done
-          exit "$status"
-
-      - name: Build
-        shell: bash
-        run: |
-          cmake --build _Build/linux \
-            --target launcher page_manager_tests memory_tracker_tests \
-              audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
-              resource_tracking_tests scalar_provenance_tests \
-              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
-            --parallel
-
-      - name: Test
-        shell: bash
-        run: |
-          ctest --test-dir _Build/linux --output-on-failure \
-            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
-
-      - name: Install
-        shell: bash
-        run: |
-          cmake --install _Build/linux --prefix _Build/linux/install
-
-      - name: Verify artifacts
-        shell: bash
-        run: |
-          file _Build/linux/install/kyty_launcher
-          file _Build/linux/install/kyty_emulator
-          test -x _Build/linux/install/kyty_updater
-          file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
-          ldd _Build/linux/install/kyty_emulator > /dev/null
-          readelf -d _Build/linux/install/kyty_launcher | grep -q 'RPATH.*\$ORIGIN/lib'
-          while IFS= read -r -d '' binary; do
-            while read -r dependency; do
-              test -e "_Build/linux/install/lib/$dependency"
-            done < <(
-              readelf -d "$binary" |
-                sed -n 's/.*Shared library: \[\(libQt6[^]]*\|libicu[^]]*\)\].*/\1/p'
-            )
-          done < <(
-            find _Build/linux/install/kyty_launcher _Build/linux/install/plugins \
-              -type f \( -name kyty_launcher -o -name '*.so' \) -print0
-          )
-          _Build/linux/install/kyty_emulator --help > /dev/null
-
-      - name: Upload Linux artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: KytyPS5-Linux-x86_64
-          path: _Build/linux/install/**
-          if-no-files-found: error
-
-  slint-windows:
-    name: Build Slint launcher (Windows)
-    needs: metadata
-    runs-on: windows-2022
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Setup Visual Studio environment
-        uses: ilammy/msvc-dev-cmd@v1
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Locate vcpkg
-        id: vcpkg
-        shell: pwsh
-        run: |
-          $vcpkgRoot = Split-Path (Get-Command vcpkg).Source
-          $portHash = (Get-FileHash "$vcpkgRoot\ports\glslang\vcpkg.json" -Algorithm SHA256).Hash
-          "root=$vcpkgRoot" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "port_hash=$($portHash.ToLowerInvariant())" |
-            Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      - name: Cache glslang
-        id: glslang_cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ steps.vcpkg.outputs.root }}\installed\x64-windows
-          key: glslang-${{ runner.os }}-${{ runner.arch }}-${{ steps.vcpkg.outputs.port_hash }}-tools-opt
-
-      - name: Install glslang
-        shell: pwsh
-        run: |
-          $vcpkgRoot = "${{ steps.vcpkg.outputs.root }}"
-          if ("${{ steps.glslang_cache.outputs.cache-hit }}" -ne "true") {
-            vcpkg install glslang[tools,opt]:x64-windows
-          }
-          "$vcpkgRoot\installed\x64-windows\tools\glslang" |
-            Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.11
-
-      - name: Verify toolchain
-        shell: cmd
-        run: |
-          git --version
-          cmake --version
-          ninja --version
-          clang-cl --version
-          glslangValidator --version
-          cargo --version
-          rustc --version
-
-      - name: Configure
-        shell: cmd
-        run: |
-          cmake -S . -B _Build/slint-windows ^
-            -G Ninja ^
-            -DCMAKE_BUILD_TYPE=Release ^
-            -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON ^
-            -DKYTY_BUILD_ORIGIN=%KYTY_BUILD_ORIGIN% ^
-            -DKYTY_BUILD_REPOSITORY=%KYTY_BUILD_REPOSITORY% ^
-            -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
-            -DKYTY_BUILD_LAUNCHER=OFF ^
-            -DKYTY_BUILD_SLINT_LAUNCHER=ON ^
-            -DCMAKE_C_COMPILER=clang-cl ^
-            -DCMAKE_CXX_COMPILER=clang-cl ^
-            -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
-
-      - name: Build
-        shell: cmd
-        run: |
-          cmake --build _Build/slint-windows --target kyty_slint_launcher kyty_emulator kyty_updater --parallel
-
-      - name: Install
-        shell: cmd
-        run: |
-          cmake --install _Build/slint-windows --prefix _Build/slint-windows/install
-
-      - name: Upload Slint Windows artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: KytyPS5-Slint-Windows-x64
-          path: _Build/slint-windows/install/**
-          if-no-files-found: error
-
-  slint-linux:
-    name: Build Slint launcher (Linux)
-    needs: metadata
-    runs-on: ubuntu-24.04
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install build dependencies
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends --yes \
-            clang \
-            glslang-tools \
-            libasound2-dev \
             libcurl4-openssl-dev \
             libdbus-1-dev \
             libfontconfig1-dev \
@@ -587,57 +339,78 @@ jobs:
         shell: bash
         run: |
           mkdir -p _Build
-          cmake -S . -B _Build/slint-linux \
+          cmake -S . -B _Build/linux \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=ON \
             -DKYTY_BUILD_ORIGIN="$KYTY_BUILD_ORIGIN" \
             -DKYTY_BUILD_REPOSITORY="$KYTY_BUILD_REPOSITORY" \
             -DKYTY_RELEASE_TAG="${{ needs.metadata.outputs.release_tag }}" \
-            -DKYTY_BUILD_LAUNCHER=OFF \
-            -DKYTY_BUILD_SLINT_LAUNCHER=ON \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_C_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache 2>&1 | tee _Build/configure.log
+          exit "${PIPESTATUS[0]}"
+
+      - name: Verify SDL3 backends
+        shell: bash
+        run: |
+          status=0
+          for feature in SDL_ALSA SDL_PULSEAUDIO SDL_WAYLAND SDL_X11 SDL_LIBUDEV SDL_DBUS; do
+            if grep -qE "^--   ${feature} +\\(Wanted: ON\\): ON" _Build/configure.log; then
+              echo "ok   ${feature}"
+            else
+              echo "FAIL ${feature} is not enabled"
+              status=1
+            fi
+          done
+          exit "$status"
 
       - name: Build
         shell: bash
         run: |
-          cmake --build _Build/slint-linux \
-            --target kyty_slint_launcher kyty_emulator kyty_updater \
+          cmake --build _Build/linux \
+            --target launcher kyty_emulator kyty_updater page_manager_tests memory_tracker_tests \
+              audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+              resource_tracking_tests scalar_provenance_tests \
+              resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
             --parallel
+
+      - name: Test
+        shell: bash
+        run: |
+          ctest --test-dir _Build/linux --output-on-failure \
+            -R '^(audio_out2_port|pad_haptics|controller_settings|host_input|ime_dialog|lru_cache|memory_tracker|page_manager|resource_tracking|scalar_provenance|resource_materialization|shader_vertex_metadata|archive_file|avplayer_file|virtual_memory_allocation)$'
 
       - name: Install
         shell: bash
         run: |
-          cmake --install _Build/slint-linux --prefix _Build/slint-linux/install
+          cmake --install _Build/linux --prefix _Build/linux/install
 
       - name: Verify artifacts
         shell: bash
         run: |
-          file _Build/slint-linux/install/kyty_slint_launcher
-          test -x _Build/slint-linux/install/kyty_slint_launcher
-          file _Build/slint-linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
-          _Build/slint-linux/install/kyty_emulator --help > /dev/null
+          file _Build/linux/install/kyty_launcher
+          test -x _Build/linux/install/kyty_launcher
+          file _Build/linux/install/kyty_emulator
+          test -x _Build/linux/install/kyty_updater
+          file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
+          ldd _Build/linux/install/kyty_emulator > /dev/null
+          _Build/linux/install/kyty_emulator --help > /dev/null
 
-      - name: Upload Slint Linux artifacts
+      - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Slint-Linux-x86_64
-          path: _Build/slint-linux/install/**
+          name: KytyPS5-Linux-x86_64
+          path: _Build/linux/install/**
           if-no-files-found: error
-
   release:
     name: Release KytyPS5
     if: >-
       always() &&
       github.event_name == 'workflow_dispatch' &&
-      (needs.windows.result == 'success' ||
-       needs.linux.result == 'success' ||
-       needs.slint-windows.result == 'success' ||
-       needs.slint-linux.result == 'success')
-    needs: [metadata, windows, macos, linux, slint-windows, slint-linux]
+      needs.linux.result == 'success'
+    needs: [metadata, windows, macos, linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -666,20 +439,6 @@ jobs:
           name: KytyPS5-Linux-x86_64
           path: artifacts/KytyPS5-Linux-x86_64
 
-      - name: Download Slint Windows build
-        if: needs.slint-windows.result == 'success'
-        uses: actions/download-artifact@v4
-        with:
-          name: KytyPS5-Slint-Windows-x64
-          path: artifacts/KytyPS5-Slint-Windows-x64
-
-      - name: Download Slint Linux build
-        if: needs.slint-linux.result == 'success'
-        uses: actions/download-artifact@v4
-        with:
-          name: KytyPS5-Slint-Linux-x86_64
-          path: artifacts/KytyPS5-Slint-Linux-x86_64
-
       - name: Package Windows build
         if: needs.windows.result == 'success'
         shell: bash
@@ -707,34 +466,11 @@ jobs:
           test -d "$linux_dir"
           chmod a+x \
             "$linux_dir/kyty_launcher" \
+            "$linux_dir/launcher" \
             "$linux_dir/kyty_emulator" \
             "$linux_dir/kyty_updater"
           tar -C "$linux_dir" -czf \
             "$GITHUB_WORKSPACE/$RELEASE_NAME-Linux-x86_64.tar.gz" .
-
-      - name: Package Slint Windows build
-        if: needs.slint-windows.result == 'success'
-        shell: bash
-        run: |
-          slint_dir="artifacts/KytyPS5-Slint-Windows-x64"
-          test -d "$slint_dir"
-          (
-            cd "$slint_dir"
-            zip -r "$GITHUB_WORKSPACE/$RELEASE_NAME-Slint-Windows-x64.zip" .
-          )
-
-      - name: Package Slint Linux build
-        if: needs.slint-linux.result == 'success'
-        shell: bash
-        run: |
-          slint_dir="artifacts/KytyPS5-Slint-Linux-x86_64"
-          test -d "$slint_dir"
-          chmod a+x \
-            "$slint_dir/kyty_slint_launcher" \
-            "$slint_dir/kyty_emulator" \
-            "$slint_dir/kyty_updater"
-          tar -C "$slint_dir" -czf \
-            "$GITHUB_WORKSPACE/$RELEASE_NAME-Slint-Linux-x86_64.tar.gz" .
 
       - name: Create release
         shell: bash
@@ -745,9 +481,7 @@ jobs:
           for artifact in \
             "$RELEASE_NAME-Windows-x64.zip" \
             "$RELEASE_NAME-macOS-x86_64.zip" \
-            "$RELEASE_NAME-Linux-x86_64.tar.gz" \
-            "$RELEASE_NAME-Slint-Windows-x64.zip" \
-            "$RELEASE_NAME-Slint-Linux-x86_64.tar.gz"; do
+            "$RELEASE_NAME-Linux-x86_64.tar.gz"; do
             if [[ -f "$artifact" ]]; then
               assets+=("$artifact")
             fi

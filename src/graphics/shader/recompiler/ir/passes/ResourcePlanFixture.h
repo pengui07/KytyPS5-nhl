@@ -164,10 +164,125 @@ struct ResourcePlanFixture {
   void operator()(SampledResourcePair& v) { Fields(v.image,v.sampler,v.first_use_pc); }
   void operator()(ShaderInfo& v) { Fields(v.buffers,v.images,v.samplers,v.sampled_pairs,
    v.vertex_fetch_components,v.vertex_offset_sgpr,v.instance_offset_sgpr,v.has_bitwise_xor,v.uses_dma,v.native_draw); }
-  void operator()(DescriptorSource::IndirectDescriptor::SelectorRead& v) { Fields(v.source,v.stride,v.offset); }
-  void operator()(DescriptorSource::IndirectDescriptor& v) { Fields(v.selector,v.table_source,
-   v.table_offset,v.table_immediate,v.table_stride,v.table_record_bytes,v.table_scalar,v.workgroup_axis,
-   v.key_count,v.selector_first,v.selector_mask,v.sources); }
+  void operator()(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows& v) {
+    Fields(v.source, v.stride);
+  }
+  void operator()(std::optional<DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows>& v) {
+    bool present = v.has_value();
+    (*this)(present);
+    if (!input) {
+      if (present && ok) (*this)(*v);
+      return;
+    }
+    v.reset();
+    if (!present || !ok) return;
+    uint32_t source = 0, stride = 0;
+    (*this)(source);
+    (*this)(stride);
+    if (!ok) return;
+    v.emplace(source, stride);
+  }
+  void operator()(DescriptorSource::IndirectDescriptor::SelectorRead& v) {
+    Fields(v.source, v.stride, v.offset, v.maximum, v.bit_offset, v.bit_mask,
+           v.global, v.bitset, v.rows, v.byte_ranges);
+  }
+  void operator()(std::optional<DescriptorSource::IndirectDescriptor::SelectorRead>& v) {
+    using S = DescriptorSource::IndirectDescriptor::SelectorRead;
+    bool present = v.has_value();
+    (*this)(present);
+    if (!input) {
+      if (present && ok) (*this)(*v);
+      return;
+    }
+    v.reset();
+    if (!present || !ok) return;
+    uint32_t source = 0, stride = 0, offset = 0, maximum = 0, bit_offset = 0, bit_mask = 0;
+    bool global = false, bitset = false;
+    std::optional<S::CountedRows> rows;
+    std::vector<std::pair<uint32_t, uint32_t>> byte_ranges;
+    (*this)(source);
+    (*this)(stride);
+    (*this)(offset);
+    (*this)(maximum);
+    (*this)(bit_offset);
+    (*this)(bit_mask);
+    (*this)(global);
+    (*this)(bitset);
+    (*this)(rows);
+    (*this)(byte_ranges);
+    if (!ok) return;
+    v.emplace(source, stride, offset, maximum, bit_offset, bit_mask, global, bitset,
+              std::move(rows), std::move(byte_ranges));
+  }
+  void operator()(DescriptorSource::IndirectDescriptor::PointerTable& v) {
+    Fields(v.offset, v.stride, v.count, v.indexed);
+  }
+  void operator()(std::optional<DescriptorSource::IndirectDescriptor::PointerTable>& v) {
+    bool present = v.has_value();
+    (*this)(present);
+    if (!input) {
+      if (present && ok) (*this)(*v);
+      return;
+    }
+    v.reset();
+    if (!present || !ok) return;
+    uint32_t offset = 0, stride = 0, count = 0;
+    bool indexed = false;
+    (*this)(offset);
+    (*this)(stride);
+    (*this)(count);
+    (*this)(indexed);
+    if (!ok) return;
+    v.emplace(offset, stride, count, indexed);
+  }
+  void operator()(DescriptorSource::IndirectDescriptor& v) {
+    Fields(v.selector, v.table_source, v.table_offset, v.table_immediate, v.table_stride,
+           v.table_record_bytes, v.table_scalar, v.indexed, v.signed_count, v.workgroup_axis,
+           v.table_mask, v.table_array, v.key_count, v.selector_first, v.selector_mask, v.sources,
+           v.table_maximum, v.pointer_table);
+  }
+  void operator()(std::optional<DescriptorSource::IndirectDescriptor>& v) {
+    using D = DescriptorSource::IndirectDescriptor;
+    bool present = v.has_value();
+    (*this)(present);
+    if (!input) {
+      if (present && ok) (*this)(*v);
+      return;
+    }
+    v.reset();
+    if (!present || !ok) return;
+    std::optional<D::SelectorRead> selector;
+    uint32_t table_source = 0, table_offset = 0, table_immediate = 0, table_stride = 0;
+    uint32_t table_record_bytes = 0, workgroup_axis = 0, table_mask = 0;
+    bool table_scalar = false, indexed = false, signed_count = false, table_array = false;
+    Value key_count, selector_first, selector_mask;
+    std::vector<uint32_t> sources;
+    std::optional<uint32_t> table_maximum;
+    std::optional<D::PointerTable> pointer_table;
+    (*this)(selector);
+    (*this)(table_source);
+    (*this)(table_offset);
+    (*this)(table_immediate);
+    (*this)(table_stride);
+    (*this)(table_record_bytes);
+    (*this)(table_scalar);
+    (*this)(indexed);
+    (*this)(signed_count);
+    (*this)(workgroup_axis);
+    (*this)(table_mask);
+    (*this)(table_array);
+    (*this)(key_count);
+    (*this)(selector_first);
+    (*this)(selector_mask);
+    (*this)(sources);
+    (*this)(table_maximum);
+    (*this)(pointer_table);
+    if (!ok) return;
+    v.emplace(std::move(selector), std::move(table_maximum), std::move(pointer_table), table_source,
+              table_offset, table_immediate, table_stride, table_record_bytes, table_scalar, indexed,
+              signed_count, workgroup_axis, table_mask, table_array, key_count, selector_first,
+              selector_mask, std::move(sources));
+  }
   void operator()(DescriptorSource& v) { Fields(v.dwords,v.dword_count,v.indirect_descriptor); if (v.dword_count > 8) ok = false; }
   void operator()(ResourcePlan::DescriptorGather::Word& v) { Fields(v.value,v.kind); }
   void operator()(ResourcePlan::DescriptorGather& v) { Fields(v.words,v.valid,v.needs_flat); }

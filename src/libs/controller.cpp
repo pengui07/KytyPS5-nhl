@@ -946,9 +946,9 @@ void GameController::ApplyVibration() {
 	const auto scale       = duration != 0 ? GetSettingScale(Setting::VibrationIntensity) : 0.0f;
 	const auto large_motor = Scale(m_vibration[0], scale);
 	const auto small_motor = Scale(m_vibration[1], scale);
-	// The DualSense haptics backend drives a single pad, so only player 1 uses it.
-	if (m_player == 0 &&
-	    DualSenseHaptics::SetVibration(m_active_id, large_motor, small_motor, duration)) {
+	// Each player's own pad handles haptics; falls back to plain SDL rumble below
+	// when the backend declines (non-DualSense pad or haptics not routing).
+	if (DualSenseHaptics::SetVibration(m_active_id, large_motor, small_motor, duration)) {
 		return;
 	}
 

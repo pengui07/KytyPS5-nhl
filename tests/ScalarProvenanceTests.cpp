@@ -986,7 +986,8 @@ void TestCompleteUMinReduction() {
     const auto cross = fixture.Emit(ValueOpcode::Permlane16U32,
         {test == Case::CrossSource ? source : prefix,
          Value(test == Case::CrossSelectorLow ? 0xfffffff0u : UINT32_MAX),
-         Value(test == Case::CrossSelectorHigh ? 0xfffffff0u : UINT32_MAX), cross_exec});
+         Value(test == Case::CrossSelectorHigh ? 0xfffffff0u : UINT32_MAX), cross_exec,
+         Value(0u)});
     cross.Instruction()->SetFlags(PermlaneFlags{
         .x16 = test != Case::CrossRow, .fetch_inactive = test == Case::CrossFetch,
         .bound_control = test != Case::CrossBound});
@@ -1152,39 +1153,54 @@ int DbgExitHandler(const char *, int, fmt::text_style, std::string_view text) {
   throw std::runtime_error(std::string(text));
 }
 
+// Reached through Common::Thread on Windows (threads.cpp is linked in for the config/experiment
+// globals); report it as an ordinary failure instead of leaving the symbol undefined.
+int DbgNotImplementedHandler(const char *expr, const char *, int) {
+  throw std::runtime_error(std::string("not implemented (") + expr + ")");
+}
+
 void DbgExit(int) { std::abort(); }
 
 } // namespace Common
 
 int main() {
   try {
-    TestImmediateFlatteningAndGvn();
-    TestRawScalarComponentAlignment();
-    TestScalarMemoryDomainMismatchFails();
-    TestDynamicReadRemainsTyped();
-    TestNestedSrtWalk();
-    TestShaderBaseAndUserData();
-    TestCarryAndBitFields();
-    TestInvariantAndDivergentPhi();
-    TestOperandMutationLifecycle();
-    TestControlDependentStandaloneLoadStaysTyped();
-    TestRuntime64BitDescriptorOps();
-    TestUniformFirstLaneSamplerLod();
-    TestFloatComparisonDescriptorInputs();
-    TestSharedIntegerRuntimeDependencies();
-    TestConstantBufferBounds();
-    TestReadLaneElimination();
-    TestPartialWaveReductionStructure();
-    TestPartialWaveReductionFoldedFill();
-    TestPartialWaveReductionRejectsUnprovenPatterns();
-    TestPartialWaveReductionCompoundFillCondition();
-    TestPartialWaveReductionCompareDerivedFillCondition();
-    TestPartialWaveReductionEquivalence();
-    TestCompleteUMinReduction();
-    TestOptimizationPipeline();
-    TestControlFlowValueSurvivesReadLaneFolding();
-    TestDeadPhiCyclesAndPlanningRoots();
-    TestUndefinedRuntimeValueFails();
+    const auto Run = [](const char *name, auto test) {
+      std::cout << "TypedValuePlanningTests: run " << name << std::endl;
+      try {
+        test();
+      } catch (const std::exception &exception) {
+        throw std::runtime_error(std::string(name) + ": " + exception.what());
+      }
+      std::cout << "TypedValuePlanningTests: ok " << name << std::endl;
+    };
+    Run("immediate-flattening", TestImmediateFlatteningAndGvn);
+    Run("raw-scalar-alignment", TestRawScalarComponentAlignment);
+    Run("scalar-domain-mismatch", TestScalarMemoryDomainMismatchFails);
+    Run("dynamic-read-typed", TestDynamicReadRemainsTyped);
+    Run("nested-walk", TestNestedSrtWalk);
+    Run("shader-base", TestShaderBaseAndUserData);
+    Run("carry-bitfields", TestCarryAndBitFields);
+    Run("invariant-divergent-phi", TestInvariantAndDivergentPhi);
+    Run("operand-mutation", TestOperandMutationLifecycle);
+    Run("control-dependent-load", TestControlDependentStandaloneLoadStaysTyped);
+    Run("runtime-64bit", TestRuntime64BitDescriptorOps);
+    Run("uniform-lod", TestUniformFirstLaneSamplerLod);
+    Run("float-comparison", TestFloatComparisonDescriptorInputs);
+    Run("shared-integer-deps", TestSharedIntegerRuntimeDependencies);
+    Run("constant-buffer-bounds", TestConstantBufferBounds);
+    Run("read-lane-elim", TestReadLaneElimination);
+    Run("partial-reduction", TestPartialWaveReductionStructure);
+    Run("reduction-folded", TestPartialWaveReductionFoldedFill);
+    Run("reduction-reject", TestPartialWaveReductionRejectsUnprovenPatterns);
+    Run("reduction-compound", TestPartialWaveReductionCompoundFillCondition);
+    Run("reduction-compare", TestPartialWaveReductionCompareDerivedFillCondition);
+    Run("reduction-equiv", TestPartialWaveReductionEquivalence);
+    Run("complete-umin", TestCompleteUMinReduction);
+    Run("opt-pipeline", TestOptimizationPipeline);
+    Run("control-flow-fold", TestControlFlowValueSurvivesReadLaneFolding);
+    Run("dead-phi-roots", TestDeadPhiCyclesAndPlanningRoots);
+    Run("undef-runtime", TestUndefinedRuntimeValueFails);
     std::cout << "TypedValuePlanningTests: all cases passed\n";
     return 0;
   } catch (const std::exception &e) {

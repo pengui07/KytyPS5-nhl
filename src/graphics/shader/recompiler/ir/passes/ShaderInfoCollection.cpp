@@ -658,6 +658,11 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	for (uint32_t i = 0; i < inputs.builtin_count; i++) {
 		AddBuiltinInput(info, inputs.builtins[i]);
 	}
+	// Bitmask mirror of the per-buffer live flags above (Stage 2 shader info).
+	info.live_buffers = 0;
+	for (uint32_t i = 0; i < info.buffers.size() && i < 64u; i++) {
+		if (info.buffers[i].live) info.live_buffers |= (1ull << i);
+	}
 	program.shader_info_complete = true;
 }
 

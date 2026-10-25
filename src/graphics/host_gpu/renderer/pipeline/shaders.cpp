@@ -212,17 +212,17 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 
 	for (const auto& binding: bindings) {
 		descriptor_count += binding.descriptorCount;
-		if (binding.descriptorType != vk::DescriptorType::eSampledImage) goto check_storage;
-		sampled_images += binding.descriptorCount;
-		uint32_t stage_stage = 0;
-		for (const auto& other: bindings) {
-			if (other.descriptorType == vk::DescriptorType::eSampledImage &&
-			    other.stageFlags == binding.stageFlags) {
-				stage_stage += other.descriptorCount;
+		if (binding.descriptorType == vk::DescriptorType::eSampledImage) {
+			sampled_images += binding.descriptorCount;
+			uint32_t stage_stage = 0;
+			for (const auto& other: bindings) {
+				if (other.descriptorType == vk::DescriptorType::eSampledImage &&
+				    other.stageFlags == binding.stageFlags) {
+					stage_stage += other.descriptorCount;
+				}
 			}
+			stage_count = std::max(stage_count, stage_stage);
 		}
-		stage_count = std::max(stage_count, stage_stage);
-	check_storage:;
 		const bool storage = binding.descriptorType == vk::DescriptorType::eStorageBuffer;
 		const bool sampler = binding.descriptorType == vk::DescriptorType::eSampler;
 		if (storage) storage_buffers += binding.descriptorCount;

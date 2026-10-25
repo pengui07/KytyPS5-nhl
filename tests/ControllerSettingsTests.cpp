@@ -499,7 +499,7 @@ void TestVirtualUserIdAllocation() {
 	};
 	const Case cases[] = {{1000, {1001, 1002, 1003}},
 	                      {1001, {1002, 1003, 1004}},
-	                      {2147483647, {1001, 1002, 1003}},
+	                      {Config::MAX_USER_ID, {1001, 1002, 1003}},
 	                      {0, {1001, 1002, 1003}}};
 	for (const auto& test: cases) {
 		Config::ConfigOptions options;

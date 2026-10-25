@@ -126,6 +126,14 @@ if(WIN32)
 	endif()
 endif()
 
+# The launcher uses try/catch (background scans); re-enable exceptions, which are
+# off by default in KYTY_CPP_FLAGS.
+if(KYTY_CLANG_CL OR MSVC)
+	target_compile_options(launcher PRIVATE /EHsc)
+else()
+	target_compile_options(launcher PRIVATE -fexceptions)
+endif()
+
 # Next to kyty_emulator.exe in the build dir.
 set_target_properties(launcher PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 

@@ -1183,7 +1183,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-			return false;
+			result = 0u;
+			return true;
 		}
 		address = (base & ~uint64_t {3}) + byte_offset;
 	} else {
@@ -2287,7 +2288,23 @@ bool SrtWalker::DirectReadRun(uint32_t slot, uint32_t count, std::vector<uint32_
 	const auto first = m_program.srt_reads[slot].flat_offset;
 	if (first > flat.size() || count > flat.size() - first) return false;
 	const auto words = std::span(flat).subspan(first, count);
-	if (evaluator.m_runtime.read_memory != nullptr) {
+	// Descriptor evaluation may already have read these words through the memo
+	// (a descriptor evaluated before the flat refresh shares its reads with it).
+	auto& values = evaluator.m_context.values;
+	if (values.size() < m_program.evaluation_value_count) values.resize(m_program.evaluation_value_count);
+	bool memo_hit = true;
+	for (uint32_t i = 0; i < count; ++i) {
+		const auto index = direct[slot + i].evaluation_index;
+		if (index >= values.size() || values[index].generation != evaluator.m_context.generation) {
+			memo_hit = false;
+			break;
+		}
+	}
+	if (memo_hit) {
+		for (uint32_t i = 0; i < count; ++i) {
+			words[i] = static_cast<uint32_t>(values[direct[slot + i].evaluation_index].value);
+		}
+	} else if (evaluator.m_runtime.read_memory != nullptr) {
 		if (!evaluator.m_runtime.read_memory(evaluator.m_runtime.userdata, address, words)) return false;
 	} else if (!Common::Experiments::Enabled(Common::Experiments::FaultPageDirect) ||
 	           !TryFaultPageRead(address, words.data(), words.size_bytes())) {
@@ -2296,8 +2313,6 @@ bool SrtWalker::DirectReadRun(uint32_t slot, uint32_t count, std::vector<uint32_
 		std::memcpy(words.data(), reinterpret_cast<const void*>(address), words.size_bytes());
 	}
 	// Descriptor and condition expressions refer back to these reads through the memo.
-	auto& values = evaluator.m_context.values;
-	if (values.size() < m_program.evaluation_value_count) values.resize(m_program.evaluation_value_count);
 	for (uint32_t i = 0; i < count; ++i) {
 		values[direct[slot + i].evaluation_index] = {words[i], evaluator.m_context.generation};
 	}
@@ -4327,8 +4342,9 @@ bool SrtWalker::ExecuteTapeOp(const ResourcePlan::SrtTape::Op& op,
 				                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 				                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 				if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-					g_tape_stats.failed.fetch_add(1, std::memory_order_relaxed);
-					return false;
+					// PS5 scalar-buffer loads return zero per out-of-range DWORD.
+					result = 0;
+					break;
 				}
 				address = (base & ~uint64_t{3}) + byte_offset;
 			} else {

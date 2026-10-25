@@ -132,11 +132,11 @@ namespace Libs::Graphics {
 struct CommandProcessorTestAccess {
   static void Pending(CommandProcessor& cp, NativeIndirectDraw source) {
     cp.m_pending_instances.push_back(std::move(source));
-    cp.m_pending_instances_sequence = cp.m_num_instances.sequence;
+    cp.m_pending_instances_sequence = cp.m_num_instances_stage.sequence;
   }
   static uint32_t Instances(CommandProcessor& cp) {
     GpuOperation operation;
-    operation.num_instances = cp.m_num_instances;
+    operation.num_instances = cp.m_num_instances_stage;
     return cp.ResolveNumInstances(operation);
   }
   static void PendingShader(CommandProcessor& cp, NativeIndirectDraw source) {
@@ -5662,7 +5662,7 @@ public:
       // `neighbour` after the dispatch was recorded, so its upload wins.
       (void)context.InvalidateMemory(neighbour, 4);
       const std::array<uint64_t, 2> pages{written, neighbour & ~(page - 1)};
-      tables.NoteWrites(pages);
+      tables.NoteWrites(pages, context.UnmapSequence());
       Require(name, "written targets",
               cache.IsRegionGpuModified(written, 0x100) &&
                   cache.HasGpuDirtyBytes(written, 0x100) &&
@@ -27136,30 +27136,6 @@ TestCase VectorAlignByteUsesTwoBitByteOffset() {
   return test;
 }
 
-TestCase ScalarVector64BitFloatInlineConstants() {
-  using O = ShaderOpcode;
-
-  // 64-bit operands receive the double-precision encoding of float inline constants,
-  // for integer B64 opcodes as well (s_mov_b64 s[0:1], 1.0 = 0x3ff0000000000000).
-  std::vector<u32> code;
-  code.push_back(0xbea804f2u); // s_mov_b64 s[40:41], 1.0
-  code.push_back(0x88aa80f0u); // s_or_b64 s[42:43], 0.5, 0
-  AppendVop3(&code, 0x300, 2, InlineU32(32), 244u); // v_lshrrev_b64 v[2:3], 32, 2.0
-  AppendStoreSgprPair(&code, 40, 0);
-  AppendStoreSgprPair(&code, 42, 2);
-  AppendStoreVgpr(&code, 2, 4);
-  AppendStoreVgpr(&code, 3, 5);
-  AppendEnd(&code);
-
-  TestCase test;
-  test.name = "ScalarVector64BitFloatInlineConstants";
-  test.code = std::move(code);
-  test.expected = {0u, 0x3ff00000u, 0u, 0x3fe00000u, 0x40000000u, 0u};
-  test.opcodes = {O::S_MOV_B64, O::S_OR_B64, O::V_LSHRREV_B64, O::V_MOV_B32,
-                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
-  return test;
-}
-
 TestCase VectorFractClampsBelowOne() {
   using O = ShaderOpcode;
 
@@ -44903,7 +44879,6 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFractClampsBelowOne);
   AddCase(ScalarVector64BitFloatInlineConstants);
   AddCase(VectorCarryAndBitCountOps);
-  AddCase(ScalarVector64BitFloatInlineConstants);
   AddCase(VectorMbcntUsesThreadMask);
   AddCase(VectorAddcWritesPerLaneCarryOut);
   AddCase(VectorAddcUsesPerLaneCarryIn);
