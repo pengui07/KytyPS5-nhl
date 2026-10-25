@@ -1465,10 +1465,12 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		std::stable_sort(candidates.begin(), candidates.end(),
 		                 [](const Candidate& a, const Candidate& b) { return a.region.size() < b.region.size(); });
 		std::unordered_map<const IR::Block*, std::unordered_set<const IR::Inst*>> per_lane_merges;
+		std::vector<const std::unordered_set<const IR::Block*>*>                kept_regions;
 		for (auto& candidate: candidates) {
 			if (const char* found = CheckLaneSkip(candidate.header, candidate.skip, candidate.region, per_lane_merges);
 			    found != nullptr) {
 				reject(candidate.header, found);
+				kept_regions.push_back(&candidate.region);
 				continue;
 			}
 			const auto* merge  = candidate.header->terminator.merge_block;
@@ -1487,12 +1489,30 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 				structured.lane_skip_repairs[merge] = {candidate.header, &skip, last_phi};
 			}
 		}
+		// Per-lane selections inside a skip-if region that keeps its ballot go back to theirs: per-lane
+		// bodies under a uniform one cost registers (33037c60 150 -> 144 VGPRs with them back; the
+		// regions of every kept selection, if/else ones too, made it far worse: 136eed67 252).
+		uint32_t nested = 0;
+		for (auto it = structured.lane_skips.begin();
+		     it != structured.lane_skips.end();) {
+			const auto* header = it->first;
+			if (std::ranges::none_of(kept_regions, [&](const auto* region) { return region->contains(header); })) {
+				++it;
+				continue;
+			}
+			if (const auto repair = structured.lane_skip_repairs.find(header->terminator.merge_block);
+			    repair != structured.lane_skip_repairs.end() && repair->second.header == header) {
+				structured.lane_skip_repairs.erase(repair);
+			}
+			it = structured.lane_skips.erase(it);
+			nested++;
+		}
 		t_lane_skip_detail = nullptr;
 		if (lane_skip_debug) {
 			std::string line;
 			for (const auto& [reason, count]: reasons) line += " [" + std::string(reason) + "]=" + std::to_string(count);
-			std::printf("NHL27LANESKIP hash=%016" PRIx64 " ballot_selections=%u per_lane=%zu repaired=%u%s\n",
-			            program.shader_hash, selections, structured.lane_skips.size(), repaired, line.c_str());
+			std::printf("NHL27LANESKIP hash=%016" PRIx64 " ballot_selections=%u per_lane=%zu repaired=%u nested=%u%s\n",
+			            program.shader_hash, selections, structured.lane_skips.size(), repaired, nested, line.c_str());
 		}
 	}
 	const auto lane_skip = [&](const IR::Block* block) -> const LaneSkip* {
