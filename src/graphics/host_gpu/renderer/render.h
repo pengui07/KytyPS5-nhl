@@ -340,6 +340,9 @@ public:
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
+	// RenderContext::CacheDmaBases() for the stage, unless it already ran for the same program,
+	// base registers, buffer set and mappings.
+	void                           CacheDmaBases(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
@@ -348,6 +351,9 @@ public:
 	// After a draw's bindings were committed: the stages whose texture bindings held to here may be
 	// kept by the next draw of their program (ProgramImageMemo::lean_epoch).
 	void FinishLeanBindings(std::span<PreparedBindings* const> bindings);
+	// Whether bindings made at texture epoch `epoch` and image set epoch `set_epoch` still hold:
+	// no image changed since, or the set of images did not and none of the stage's direct images did.
+	[[nodiscard]] bool KeptImagesHold(const PreparedBindings& prepared, uint64_t epoch, uint64_t set_epoch);
 	// table_candidate rejects (EXIT) a texture whose guest memory cannot be read, for tables
 	// that keep T#s of freed textures, and declines depth/color conversions. examined receives
 	// the guest range before the lookup depends on the texture cache: a failure without it

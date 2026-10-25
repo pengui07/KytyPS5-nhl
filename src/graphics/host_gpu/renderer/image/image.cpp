@@ -245,7 +245,7 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	    std::ranges::any_of(barriers, [](const vk::ImageMemoryBarrier2& barrier) {
 		    return barrier.oldLayout != barrier.newLayout || barrier.srcAccessMask != barrier.dstAccessMask;
 	    })) {
-		TextureStateChanged();
+		StateChanged();
 	}
 	state = {destination_stage, destination_access, destination_layout};
 	return barriers;
@@ -803,7 +803,7 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
       m_graphics(graphics), m_scheduler(scheduler) {
 	KYTY_PROFILER_FUNCTION();
 	ImageOps::Validate(info);
-	TextureStateChanged();
+	ImageSetChanged();
 	m_cpu_dirty =
 	    !info.data.Empty() && info.metadata.compression == VideoOutCompression::Uncompressed;
 	if (info.pixel_format == vk::Format::eUndefined) {
@@ -1048,7 +1048,7 @@ void Image::FlushShadowStorage() {
 
 Image::~Image() {
 	KYTY_PROFILER_FUNCTION();
-	TextureStateChanged();
+	ImageSetChanged();
 	for (const auto& cached: views) {
 		if (cached.view != nullptr) {
 			m_graphics.device.destroyImageView(cached.view, nullptr);

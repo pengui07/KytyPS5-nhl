@@ -84,6 +84,9 @@ struct ProgramImageMemo {
 	// description's lookup still holding, unchanged until that draw ended: while the epoch keeps
 	// it, the same T#s find the same images and views (UINT64_MAX: none).
 	uint64_t lean_epoch = UINT64_MAX;
+	// The image set epoch (g_image_set_epoch) then: with it unchanged, the bindings also hold while
+	// none of their images changed since lean_epoch (Image::binding_epoch).
+	uint64_t lean_set_epoch = 0;
 	// The attachments of that draw (RenderExecutor::m_lean_targets): its layout transitions hold
 	// for draws with the same ones.
 	uint64_t lean_targets = 0;
@@ -111,6 +114,11 @@ struct PreparedBindings {
 		uint64_t                              generation = 0;
 	};
 	std::vector<BufferSlotKey> buffer_keys;
+	// The DMA base registers' dwords the stage last found buffers for, with its program and the
+	// generations then (see RenderExecutor::CacheDmaBases()).
+	const void*           dma_program    = nullptr;
+	uint64_t              dma_generation = 0;
+	std::vector<uint32_t> dma_bases;
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	// RebindBuffers: what each plain-read slot bound last (see BufferCache::PlainReadHolds()).
 	struct BufferSlotMemo {
@@ -153,8 +161,9 @@ struct PreparedBindings {
 	ProgramBufferMemo* buffer_memo = nullptr;
 	// The texture epoch when PrepareBindings() looked up the images, and whether it kept the
 	// bindings of the program's last draw (ProgramImageMemo::lean_epoch) instead.
-	uint64_t lookup_epoch = 0;
-	bool     lean         = false;
+	uint64_t lookup_epoch     = 0;
+	uint64_t lookup_set_epoch = 0;
+	bool     lean             = false;
 	// Every direct image slot reuses its description's lookup (none written, none with dynamic
 	// mips, no tables): the bindings may be kept by a later draw.
 	bool lean_eligible = false;

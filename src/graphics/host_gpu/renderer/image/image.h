@@ -32,10 +32,18 @@ using ImageId = Common::SlotId;
 // Advances on every change of an image that texture bindings depend on: its lookup state (dirty
 // and modified flags, tracking, stencil association, usage), its layouts, its registration, its
 // replacement or deletion. A draw that binds the same T#s as the draw before it keeps that draw's
-// bindings while the epoch is unchanged (RenderExecutor's repeated draws).
+// bindings while the epoch is unchanged (RenderExecutor's repeated draws), or while no image of
+// its own changed (Image::binding_epoch) and the set of images did not (g_image_set_epoch).
 inline std::atomic<uint64_t> g_texture_epoch {0};
 inline void                  TextureStateChanged() noexcept {
 	g_texture_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+// Advances (with g_texture_epoch) on the changes that are not of one image's own state: images
+// created, registered, unregistered, replaced or deleted, stencil associations.
+inline std::atomic<uint64_t> g_image_set_epoch {0};
+inline void                  ImageSetChanged() noexcept {
+	g_image_set_epoch.fetch_add(1, std::memory_order_relaxed);
+	TextureStateChanged();
 }
 
 struct CachedImageView {
@@ -141,8 +149,15 @@ public:
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
+	// The g_texture_epoch of this image's last change that texture bindings depend on (its lookup
+	// state, usage and layouts; see g_texture_epoch). Written by any thread that changes the image.
+	std::atomic<uint64_t> binding_epoch {0};
+	void                  StateChanged() noexcept {
+		binding_epoch.store(g_texture_epoch.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+	}
+
 	void MarkCpuDirty() {
-		if (!m_cpu_dirty || m_maybe_cpu_dirty) TextureStateChanged();
+		if (!m_cpu_dirty || m_maybe_cpu_dirty) StateChanged();
 		m_cpu_dirty       = true;
 		m_maybe_cpu_dirty = false;
 		HeapChanged();
@@ -155,7 +170,7 @@ public:
 		if (!IsCpuDirty()) {
 			m_maybe_cpu_hash  = HashGuestEdges();
 			m_maybe_cpu_dirty = true;
-			TextureStateChanged();
+			StateChanged();
 			HeapChanged();
 		}
 	}
@@ -163,7 +178,7 @@ public:
 		if (!m_maybe_cpu_dirty || m_cpu_dirty) {
 			EXIT("image cannot resolve maybe-dirty hash\n");
 		}
-		TextureStateChanged();
+		StateChanged();
 		m_maybe_cpu_dirty = false;
 		m_cpu_dirty |= hash != m_maybe_cpu_hash;
 		return m_cpu_dirty;
@@ -173,29 +188,29 @@ public:
 		if (!IsCpuDirty()) {
 			EXIT("clean image cannot complete a refresh\n");
 		}
-		TextureStateChanged();
+		StateChanged();
 		m_cpu_dirty       = false;
 		m_maybe_cpu_dirty = false;
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
 	void               MarkGpuModified() noexcept {
-		if (!m_gpu_modified) TextureStateChanged();
+		if (!m_gpu_modified) StateChanged();
 		m_gpu_modified = true;
 	}
 	void ClearGpuModified() noexcept {
-		if (m_gpu_modified) TextureStateChanged();
+		if (m_gpu_modified) StateChanged();
 		m_gpu_modified = false;
 	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
-		if (!m_buffer_modified) TextureStateChanged();
+		if (!m_buffer_modified) StateChanged();
 		m_buffer_modified = true;
 		HeapChanged();
 	}
 	void ClearBufferModified() noexcept {
-		if (m_buffer_modified) TextureStateChanged();
+		if (m_buffer_modified) StateChanged();
 		m_buffer_modified = false;
 	}
 

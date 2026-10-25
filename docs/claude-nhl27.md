@@ -1441,6 +1441,19 @@ Toward 120 fps (2026-10-23):
   us, fps 79.3 -> 80.3; kept.
 * The NHL 27 FSR3 hook skips dispatches other than its four passes before timing them (it read the
   clock twice on each of 60,000 dispatches a second).
+* DMA bases (`RenderExecutor::CacheDmaBases`): a stage looks its DMA base windows' buffers up again
+  only when its program, the base registers' dwords, the buffer set or the mappings changed
+  (`FindBuffer` only creates what is missing). The lookups (mapped-range walk under the mapping lock,
+  page-table searches) were 25 ms/s in play, 46,000 stages a second (region `dma`). Paused in-boot
+  A/B: draw 3.126 -> 3.111 us.
+* Why stages did not keep their bindings (play, region-timer build): of 340,000 stages a second
+  234,000 kept them; 62,000 had other T#s, 21,000 had a last draw whose bindings did not hold to its
+  end and 23,000 found the texture epoch moved since. Each image now also has its own stamp
+  (`Image::binding_epoch`, set from `g_texture_epoch` by every change of its own lookup state, usage
+  or layouts), and changes of the image set (creation, registration, deletion, replacement, stencil
+  association) advance `g_image_set_epoch`: kept bindings hold while the set is unchanged and none
+  of their own images changed (`KeptImagesHold()`), whatever other images did. `KYTY_LEAN_VERIFY=1`:
+  no difference in the menus and 60 s of play. Paused in-boot A/B: draw 3.297 -> 3.278 us.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 

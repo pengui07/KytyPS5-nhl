@@ -1412,16 +1412,24 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		image_descs.assign(program.info.images.size(), nullptr);
 	}
 	ExecRegions::InDraw(ExecRegions::StagesMemo);
-	// A program binding the T#s of its last draw keeps that draw's bindings while no image changed
-	// since its lookups last held (ProgramImageMemo::lean_epoch): each slot would reuse its
-	// description's lookup (ReuseTextureLookup) and find the same image and view. Only the per-draw
-	// bookkeeping of a reuse (access tick, binding state) is redone, and RebindImages() and the
-	// layout transitions are skipped while the epoch holds (see CommitBindings()).
-	prepared.lookup_epoch = g_texture_epoch.load(std::memory_order_relaxed);
-	prepared.lean         = LeanDrawsEnabled() && same_images && memo->holder == &prepared &&
-	                memo->lean_epoch == prepared.lookup_epoch &&
-	                image_descs.size() == program.info.images.size();
+	// A program binding the T#s of its last draw keeps that draw's bindings while none of their images
+	// and not the image set changed since its lookups last held (ProgramImageMemo::lean_epoch,
+	// KeptImagesHold()): each slot would reuse its description's lookup (ReuseTextureLookup) and find
+	// the same image and view. Only the per-draw bookkeeping of a reuse (access tick, binding state) is
+	// redone, and RebindImages() and the layout transitions are skipped while they hold (see
+	// CommitBindings()).
+	prepared.lookup_set_epoch = g_image_set_epoch.load(std::memory_order_relaxed);
+	prepared.lookup_epoch     = g_texture_epoch.load(std::memory_order_relaxed);
+	prepared.lean             = LeanDrawsEnabled() && same_images && memo->holder == &prepared &&
+	                memo->lean_epoch != UINT64_MAX && image_descs.size() == program.info.images.size() &&
+	                KeptImagesHold(prepared, memo->lean_epoch, memo->lean_set_epoch);
 	if (!prepared.lean) {
+		if (ExecRegions::Enabled()) {
+			ExecRegions::Note(!same_images                    ? ExecRegions::LeanOtherImages
+			                  : memo->holder != &prepared     ? ExecRegions::LeanOtherHolder
+			                  : memo->lean_epoch == UINT64_MAX ? ExecRegions::LeanNotHeld
+			                                                   : ExecRegions::LeanEpochMoved);
+		}
 		// Set again by FinishLeanBindings() once the bindings this draw makes have held to its end.
 		memo->lean_epoch = UINT64_MAX;
 	} else {
@@ -1674,6 +1682,44 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 	}
 }
 
+// FindBuffer only creates what is missing: while the base registers, the buffer set and the mappings
+// are unchanged, looking the bases' windows up again (a mapped-range walk under the mapping lock and
+// a page-table search per piece) finds the same buffers. That was 2.9% of the execution thread in
+// play (46,000 stages a second, 540 ns each).
+void RenderExecutor::CacheDmaBases(PreparedBindings& prepared) {
+	const auto& runtime   = *prepared.runtime;
+	const auto& program   = *runtime.program;
+	const auto& user_data = runtime.resources->user_data;
+	auto&       cache     = m_context.GetBufferCache();
+	const auto  dword     = [&](uint32_t reg, uint32_t half) -> uint32_t {
+		const auto index = static_cast<uint64_t>(reg) - program.user_data_base;
+		// As RenderContext::CacheDmaBases(): registers outside the user data are skipped.
+		return reg < program.user_data_base || index + 1u >= user_data.size() ? 0u : user_data[index + half];
+	};
+	const auto generation = [&] {
+		return cache.BufferSetEpoch() * 0x9e3779b97f4a7c15ull ^ m_context.MappingGeneration();
+	};
+	const auto& registers = program.info.dma_base_registers;
+	bool        same      = prepared.dma_program == &program && prepared.dma_generation == generation() &&
+	              prepared.dma_bases.size() == registers.size() * 2u;
+	for (size_t i = 0; same && i < registers.size(); i++) {
+		same = prepared.dma_bases[i * 2u] == dword(registers[i], 0) &&
+		       prepared.dma_bases[i * 2u + 1u] == dword(registers[i], 1);
+	}
+	if (same) {
+		return;
+	}
+	m_context.CacheDmaBases(runtime);
+	// After the lookups, which may have created buffers.
+	prepared.dma_program    = &program;
+	prepared.dma_generation = generation();
+	prepared.dma_bases.clear();
+	for (const auto reg: registers) {
+		prepared.dma_bases.push_back(dword(reg, 0));
+		prepared.dma_bases.push_back(dword(reg, 1));
+	}
+}
+
 void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	FrameBreakdown::Timer prep_timer(FrameBreakdown::g_counters.prep_rebind_buffers_ns,
 	                                 FrameBreakdown::DetailEnabled());
@@ -1861,7 +1907,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
 	// Kept bindings (see PrepareBindings()) whose images nothing changed since.
-	const bool kept = prepared.lean && g_texture_epoch.load(std::memory_order_relaxed) == prepared.lookup_epoch;
+	const bool kept = prepared.lean && KeptImagesHold(prepared, prepared.lookup_epoch, prepared.lookup_set_epoch);
 	if (kept && !LeanVerifyEnabled()) {
 		return;
 	}
@@ -1920,7 +1966,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		view_timer.Stop();
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
-		if (storage ? !image.usage.storage : !image.usage.texture) TextureStateChanged();
+		if (storage ? !image.usage.storage : !image.usage.texture) image.StateChanged();
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
 		if (binding.lookup != nullptr && !binding.reused) {
@@ -1951,7 +1997,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		}
 		texture.image_view = texture_cache.FindTexture(texture.image_id, texture.desc);
 		auto& table_image  = texture_cache.GetImage(texture.image_id);
-		if (!table_image.usage.texture) TextureStateChanged();
+		if (!table_image.usage.texture) table_image.StateChanged();
 		table_image.usage.texture = true;
 
 	}
@@ -1969,17 +2015,44 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	}
 }
 
+bool RenderExecutor::KeptImagesHold(const PreparedBindings& prepared, uint64_t epoch, uint64_t set_epoch) {
+	if (g_texture_epoch.load(std::memory_order_relaxed) == epoch) {
+		return true;
+	}
+	if (g_image_set_epoch.load(std::memory_order_relaxed) != set_epoch) {
+		return false;
+	}
+	// Other images changed (layouts, guest writes, targets of other passes): the bindings hold while
+	// none of their own did.
+	const auto& resources = prepared.runtime->program->info.images;
+	if (prepared.images.size() != resources.size()) {
+		return false;
+	}
+	auto& texture_cache = m_context.GetTextureCache();
+	for (uint32_t i = 0; i < resources.size(); i++) {
+		if (resources[i].heap) {
+			continue;
+		}
+		const auto* image = texture_cache.m_slot_images.try_get(prepared.images[i].image_id);
+		if (image == nullptr || image->binding_epoch.load(std::memory_order_relaxed) > epoch) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void RenderExecutor::FinishLeanBindings(std::span<PreparedBindings* const> stages) {
-	const auto epoch = g_texture_epoch.load(std::memory_order_relaxed);
 	for (auto* stage: stages) {
 		auto* memo = stage->image_memo;
 		if (memo == nullptr) {
 			continue;
 		}
-		memo->lean_epoch = stage->lean_eligible && memo->holder == stage && epoch == stage->lookup_epoch
-		                       ? epoch
-		                       : UINT64_MAX;
-		memo->lean_targets = m_lean_targets;
+		// From when the lookups were made: a change of one of the images after then has a later stamp.
+		const bool held = stage->lean_eligible && memo->holder == stage &&
+		                  KeptImagesHold(*stage, stage->lookup_epoch, stage->lookup_set_epoch);
+		memo->lean_epoch     = held ? stage->lookup_epoch : UINT64_MAX;
+		memo->lean_set_epoch = stage->lookup_set_epoch;
+		memo->lean_targets   = m_lean_targets;
 	}
 }
 
@@ -1990,15 +2063,17 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	bool uses_image_heap = false;
 
 	FindBuffers(stages);
+	ExecRegions::To(ExecRegions::DrawFindBuffers);
 	for (auto* stage: stages) {
 		if (stage->runtime->program->info.uses_dma) {
-			m_context.CacheDmaBases(*stage->runtime);
+			ExecRegions::Note(ExecRegions::DmaStages);
+			CacheDmaBases(*stage);
 			uses_dma = true;
 		}
 		uses_image_heap |= stage->runtime->program->info.uses_image_heap;
 	}
 	if (uses_dma) m_context.PrepareBda();
-	ExecRegions::To(ExecRegions::DrawFindBuffers);
+	ExecRegions::To(ExecRegions::DrawDma);
 	if (uses_image_heap) {
 		ExecRegions::Note(ExecRegions::HeapRebinds);
 		m_context.GetImageHeap().Rebind(*this);
@@ -2232,7 +2307,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		// Kept bindings (see PrepareBindings()) are in the layouts the draw that made them left
 		// while no image changed since.
 		const bool keep_layouts =
-		    descriptors.lean && g_texture_epoch.load(std::memory_order_relaxed) == descriptors.lookup_epoch &&
+		    descriptors.lean && KeptImagesHold(descriptors, descriptors.lookup_epoch, descriptors.lookup_set_epoch) &&
 		    pipeline_bind_point == vk::PipelineBindPoint::eGraphics && descriptors.image_memo != nullptr &&
 		    descriptors.image_memo->lean_targets == m_lean_targets;
 		if (!keep_layouts || LeanVerifyEnabled()) {

@@ -27,7 +27,8 @@ enum Region : uint32_t {
 	StagesTables,    // PrepareBindings: image tables.
 	StagesSamplers,  // PrepareBindings: samplers.
 	DrawStages,      // PrepareBindings: user data, and between the stages.
-	DrawFindBuffers, // PrepareGraphicsBindings: FindBuffers, DMA bases.
+	DrawFindBuffers, // PrepareGraphicsBindings: FindBuffers.
+	DrawDma,         // PrepareGraphicsBindings: DMA bases and the BDA synchronization.
 	DrawHeap,        // PrepareGraphicsBindings: image heap rebind.
 	DrawImages,      // PrepareGraphicsBindings: RebindImages, render target rediscovery.
 	BuffersMemo,     // RebindBuffers: slots whose memo held.
@@ -60,7 +61,7 @@ enum Region : uint32_t {
 };
 
 inline const char* const Names[Count] = {"pending", "special", "pre", "acquire", "masks", "state", "entry", "memo", "simages", "sresolve", "smap",
-                                         "tables", "samplers", "stages", "find", "heap", "images", "bmemo", "bobtain", "buffers", "vertex",
+                                         "tables", "samplers", "stages", "find", "dma", "heap", "images", "bmemo", "bobtain", "buffers", "vertex",
                                          "pipeline", "targets", "csetup", "ctransit", "cwrites", "descriptors", "record", "exit",
                                          "dprogram", "dfill", "dpipeline", "dstages", "dfind", "dimages", "dbplain",
                                          "dbwritten", "dbtexel", "dbglobal", "dbobtain", "dbuffers",
@@ -140,6 +141,14 @@ enum Event : uint32_t {
 	ObtainNoMemoDirty,
 	ObtainNoMemoEvicted,
 	ObtainNoMemoSlotSame,
+	// Stages that do not keep their bindings (see PrepareBindings()): other T#s than the program's
+	// last draw, the memo held by another stage, the last draw's bindings not held to its end, the
+	// texture epoch moved since (T#s the same).
+	LeanOtherImages,
+	LeanOtherHolder,
+	LeanNotHeld,
+	LeanEpochMoved,
+	DmaStages,
 	EventCount
 };
 inline const char* const EventNames[EventCount] = {"img_slots", "img_memo",  "img_map",   "img_reused",
@@ -151,7 +160,8 @@ inline const char* const EventNames[EventCount] = {"img_slots", "img_memo",  "im
                                                    "same_ctx", "same_prog", "same_tex", "same_vs", "same_user",
                                                    "same_but_data", "rt_reused", "lean_stages", "lean_slots",
                                                    "o_nokind", "o_plain", "o_written", "o_texel", "o_nomemo",
-                                                   "o_notkept", "o_stream", "o_dirty", "o_evicted", "o_slotsame"};
+                                                   "o_notkept", "o_stream", "o_dirty", "o_evicted", "o_slotsame",
+                                                   "l_images", "l_holder", "l_notheld", "l_epoch", "dma_stages"};
 // Ranges bound before (diagnostics of the by-range memo's evictions): a direct-mapped set of 1M keys.
 inline bool SeenRange(uint64_t address, uint64_t size, uint8_t kind) {
 	static auto* keys = new uint64_t[1u << 20u] {};

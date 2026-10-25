@@ -1228,7 +1228,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 		if (program.info.uses_dma) {
 			FrameBreakdown::Timer bda_timer(FrameBreakdown::g_counters.dc_bda_ns);
-			m_context.CacheDmaBases(input_info.stage);
+			CacheDmaBases(bindings);
 			m_context.PrepareBda();
 		}
 	}
@@ -1645,7 +1645,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 		if (program.info.uses_dma) {
 			FrameBreakdown::Timer bda_timer(FrameBreakdown::g_counters.dc_bda_ns);
-			m_context.CacheDmaBases(input_info.stage);
+			CacheDmaBases(bindings);
 			m_context.PrepareBda();
 		}
 		BindSharedMemory(m_context, input_info, bindings, args_addr);
