@@ -55,6 +55,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <xmmintrin.h>
 
 #ifdef min
 #undef min
@@ -1706,6 +1707,19 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			}
 
 			source = {address, size, cache.FindBuffer(address, size)};
+			// RebindBuffers() looks a new range up in its by-range memo, a random entry of a table of
+			// several MiB that is mostly not in the cache (that first access was 4.4% of the
+			// execution thread in play): start loading it now, as RebindBuffers() picks the kind. Paused
+			// in-boot A/B: draw 3.404 -> 3.336 us, dispatch 2.493 -> 2.440 us.
+			{
+				const bool    sync_raw = metadata.read && Config::SyncRawImageBuffersEnabled();
+				const uint8_t kind     = metadata.written ? 2 : sync_raw ? 0 : metadata.formatted ? 3 : 1;
+				if (kind != 0) {
+					const auto* entry = reinterpret_cast<const char*>(&BindMemoOf(address, size, kind));
+					_mm_prefetch(entry, _MM_HINT_T0);
+					_mm_prefetch(entry + 64, _MM_HINT_T0);
+				}
+			}
 		}
 	}
 }

@@ -1475,6 +1475,12 @@ Toward 120 fps (2026-10-23):
   boundaries emitted as operations of their own. Two boots in play: draw 4.38 vs 3.2-3.5 us,
   dispatch 2.66 vs 2.1 us; a 3-minute match 55.7 fps at 60 Hz with it, 76-78 without. It is now
   `0` there (set it to `1` again for the NHL27BDA, NHL27BUFFERS and other per-frame statistics).
+* The first access to a range's by-range memo entry in `RebindBuffers` (a random entry of the 6.8
+  MB table) was the hottest single line of the execution thread (4.4% of its samples in play).
+  `FindBuffers` now prefetches the entry when a slot gets a new range, several hundred ns before
+  `RebindBuffers` reads it. Paused in-boot A/B: draw 3.404 -> 3.336 us, dispatch 2.493 -> 2.440 us.
+  The same before a non-lean stage's image slots (each description's last lookup and the image's
+  lookup-state lines, for all slots first): 3.117 / 3.114 us, no effect, dropped.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
