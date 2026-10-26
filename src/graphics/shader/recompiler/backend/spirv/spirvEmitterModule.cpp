@@ -976,6 +976,11 @@ void DefineModule(EmitterState& state) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyAndLateFragmentTestsAMD);
 		}
 	}
+	if (state.program.stage == ShaderType::Compute && g_shader_maximal_reconvergence.load(std::memory_order_relaxed)) {
+		// KYTY_MAXIMAL_RECONVERGENCE (shader.h): diverged lanes rejoin where the control flow merges.
+		state.builder.RequireExtension("SPV_KHR_maximal_reconvergence");
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeMaximallyReconvergesKHR);
+	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupQuadsKHR);
 	}

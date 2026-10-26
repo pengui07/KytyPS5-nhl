@@ -144,6 +144,8 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 }
 // The device has VK_AMD_shader_early_and_late_fragment_tests (vulkanWindow sets it).
 inline std::atomic<bool> g_shader_early_late_tests {false};
+// The device enabled VK_KHR_shader_maximal_reconvergence (vulkanWindow, only with KYTY_MAXIMAL_RECONVERGENCE=1).
+inline std::atomic<bool> g_shader_maximal_reconvergence {false};
 // Codegen option: experiment EarlyLateFragmentTests (key bit 65536). A pixel shader that reads memory
 // by address records missing pages in the fault buffer, and with those stores (and a kill) the host
 // compiler tests depth only after the shader: occluded pixels ran it too. When the guest shader itself
@@ -645,6 +647,28 @@ uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
+
+// KYTY_UNIFORM_ATOMIC_LOOPS=1 (experiment, default off): DS_INC/DS_DEC with the limit 0xffffffff use the
+// native atomic increment/decrement, and the other emulated atomics' compare-exchange loops exit for the
+// whole subgroup at once, and atomics get no trailing device-scope fence. The AMD driver lowers that fence
+// into an s_barrier, which after an atomic only some lanes run is reached by their wave alone and releases
+// the other waves from their next real barrier (NHL 27 hair: rasterizer ea94f09b2981eb43 NaN bloom, hair-sim grid streaks).
+[[nodiscard]] inline bool UniformAtomicLoops() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UNIFORM_ATOMIC_LOOPS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+// KYTY_MAXIMAL_RECONVERGENCE=1 (experiment, default off): compute shaders declare MaximallyReconvergesKHR when
+// the device has VK_KHR_shader_maximal_reconvergence (it did not help the NHL 27 hair rasterizer).
+[[nodiscard]] inline bool MaximalReconvergenceRequested() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MAXIMAL_RECONVERGENCE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
 
 } // namespace Libs::Graphics
 

@@ -644,7 +644,21 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_barycentric.pNext = supported_features2.pNext;
 		supported_features2.pNext   = &supported_barycentric;
 	}
+	const bool maximal_reconvergence_extension =
+	    HasExtension(device_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR maximal_reconvergence {};
+	if (maximal_reconvergence_extension) {
+		maximal_reconvergence.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &maximal_reconvergence;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	const bool maximal_reconvergence_enabled =
+	    maximal_reconvergence_extension && maximal_reconvergence.shaderMaximalReconvergence == VK_TRUE;
+	g_shader_maximal_reconvergence.store(maximal_reconvergence_enabled, std::memory_order_relaxed);
+	if (MaximalReconvergenceRequested()) {
+		std::printf("KYTY_MAXIMAL_RECONVERGENCE: maximal reconvergence %s\n",
+		            maximal_reconvergence_enabled ? "enabled" : "unavailable");
+	}
 	const bool barycentric_supported =
 	    barycentric_extension && supported_barycentric.fragmentShaderBarycentric == VK_TRUE;
 	if (!barycentric_supported) {
@@ -931,6 +945,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		pipeline_executable.pNext                  = const_cast<void*>(create_info.pNext);
 		pipeline_executable.pipelineExecutableInfo = VK_TRUE;
 		create_info.pNext                          = &pipeline_executable;
+	}
+	vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR maximal_reconvergence_enable {};
+	if (maximal_reconvergence_enabled) {
+		maximal_reconvergence_enable.pNext                      = const_cast<void*>(create_info.pNext);
+		maximal_reconvergence_enable.shaderMaximalReconvergence = VK_TRUE;
+		create_info.pNext                                       = &maximal_reconvergence_enable;
 	}
 	vk::PhysicalDeviceShaderEarlyAndLateFragmentTestsFeaturesAMD early_late_enable {};
 	if (early_late_enabled) {
@@ -1395,6 +1415,14 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		// KYTY_MAXIMAL_RECONVERGENCE=1 (shader.h): compute shaders declare MaximallyReconvergesKHR when the
+		// device has it.
+		if (MaximalReconvergenceRequested() &&
+		    HasExtension(available_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME);
 		}
 		if (HasExtension(available_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);

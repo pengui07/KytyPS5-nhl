@@ -644,6 +644,10 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 }
 
 void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind) {
+	// KYTY_UNIFORM_ATOMIC_LOOPS (shader.h): no fence. GCN atomics order nothing themselves, and the AMD driver
+	// lowers this device-scope acquire-release into an s_barrier; after an atomic only some lanes run, that is
+	// a barrier only their wave reaches (NHL 27 hair rasterizer ea94f09b2981eb43).
+	if (UniformAtomicLoops()) return;
 	const auto scope  = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
 	const auto memory = [&] {
 		switch (kind) {

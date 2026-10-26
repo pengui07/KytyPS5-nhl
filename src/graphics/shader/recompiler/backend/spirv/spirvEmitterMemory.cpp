@@ -2191,8 +2191,25 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 }
 
 uint32_t EmitSharedIncDec(ValueEmitContext& ctx, const IR::Inst& inst) {
-	const auto replacement =
-	    inst.GetOpcode() == IR::ValueOpcode::SharedAtomicInc32 ? AtomicIncrement : AtomicDecrement;
+	const bool increment = inst.GetOpcode() == IR::ValueOpcode::SharedAtomicInc32;
+	if (UniformAtomicLoops()) {
+		// KYTY_UNIFORM_ATOMIC_LOOPS (shader.h): with the limit 0xffffffff the wrap is the plain u32 one.
+		const auto limit = IR::ResolveActiveU32(inst.Arg(inst.NumArgs() - 2).Resolve(),
+		                                        inst.Arg(inst.NumArgs() - 1).Resolve());
+		if (limit.IsImmediate() && limit.U32() == 0xffffffffu) {
+			const auto& mem = ctx.Memory(inst);
+			return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
+				const auto old = ctx.state.builder.AllocateId();
+				ctx.state.builder.AddFunction(
+				    increment ? spv::OpAtomicIIncrement : spv::OpAtomicIDecrement, TypeU32(ctx.state), old, pointer,
+				    ConstantU32(ctx.state, mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice),
+				    ConstantU32(ctx.state, spv::MemorySemanticsMaskNone));
+				EmitAtomicMemoryBarrier(ctx.state, mem.kind);
+				return old;
+			});
+		}
+	}
+	const auto replacement = increment ? AtomicIncrement : AtomicDecrement;
 	return EmitAtomicUpdate(ctx, inst, ctx.Memory(inst), replacement);
 }
 
