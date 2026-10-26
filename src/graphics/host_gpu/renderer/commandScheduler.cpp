@@ -157,15 +157,18 @@ struct CpuCrumb {
 	const char* kind = nullptr;
 	uint64_t    hash_a = 0, hash_b = 0, info = 0, tick = 0;
 };
-std::array<CpuCrumb, 16384> g_cpu_crumbs;
-std::atomic<uint64_t>       g_cpu_crumb_next {0};
-const MasterSemaphore*      g_crumb_master = nullptr;
+// About a frame of draws and dispatches, small enough to stay in the L2 cache (16384 entries, 640
+// KiB, missed it: 0.9% of the execution thread). The execution thread records them all.
+std::array<CpuCrumb, 4096> g_cpu_crumbs;
+std::atomic<uint64_t>      g_cpu_crumb_next {0};
+const MasterSemaphore*     g_crumb_master = nullptr;
 
 void NoteCpuCrumb(const char* kind, uint64_t hash_a, uint64_t hash_b, uint64_t info) {
 	if (g_crumb_master == nullptr) {
 		return;
 	}
-	const auto n = g_cpu_crumb_next.fetch_add(1, std::memory_order_relaxed);
+	const auto n = g_cpu_crumb_next.load(std::memory_order_relaxed);
+	g_cpu_crumb_next.store(n + 1, std::memory_order_relaxed);
 	g_cpu_crumbs[n % g_cpu_crumbs.size()] = {kind, hash_a, hash_b, info, g_crumb_master->CurrentTick()};
 }
 
@@ -1006,6 +1009,40 @@ void GpuTraceCmdEnd(const CommandRecorder& cmd, uint32_t slot_plus_one) {
 
 } // namespace
 
+uint32_t HostTraceBegin(const CommandRecorder& cmd, const char* kind, uint64_t identity) {
+	static const bool no_cmds = std::getenv("KYTY_IDLE_TRACE_NO_CMDS") != nullptr;
+	if (no_cmds || !Common::EventTrace::g_capturing.load(std::memory_order_relaxed)) {
+		return 0;
+	}
+	std::lock_guard lock(g_gtrace.mutex);
+	// Only once a guest command initialized the trace (it needs the graphics context).
+	if (!g_gtrace.initialized || !g_gtrace.available || g_gtrace.cmd_pool == nullptr) {
+		return 0;
+	}
+	GpuTraceMapCaptureLocked();
+	g_gtrace.shader_rows[GpuTraceShaderKey {kind, identity, 0, 0}]++;
+	const uint32_t index = g_gtrace.cmd_open_count++;
+	if (g_gtrace.cmd_free.empty()) {
+		GpuTracePollLocked();
+		if (g_gtrace.cmd_free.empty()) {
+			g_gtrace.cmd_skipped++;
+			return 0;
+		}
+	}
+	const uint32_t slot = g_gtrace.cmd_free.back();
+	g_gtrace.cmd_free.pop_back();
+	VULKAN_HPP_DEFAULT_DISPATCHER.vkResetQueryPool(static_cast<VkDevice>(g_gtrace.device),
+	                                               static_cast<VkQueryPool>(g_gtrace.cmd_pool),
+	                                               slot * 2u, 2u);
+	g_gtrace.cmd_open.push_back({slot, index, false, identity, 0});
+	cmd.writeTimestamp(vk::PipelineStageFlagBits::eTopOfPipe, g_gtrace.cmd_pool, slot * 2u);
+	return slot + 1u;
+}
+
+void HostTraceEnd(const CommandRecorder& cmd, uint32_t slot_plus_one) {
+	GpuTraceCmdEnd(cmd, slot_plus_one);
+}
+
 namespace {
 
 void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint32_t debug_op,
@@ -1238,7 +1275,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 	}
 }
 
-void CommandScheduler::PopPendingOperations() {
+void CommandScheduler::PopPendingOperations(bool wait_priority) {
 	// Every draw and dispatch comes here: only query the timeline semaphore (a driver call) when
 	// the oldest operation is not already known to be free.
 	bool refreshed = false;
@@ -1279,6 +1316,16 @@ void CommandScheduler::PopPendingOperations() {
 				m_master.Refresh();
 				refreshed = true;
 				if (!m_master.IsFree(m_pending_operations.front().tick)) {
+					return;
+				}
+			}
+			// The priority thread still runs or has queued operations of this tick or earlier (its
+			// downloads): the operation waits for them, and draws do not wait for it (the execution
+			// thread waited there 1.5% of its time in play).
+			if (!wait_priority) {
+				const auto tick = m_pending_operations.front().tick;
+				if ((m_priority_active && m_priority_active_tick <= tick) ||
+				    (!m_priority_operations.empty() && m_priority_operations.front().tick <= tick)) {
 					return;
 				}
 			}

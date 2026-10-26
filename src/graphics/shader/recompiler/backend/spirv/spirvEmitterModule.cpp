@@ -796,6 +796,12 @@ void DefineModule(EmitterState& state) {
 			state.scratch_variable[half] = state.builder.AllocateId();
 		}
 	}
+	for (const auto array: state.program.info.reg_arrays) {
+		auto& variables = state.reg_array_variables[array];
+		for (uint32_t half = 0; half < state.lane_count; half++) {
+			variables[half] = state.builder.AllocateId();
+		}
+	}
 	state.main_func = state.builder.AllocateId();
 	if (state.program.stage == ShaderType::Mesh) {
 		state.mesh_guest_func = state.builder.AllocateId();
@@ -901,6 +907,10 @@ void DefineModule(EmitterState& state) {
 	// contract prevents host compilers from treating synthesized IEEE values as finite.
 	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve,
 	                               32u);
+	if (ShaderFtz32()) {
+		state.builder.RequireCapability(spv::CapabilityDenormFlushToZero);
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDenormFlushToZero, 32u);
+	}
 	if (state.program.info.float64) {
 		EXIT_NOT_IMPLEMENTED(state.program.stage == ShaderType::Compute &&
 		                     state.input_info.compute->float_mode != 0xc0);
@@ -953,11 +963,23 @@ void DefineModule(EmitterState& state) {
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
 		}
-		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
-		    !state.input_info.pixel->ps_depth_export_enable &&
-		    !state.input_info.pixel->ps_sample_mask_export_enable) {
+		const auto& pixel = *state.input_info.pixel;
+		if (pixel.ps_early_z && !pixel.ps_pixel_kill_enable && !pixel.ps_depth_export_enable &&
+		    !pixel.ps_sample_mask_export_enable) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
+		} else if (ShaderEarlyLateFragmentTests() && state.program.info.uses_dma && state.depth_variable == 0 &&
+		           state.sample_mask_variable == 0 && !pixel.ps_depth_export_enable &&
+		           !pixel.ps_sample_mask_export_enable && !state.program.info.uses_gds &&
+		           !state.program.has_address_writes && !IR::HasShaderMemoryWrites(state.program)) {
+			// Experiment EarlyLateFragmentTests: the fault records are the only side effects.
+			state.builder.RequireExtension("SPV_AMD_shader_early_and_late_fragment_tests");
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyAndLateFragmentTestsAMD);
 		}
+	}
+	if (state.program.stage == ShaderType::Compute && g_shader_maximal_reconvergence.load(std::memory_order_relaxed)) {
+		// KYTY_MAXIMAL_RECONVERGENCE (shader.h): diverged lanes rejoin where the control flow merges.
+		state.builder.RequireExtension("SPV_KHR_maximal_reconvergence");
+		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeMaximallyReconvergesKHR);
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupQuadsKHR);

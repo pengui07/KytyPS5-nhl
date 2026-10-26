@@ -19,6 +19,7 @@ void Initialize() {
 	if (Config::ProfilerEnabled() && !tracy::ProfilerAvailable()) {
 		tracy::StartupProfiler();
 		TracySetProgramName("KytyPS5");
+		g_zones_on.store(true, std::memory_order_relaxed);
 		::printf("Tracy profiler enabled: client %d.%d.%d, protocol %u, "
 		         "broadcast %u, connect to 127.0.0.1:8086\n",
 		         tracy::Version::Major, tracy::Version::Minor, tracy::Version::Patch,
@@ -28,6 +29,7 @@ void Initialize() {
 
 void Shutdown() {
 	if (tracy::ProfilerAvailable()) {
+		g_zones_on.store(false, std::memory_order_relaxed);
 		tracy::ShutdownProfiler();
 	}
 }

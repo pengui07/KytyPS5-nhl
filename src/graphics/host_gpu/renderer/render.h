@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <memory>
@@ -304,6 +305,11 @@ public:
 	// compiled yet, guest memory that cannot be read ahead). Waits while every resolution is in
 	// use: the execution thread releases them in order. Each resolving thread has its own ring
 	// (ring 1: experiment DrawResolver).
+	// The execution thread pulls an upcoming resolution into its cache, in two steps: step 0 the
+	// snapshot and log headers and the draw state it reads first (two operations ahead), step 1 the
+	// arrays they point to (one ahead), so neither step waits for a miss.
+	static void PrefetchResolvedDraw(const ResolvedDraw* resolved, int step);
+	static void PrefetchResolvedDispatch(const ResolvedDispatch* resolved, int step);
 	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context&    context,
 	                                             const HW::UserConfig& user_config,
 	                                             const HW::Shader& shaders, uint32_t ring_index = 0);
@@ -334,11 +340,22 @@ public:
 
 	void PrepareBindings(const ShaderStageRuntime& runtime, PreparedBindings& prepared);
 	void                           FindBuffers(std::span<PreparedBindings* const> stages);
+	// RenderContext::CacheDmaBases() for the stage, unless it already ran for the same program,
+	// base registers, buffer set and mappings.
+	void                           CacheDmaBases(PreparedBindings& bindings);
 	void                           RebindBuffers(PreparedBindings& bindings);
 	void                           RebindImages(PreparedBindings& bindings);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
+	// After a draw's bindings were committed: the stages whose texture bindings held to here may be
+	// kept by the next draw of their program (ProgramImageMemo::lean_epoch).
+	void FinishLeanBindings(std::span<PreparedBindings* const> bindings);
+	// Whether bindings made at texture epoch `epoch` and image set epoch `set_epoch` still hold:
+	// no image changed since, or the set of images did not and none of the stage's direct images did.
+	[[nodiscard]] bool KeptImagesHold(const PreparedBindings& prepared, uint64_t epoch, uint64_t set_epoch);
+	// The same for one binding: the set of images and the binding's image are unchanged.
+	[[nodiscard]] bool KeptImageHolds(const TextureBinding& binding, uint64_t epoch, uint64_t set_epoch);
 	// table_candidate rejects (EXIT) a texture whose guest memory cannot be read, for tables
 	// that keep T#s of freed textures, and declines depth/color conversions. examined receives
 	// the guest range before the lookup depends on the texture cache: a failure without it
@@ -394,7 +411,11 @@ private:
 	struct TextureDescKey {
 		std::array<uint32_t, 8> dwords {};
 		std::array<uint32_t, 5> view {};
-		bool                    operator==(const TextureDescKey&) const = default;
+		// One memcmp of the 52 bytes (no padding): the defaulted compare went dword by dword
+		// (1% of the execution thread, in the description lookups of every texture bind).
+		bool operator==(const TextureDescKey& other) const noexcept {
+			return std::memcmp(this, &other, sizeof(*this)) == 0;
+		}
 	};
 	struct TextureDescKeyHash {
 		size_t operator()(const TextureDescKey& key) const noexcept;
@@ -407,6 +428,18 @@ private:
 	[[nodiscard]] bool ReuseTextureLookup(TextureDescDerivation& derived, TextureBinding& binding);
 	static constexpr size_t MaxTextureDescs = size_t {1} << 16u;
 	std::unordered_map<TextureDescKey, TextureDescDerivation, TextureDescKeyHash> m_texture_descs;
+	using TextureDescEntry = std::unordered_map<TextureDescKey, TextureDescDerivation, TextureDescKeyHash>::value_type;
+	// The descriptions by key hash, direct-mapped in front of the map: a hit reads only the
+	// entry, which the caller reads anyway (the map's bucket array and chain were 2% of the
+	// execution thread). Map elements stay in place; cleared with the map.
+	struct TextureDescFront {
+		uint64_t          hash  = 0;
+		TextureDescEntry* entry = nullptr;
+	};
+	static constexpr size_t TextureDescFrontSize = 4096;
+	std::array<TextureDescFront, TextureDescFrontSize> m_texture_desc_front {};
+	[[nodiscard]] TextureDescEntry* FindTextureDesc(const TextureDescKey& key);
+	TextureDescEntry*               AddTextureDesc(const TextureDescKey& key, TextureDescDerivation&& derived);
 	// Bindings point into m_texture_descs until their views are acquired: a full map is cleared
 	// once the bindings of the operation are reset.
 	bool m_clear_texture_descs = false;
@@ -416,8 +449,40 @@ private:
 	// and the description each had, so draws that alternate programs on a stage skip the
 	// description lookups of unchanged T#s (see PrepareBindings()).
 	std::unordered_map<const void*, ProgramImageMemo> m_program_image_memos;
+	// Per program too: its buffer slots, so an unchanged V# finds what it bound the program's last
+	// draw (see PrepareBindings()).
+	std::unordered_map<const void*, ProgramBufferMemo> m_program_buffer_memos;
+	// The two memos of a program by its address, direct-mapped in front of the maps (their lookups
+	// were 0.8% of the execution thread). The maps never erase, and their elements stay in place.
+	struct ProgramMemos {
+		const void*        program = nullptr;
+		ProgramImageMemo*  image   = nullptr;
+		ProgramBufferMemo* buffer  = nullptr;
+	};
+	std::array<ProgramMemos, 256> m_program_memo_cache {};
+	ProgramMemos& ProgramMemosOf(const void* program) {
+		auto& entry = m_program_memo_cache[(reinterpret_cast<uintptr_t>(program) >> 6u) & 255u];
+		if (entry.program != program) {
+			entry = {program, &m_program_image_memos[program], &m_program_buffer_memos[program]};
+		}
+		return entry;
+	}
 	// The last TextureDescDerivation::Found::serial given out.
 	uint64_t m_found_serial = 0;
+	// Buffer bindings by range, in front of the lookups a slot memo miss makes: a program's slot sees
+	// a new range almost every draw (meshes' vertex streams: in play 8,500 of the 18,600 texel binds
+	// a frame missed their slot memo), and the same ranges come back every frame (see RebindBuffers()).
+	// With 16384 slots, ranges pushing each other out were most of the lookups left (draws: 60,000 of
+	// 70,000 a second in play); paused A/B with 65536: dispatches -1.1%, draws the same.
+	static constexpr size_t BindMemoSlots = 65536;
+	struct BindMemo {
+		PreparedBindings::BufferSlotMemo slot;
+		uint8_t                          kind = 0; // 1 plain, 2 written, 3 texel
+	};
+	std::unique_ptr<std::array<BindMemo, BindMemoSlots>> m_bind_memo = std::make_unique<std::array<BindMemo, BindMemoSlots>>();
+	BindMemo& BindMemoOf(uint64_t address, uint64_t size, uint8_t kind) {
+		return (*m_bind_memo)[((address ^ (size << 40u) ^ kind) * 0x9E3779B97F4A7C15ull >> 32u) % BindMemoSlots];
+	}
 
 	// The host sampler for a sampler binding; see NativeSampler().
 	[[nodiscard]] vk::Sampler NativeSampler(const ShaderRecompiler::IR::CompiledShaderInfo& program,
@@ -499,6 +564,10 @@ private:
 	std::shared_ptr<Nhl27Fsr3>           m_nhl27_fsr3;
 	PreparedBindings                     m_compute_bindings;
 	std::vector<ImageId>                  m_bound_images;
+	// Whether the operation binds a storage image, and a signature of the draw's attachments and
+	// their layouts: the layouts kept bindings need depend on both (see CommitBindings()).
+	bool     m_bound_storage = false;
+	uint64_t m_lean_targets  = 0;
 	// ResolveTexture: memoized pure descriptor -> ImageDesc decode (direct-mapped).
 	struct TextureDescMemo {
 		bool                                valid = false;
@@ -567,6 +636,8 @@ private:
 	                                                                                nullptr};
 	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring_second {nullptr,
 	                                                                                       nullptr};
+	std::unique_ptr<ResolvedDrawRing, void (*)(ResolvedDrawRing*)> m_resolved_ring_third {nullptr,
+	                                                                                      nullptr};
 	ResolvedDraw*                                                  m_resolved_draw = nullptr;
 	std::unique_ptr<ResolvedDispatchRing, void (*)(ResolvedDispatchRing*)> m_resolved_dispatch_ring {nullptr,
 	                                                                                                nullptr};

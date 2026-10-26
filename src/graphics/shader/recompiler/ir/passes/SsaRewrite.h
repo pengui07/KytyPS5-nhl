@@ -4,6 +4,7 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-void RewriteToSsa(const BlockList& blocks);
+// undef_vgprs: VGPRs no write reaches read as UndefU32 (see ShaderUndefVgprs) instead of 0.
+void RewriteToSsa(const BlockList& blocks, bool undef_vgprs = false);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

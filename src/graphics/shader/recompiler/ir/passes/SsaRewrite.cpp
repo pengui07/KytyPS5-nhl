@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <map>
+#include <type_traits>
 #include <unordered_map>
 #include <variant>
 
@@ -175,6 +176,8 @@ struct ReadState {
 
 class Pass {
 public:
+	explicit Pass(Block* entry): entry(entry) {}
+
 	template <typename T>
 	void Write(T variable, Block* block, Value value) {
 		definitions.Set(block, variable, value);
@@ -187,7 +190,7 @@ public:
 			auto&      state        = stack.back();
 			const auto predecessors = state.block->ImmPredecessors();
 			if (state.pred == predecessors.size()) {
-				const auto result = TryRemoveTrivialPhi(*state.phi, InitialValue(variable));
+				const auto result = TryRemoveTrivialPhi(*state.phi, Initial(variable));
 				const auto block  = state.block;
 				stack.pop_back();
 				stack.back().result = result;
@@ -207,7 +210,7 @@ public:
 						state.result = def;
 					} else if (!block->IsSsaSealed()) {
 						auto& phi = *block->PrependNewInst(block->begin(), ValueOpcode::Phi);
-						phi.SetFlags(InitialValue(variable).GetType());
+						phi.SetFlags(Initial(variable).GetType());
 						incomplete_phis[block][Variable(variable)] = &phi;
 						state.result                               = Value(&phi);
 					} else if (const auto predecessors = block->ImmPredecessors();
@@ -217,7 +220,7 @@ public:
 						break;
 					} else {
 						auto& phi = *block->PrependNewInst(block->begin(), ValueOpcode::Phi);
-						phi.SetFlags(InitialValue(variable).GetType());
+						phi.SetFlags(Initial(variable).GetType());
 						Write(variable, block, Value(&phi));
 						state.phi = &phi;
 						prepare_phi();
@@ -259,7 +262,7 @@ private:
 		for (auto* predecessor: block->ImmPredecessors()) {
 			phi.AddPhiOperand(predecessor, Read(variable, predecessor));
 		}
-		return TryRemoveTrivialPhi(phi, InitialValue(variable));
+		return TryRemoveTrivialPhi(phi, Initial(variable));
 	}
 
 	Value TryRemoveTrivialPhi(Inst& phi, Value initial_value) {
@@ -287,6 +290,22 @@ private:
 		return same;
 	}
 
+	// The value of a variable no write reaches: undefined for VGPRs with an undef entry.
+	template <typename T>
+	Value Initial(T variable) {
+		if constexpr (std::is_same_v<T, VectorReg>) {
+			if (entry != nullptr) {
+				if (vector_undef == nullptr) {
+					vector_undef = &*entry->PrependNewInst(entry->begin(), ValueOpcode::UndefU32);
+				}
+				return Value(vector_undef);
+			}
+		}
+		return InitialValue(variable);
+	}
+
+	Block* entry        = nullptr;
+	Inst*  vector_undef = nullptr;
 	std::unordered_map<Block*, std::map<Variable, Inst*>> incomplete_phis;
 	DefTable                                              definitions;
 	std::vector<ReadState>                               stack;
@@ -347,8 +366,9 @@ void VisitInstruction(Pass& pass, Block* block, Inst& inst) {
 
 } // namespace
 
-void RewriteToSsa(const BlockList& blocks) {
-	Pass pass;
+void RewriteToSsa(const BlockList& blocks, bool undef_vgprs) {
+	Pass pass(undef_vgprs && !blocks.empty() && blocks.front()->ImmPredecessors().empty() ? blocks.front()
+	                                                                                       : nullptr);
 	for (auto* block: blocks) {
 		for (auto& inst: *block) {
 			VisitInstruction(pass, block, inst);

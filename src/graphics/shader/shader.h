@@ -55,7 +55,10 @@ inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
 	return Common::Experiments::Enabled(Common::Experiments::NativeMinMax);
 }
 // Codegen option: experiment FusedMad. V_MAD_F32/V_MAC_F32 (a separately rounded multiply and
-// add on the guest) as one fused multiply-add instead of a NoContraction multiply and add.
+// add on the guest) of pixel and compute shaders as one fused multiply-add instead of a
+// NoContraction multiply and add. The guest compiler picks V_MAD/V_MAC for contractable multiply-adds
+// (the fast form with FP32 denormals flushed); vertex and mesh shaders keep the separate rounding so
+// positions computed by different shaders stay bit-identical (depth-equal passes).
 [[nodiscard]] inline bool ShaderFusedMad() {
 	return Common::Experiments::Enabled(Common::Experiments::FusedMad);
 }
@@ -139,6 +142,110 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 [[nodiscard]] inline bool ShaderBdaLoadGroups() {
 	return Common::Experiments::Enabled(Common::Experiments::BdaLoadGroups);
 }
+// The device has VK_AMD_shader_early_and_late_fragment_tests (vulkanWindow sets it).
+inline std::atomic<bool> g_shader_early_late_tests {false};
+// The device enabled VK_KHR_shader_maximal_reconvergence (vulkanWindow, only with KYTY_MAXIMAL_RECONVERGENCE=1).
+inline std::atomic<bool> g_shader_maximal_reconvergence {false};
+// Codegen option: experiment EarlyLateFragmentTests (key bit 65536). A pixel shader that reads memory
+// by address records missing pages in the fault buffer, and with those stores (and a kill) the host
+// compiler tests depth only after the shader: occluded pixels ran it too. When the guest shader itself
+// writes no memory and exports no depth or sample mask, it declares EarlyAndLateFragmentTestsAMD:
+// depth is tested before it as well (a fragment that fails the early test records no fault).
+[[nodiscard]] inline bool ShaderEarlyLateFragmentTests() {
+	return g_shader_early_late_tests.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::EarlyLateFragmentTests);
+}
+// Codegen option: experiment UndefVgprs (key bit 131072). A VGPR the hardware leaves uninitialized
+// read before any write on some path was 0 there: a value written in one branch and read after it
+// merged with that 0 (a phi, often a move per path and a register longer live). It is undefined
+// instead, as on the hardware.
+[[nodiscard]] inline bool ShaderUndefVgprs() {
+	return Common::Experiments::Enabled(Common::Experiments::UndefVgprs);
+}
+// The device can flush 32-bit denormals while 16-bit ones are preserved (vulkanWindow sets it).
+inline std::atomic<bool> g_shader_ftz32 {false};
+// Codegen option: experiment Ftz32 (key bit 262144). The guest's MODE (0xc0) flushes FP32
+// denormals; the shaders declare DenormFlushToZero for 32-bit floats, so the inputs of RCP, RSQ,
+// SQRT, EXP and LOG need no flush of their own (an and, a compare and a select each).
+[[nodiscard]] inline bool ShaderFtz32() {
+	return g_shader_ftz32.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::Ftz32);
+}
+// Codegen option: experiment MovRelBounds (key bit 524288), see MovRelExtents in Translate.cpp.
+[[nodiscard]] inline bool ShaderMovRelBounds() {
+	return Common::Experiments::Enabled(Common::Experiments::MovRelBounds);
+}
+// Codegen option: experiment F16Converts (key bit 1048576). An f16 the f32 emulation of a scalar f16
+// op produces was packed with PackHalf2x16, which the AMD compiler emits as v_cvt_pk_rtz_f16_f32
+// (round toward zero, not the guest's to nearest even); as OpFConvert it is v_cvt_f16_f32, and the
+// host compiler can fold an op between two conversions into its f16 form.
+[[nodiscard]] inline bool ShaderF16Converts() {
+	return ShaderNativeFp16() && Common::Experiments::Enabled(Common::Experiments::F16Converts);
+}
+// Codegen option: experiment F16ImagePack (key bit 2097152), see ShaderF16Converts.
+[[nodiscard]] inline bool ShaderF16ImagePack() {
+	return ShaderF16Converts() && Common::Experiments::Enabled(Common::Experiments::F16ImagePack);
+}
+// Codegen option: experiment ExecRunTransparent (key bit 4194304). ExecBranches runs ended at any
+// instruction that is not lane-wise: in NHL 27's heaviest shaders mostly resource handles (Get*Resource),
+// LaneId and Reference (no code), which do not depend on EXEC and may sit in or before the branch.
+[[nodiscard]] inline bool ShaderExecRunTransparent() {
+	return ShaderExecBranches() && Common::Experiments::Enabled(Common::Experiments::ExecRunTransparent);
+}
+// Codegen option: experiment ExecRunConstReads (key bit 268435456). With ExecRunTransparent, runs
+// still ended at scalar constant reads and image address operands (in NHL 27's heaviest compute
+// shaders most of the ends: 52 and 61 constant reads, 19 and 33 image addresses), which do not
+// depend on EXEC either.
+[[nodiscard]] inline bool ShaderExecRunConstReads() {
+	return ShaderExecRunTransparent() && Common::Experiments::Enabled(Common::Experiments::ExecRunConstReads);
+}
+// Codegen option: experiment SccBranches (key bit 536870912). A branch on SCC tested its condition
+// through a ballot like a branch on VCC or EXEC; SCC is uniform, and with the ballot (a convergent
+// operation) in its exit test the host compiler could not rotate a loop tested at the top, which then
+// kept its carried values in two register sets (c556aaf3 134 -> 119 VGPRs, d7cfa519 80 -> 16 bytes
+// of scratch).
+[[nodiscard]] inline bool ShaderSccBranches() {
+	return Common::Experiments::Enabled(Common::Experiments::SccBranches);
+}
+// Codegen option: experiment LaneSkips (key bit 2147483648). A selection skipped by a branch on EXEC
+// or VCC (s_cbranch_execz around an "if") tested its condition through a ballot, so every lane ran
+// the body and selected each VGPR's new value against the old one, which kept both live (33037c60
+// 191 -> 150 VGPRs per lane, paused GPU per flip -2.7%); see FindLaneSkip.
+[[nodiscard]] inline bool ShaderLaneSkips() {
+	return Common::Experiments::Enabled(Common::Experiments::LaneSkips);
+}
+// Codegen option: experiment AlignedBufferOffsets (key bit 8388608). A buffer binding starts at the
+// guest base aligned down to the device's storage offset alignment, and the shader adds the rest
+// (the binding prefix, from the shader data). Scalar buffer reads align the base and the offset
+// independently, so with an alignment of at most 4 bytes (AMD) their prefix is always zero dwords;
+// adding it per read kept the compiler from folding and merging the constant loads.
+// vulkanWindow sets g_shader_storage_align4 at device creation.
+inline std::atomic<bool> g_shader_storage_align4 {false};
+[[nodiscard]] inline bool ShaderAlignedBufferOffsets() {
+	return g_shader_storage_align4.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::AlignedBufferOffsets);
+}
+// Codegen option: experiment NativeFract (key bit 16777216), AMD devices only (see
+// g_shader_native_pkrtz): the clamp after V_FRACT_F32's Fract is left out.
+[[nodiscard]] inline bool ShaderNativeFract() {
+	return g_shader_native_pkrtz.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::NativeFract);
+}
+// Codegen option: experiment NativeF16Ops (key bit 33554432), AMD devices with native f16 and
+// native min/max: the f16 unary ops and min/max run as the host's f16 instructions (the guest's
+// own: v_rcp_f16, v_pk_max_f16, ...) instead of through f32 with NaN fix-ups.
+[[nodiscard]] inline bool ShaderNativeF16Ops() {
+	return ShaderNativeFp16() && ShaderNativeMinMax() && g_shader_native_pkrtz.load(std::memory_order_relaxed) &&
+	       Common::Experiments::Enabled(Common::Experiments::NativeF16Ops);
+}
+// Codegen option: experiment MovRelArrays (key bit 67108864), with MovRelBounds.
+[[nodiscard]] inline bool ShaderMovRelArrays() {
+	return ShaderMovRelBounds() && Common::Experiments::Enabled(Common::Experiments::MovRelArrays);
+}
+// Codegen option: experiment BdaTwoLookups (key bit 134217728), with BdaLoadGroups.
+[[nodiscard]] inline bool ShaderBdaTwoLookups() {
+	return ShaderBdaLoadGroups() && Common::Experiments::Enabled(Common::Experiments::BdaTwoLookups);
+}
 [[nodiscard]] inline uint32_t ShaderFloatCodegenKey() {
 	return static_cast<uint32_t>(ShaderNativeFp16()) | (ShaderNativeMinMax() ? 2u : 0u) |
 	       (ShaderFusedMad() ? 4u : 0u) |
@@ -148,7 +255,14 @@ inline std::atomic<bool> g_shader_native_pkrtz {false};
 	       (ShaderRobustSpillLoads() ? 512u : 0u) | (ShaderBranchlessFormattedLoads() ? 1024u : 0u) |
 	       (ShaderExecBranches() ? 2048u : 0u) | (ShaderExecBranchMemory() ? 4096u : 0u) |
 	       (ShaderBdaLoadGroups() ? 8192u : 0u) | (ShaderExecBranchContinue() ? 16384u : 0u) |
-	       (ShaderF16LaneViews() ? 32768u : 0u);
+	       (ShaderF16LaneViews() ? 32768u : 0u) | (ShaderEarlyLateFragmentTests() ? 65536u : 0u) |
+	       (ShaderUndefVgprs() ? 131072u : 0u) | (ShaderFtz32() ? 262144u : 0u) |
+	       (ShaderMovRelBounds() ? 524288u : 0u) | (ShaderF16Converts() ? 1048576u : 0u) |
+	       (ShaderF16ImagePack() ? 2097152u : 0u) | (ShaderExecRunTransparent() ? 4194304u : 0u) |
+	       (ShaderAlignedBufferOffsets() ? 8388608u : 0u) | (ShaderNativeFract() ? 16777216u : 0u) |
+	       (ShaderNativeF16Ops() ? 33554432u : 0u) | (ShaderMovRelArrays() ? 67108864u : 0u) |
+	       (ShaderBdaTwoLookups() ? 134217728u : 0u) | (ShaderExecRunConstReads() ? 268435456u : 0u) |
+	       (ShaderSccBranches() ? 536870912u : 0u) | (ShaderLaneSkips() ? 2147483648u : 0u);
 }
 [[nodiscard]] inline uint32_t ShaderNativeFp16Modes() {
 	return g_shader_native_fp16_modes.load(std::memory_order_relaxed);
@@ -533,6 +647,28 @@ uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
 void     ShaderDbgDumpInputInfo(const ShaderVertexInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderPixelInputInfo& info);
 void     ShaderDbgDumpInputInfo(const ShaderComputeInputInfo& info);
+
+// KYTY_UNIFORM_ATOMIC_LOOPS=1 (experiment, default off): DS_INC/DS_DEC with the limit 0xffffffff use the
+// native atomic increment/decrement, and the other emulated atomics' compare-exchange loops exit for the
+// whole subgroup at once, and atomics get no trailing device-scope fence. The AMD driver lowers that fence
+// into an s_barrier, which after an atomic only some lanes run is reached by their wave alone and releases
+// the other waves from their next real barrier (NHL 27 hair: rasterizer ea94f09b2981eb43 NaN bloom, hair-sim grid streaks).
+[[nodiscard]] inline bool UniformAtomicLoops() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_UNIFORM_ATOMIC_LOOPS");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+// KYTY_MAXIMAL_RECONVERGENCE=1 (experiment, default off): compute shaders declare MaximallyReconvergesKHR when
+// the device has VK_KHR_shader_maximal_reconvergence (it did not help the NHL 27 hair rasterizer).
+[[nodiscard]] inline bool MaximalReconvergenceRequested() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_MAXIMAL_RECONVERGENCE");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
 
 } // namespace Libs::Graphics
 

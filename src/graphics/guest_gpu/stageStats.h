@@ -25,6 +25,11 @@ enum Counter : uint32_t {
 	ExecIdleBlocked,  // every queue waited on a WAIT_REG_MEM the guest had not satisfied
 	ExecIdleDecision, // the command processor waited for a write it decides on (clock, label)
 	ExecIdleOther,    // the command processor waited for the execution thread otherwise
+	// Execution-thread waits for the draw (dispatch) resolver's slot of the next operation, and the
+	// part of all its waits within the first 256 operations after a flip.
+	ExecIdleDrawSlot,
+	ExecIdleDispatchSlot,
+	ExecIdleEarly,
 	CounterCount,
 };
 

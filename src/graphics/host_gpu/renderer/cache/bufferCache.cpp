@@ -30,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <string>
@@ -590,6 +591,7 @@ void BufferCache::Unregister(BufferId id) {
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	++m_registration_generation;
+	FrameBreakdown::VAdd(FrameBreakdown::g_counters.buffer_registrations);
 	auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
@@ -962,7 +964,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		// waiting for that copy. Large downloads stay on the GPU path: reads of video memory over
 		// PCIe are slow per byte.
 		constexpr uint64_t DirectLimit = uint64_t {64} * 1024;
-		if (Common::Experiments::Enabled(Common::Experiments::DirectGpuReads)) {
+		if (Common::Experiments::EnvEnabled(Common::Experiments::EnvBit::DirectGpuReads)) {
 			const auto start = std::chrono::steady_clock::now();
 			uint64_t   tick  = range_tick;
 			if (!tick_stats) {
@@ -1371,7 +1373,25 @@ void NoteLabel(LabelOutcome outcome, uint64_t vaddr) {
 }
 } // namespace
 
-bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size) {
+namespace {
+// Labels the host copy thread wrote (DeferredLabel slots are reused after it did).
+std::atomic<uint64_t> g_deferred_labels_written {0};
+
+void WriteDeferredLabel(void* argument) noexcept {
+	const auto& label = *static_cast<const BufferCache::DeferredLabel*>(argument);
+	if (!Libs::LibKernel::Memory::TryWriteBacking(label.vaddr, label.bytes.data(), label.size)) {
+		static std::atomic_flag reported = ATOMIC_FLAG_INIT;
+		if (!reported.test_and_set(std::memory_order_relaxed)) {
+			std::printf("NHL27LABEL: deferred label write at 0x%016llx has no backing\n",
+			            static_cast<unsigned long long>(label.vaddr));
+			std::fflush(stdout);
+		}
+	}
+	g_deferred_labels_written.fetch_add(1, std::memory_order_release);
+}
+} // namespace
+
+bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size, HostCopyQueue* deferred) {
 	if (size == 0 || size > 256 || (size & 3u) != 0 || (vaddr & 3u) != 0 || data == nullptr ||
 	    !GuestRange {vaddr, size}.Valid()) {
 		NoteLabel(LabelBadSize, vaddr);
@@ -1379,6 +1399,11 @@ bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size)
 	}
 	Libs::LibKernel::Memory::NoteHostWrite(vaddr, size, Libs::LibKernel::Memory::HostWriteSource::Label,
 	                                       data);
+	// A label too long for a deferred slot is written now: the copies queued before it first.
+	if (deferred != nullptr && size > sizeof(DeferredLabel::bytes)) {
+		deferred->Drain();
+		deferred = nullptr;
+	}
 	// KYTY_LABEL_UNCACHED_DIRECT=1 (experiment, off by default): a label no buffer covers has no GPU copy
 	// to keep coherent, so write the backing directly. Its page can still be protected for other
 	// GPU-written bytes; preparing it would download those and wait for queued GPU work (about 19 ms per
@@ -1387,9 +1412,31 @@ bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size)
 		const char* value = std::getenv("KYTY_LABEL_UNCACHED_DIRECT");
 		return value != nullptr && value[0] == '1';
 	}();
+	// The copy thread writes the bytes into guest memory (TryWriteLabel with a queue).
+	const auto queue_backing = [&] {
+		// A slot is reused once the copy thread wrote it (the queue holds fewer labels than slots
+		// before every submission drains it).
+		if (m_deferred_labels_queued - g_deferred_labels_written.load(std::memory_order_acquire) >=
+		    DeferredLabelSlots) {
+			deferred->Drain();
+		}
+		auto& label = m_deferred_labels[m_deferred_labels_queued++ % DeferredLabelSlots];
+		label.vaddr = vaddr;
+		label.size  = size;
+		std::memcpy(label.bytes.data(), data, size);
+		deferred->Call(&WriteDeferredLabel, &label);
+		(void)deferred->Flush();
+	};
+	// A deferred label needs no GPU copy either: the copy thread writes the backing (most of NHL 27's
+	// end-of-pipe labels; the old path drained the copy queue and prepared the page first).
 	const auto write_uncached = [&] {
-		if (!uncached_direct || HasGpuDirtyBytes(vaddr, size) || m_texture_cache.HasImagesInRegion(vaddr, size) ||
-		    !Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+		if ((!uncached_direct && deferred == nullptr) || HasGpuDirtyBytes(vaddr, size) ||
+		    m_texture_cache.HasImagesInRegion(vaddr, size)) {
+			return false;
+		}
+		if (deferred != nullptr) {
+			queue_backing();
+		} else if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 			return false;
 		}
 		DropGpuFills(vaddr, size);
@@ -1415,7 +1462,9 @@ bool BufferCache::TryWriteLabel(uint64_t vaddr, const void* data, uint64_t size)
 		NoteLabel(written ? LabelUncached : LabelNotCovered, vaddr);
 		return written;
 	}
-	if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
+	if (deferred != nullptr) {
+		queue_backing();
+	} else if (!Libs::LibKernel::Memory::TryWriteBacking(vaddr, data, size)) {
 		NoteLabel(LabelBacking, vaddr);
 		return false;
 	}
@@ -1829,7 +1878,6 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 				}
 			}
 			if (!lazy && !on_gpu && attempt < 4 && buffer.last_write_tick != 0 &&
-			    !Common::Experiments::Enabled(Common::Experiments::AbPending3) &&
 			    !m_scheduler.IsFree(buffer.last_write_tick) &&
 			    m_gpu_modified_ranges.Intersects(download_vaddr, download_size)) {
 				if (buffer.last_write_tick >= m_scheduler.CurrentTick()) {
@@ -2100,6 +2148,16 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
+	// As for BDA (SynchronizeBuffersInRangesBefore()): the pages this upload watches again are
+	// protected by the host copy thread, before the upload's copies, which it makes as well. In play
+	// the protect calls of uploads went from 1.9% to 0.6% of the execution thread's samples
+	// (SynchronizeBuffer 4.8% -> 3.0%).
+	std::optional<PageManager::DeferredProtectionScope> deferred;
+	if (auto* const host_copies = m_scheduler.HostCopies();
+	    host_copies != nullptr && !PageManager::DeferringProtection() && m_staging_buffer.IsCoherent() &&
+	    GuestGpu::IsGpuThread()) {
+		deferred.emplace(host_copies);
+	}
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -2224,6 +2282,27 @@ void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t
 			copies->Copy(destination, source, size);
 			return;
 		}
+		// A range no single mapping holds: a page at a time (mappings hold whole pages), so the
+		// copies still go to the copy thread instead of waiting for all of its work (in-play A/B:
+		// draw 3.572 -> 3.342 us, dispatch 2.304 -> 2.231 us).
+		if (deferring) {
+			constexpr uint64_t Page = 0x1000;
+			bool               all  = true;
+			for (uint64_t at = vaddr; at < vaddr + size && all;) {
+				const auto chunk = std::min((at & ~(Page - 1)) + Page, vaddr + size) - at;
+				all              = Libs::LibKernel::Memory::FindBackingPointer(at, chunk) != nullptr;
+				at += chunk;
+			}
+			if (all) {
+				for (uint64_t at = vaddr; at < vaddr + size;) {
+					const auto chunk = std::min((at & ~(Page - 1)) + Page, vaddr + size) - at;
+					copies->Copy(destination + (at - vaddr), Libs::LibKernel::Memory::FindBackingPointer(at, chunk),
+					             chunk);
+					at += chunk;
+				}
+				return;
+			}
+		}
 	}
 	if (deferring && copies != nullptr) {
 		copies->Drain();
@@ -2334,7 +2413,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		TouchBuffer(buffer);
 	}
 	bool synced_from_image = false;
-	{
+	// A read of a range without CPU-dirty pages has nothing to upload, and a texel read with no
+	// image at the address nothing to copy from one: SynchronizeBuffer would walk the region's
+	// pages under its lock and find nothing (about 5,000 of the 5,200 synchronizations a frame of
+	// binds made in play). The check reads the bit words without the lock, as the memo above does.
+	if ((plain_read || texel_read) && !m_memory_tracker.IsRegionCpuModified(vaddr, size)) {
+		if (bon) bs.ob_clean.fetch_add(1, std::memory_order_relaxed);
+	} else {
 		FrameBreakdown::Timer sync_timer(bs.ob_sync_ns, bon);
 		if (bon) bs.ob_syncs.fetch_add(1, std::memory_order_relaxed);
 		synced_from_image = SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
@@ -2350,7 +2435,10 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		         .texel        = texel_read,
 		         .image_version = image_version};
 	}
-	if (is_written || is_texel_buffer) {
+	// A texel read changes the buffer only when an image was copied into it (known fills of its
+	// memory then no longer hold): dropping them for every texel bind took a lock and a scan of
+	// the fills (1.7% of the execution thread).
+	if (is_written || (is_texel_buffer && synced_from_image)) {
 		DropGpuFills(vaddr, size);
 	}
 	if (is_written) {
@@ -2413,6 +2501,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uin
 		return {&buffer, entry.offset};
 	}
 	FrameBreakdown::VAdd(FrameBreakdown::g_counters.obtain_cache_misses);
+	if (FrameBreakdown::Verbose()) {
+		auto& c = FrameBreakdown::g_counters;
+		FrameBreakdown::VAdd(entry.vaddr != vaddr || entry.size != size         ? c.obtain_miss_slot
+		                     : entry.registration != m_registration_generation ? c.obtain_miss_registration
+		                     : IsBufferInvalid(entry.id) || !m_slot_buffers[entry.id].IsInBounds(vaddr, size)
+		                         ? c.obtain_miss_buffer
+		                         : c.obtain_miss_cpu);
+	}
 	// Stamp before the lookup so a CPU write racing with it forces a recheck on the next hit.
 	const auto registration = m_registration_generation;
 	const auto result       = ObtainBuffer(vaddr, size, false, false, id);
@@ -2422,6 +2518,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uin
 		if (!IsBufferInvalid(found) && &m_slot_buffers[found] == result.first) {
 			entry = {vaddr, size, registration, cpu, found, result.second};
 		}
+	} else if (FrameBreakdown::Verbose()) {
+		auto& c = FrameBreakdown::g_counters;
+		FrameBreakdown::VAdd(result.first == &m_stream_buffer             ? c.obtain_nostore_stream
+		                     : registration != m_registration_generation ? c.obtain_nostore_registration
+		                                                                 : c.obtain_nostore_cpu);
 	}
 	return result;
 }
@@ -2640,7 +2741,22 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	// A pending guest read makes only the bytes it carries dirty: the execution thread's resource
 	// checks on the other bytes of its pages read the backing instead of faulting and waiting for
 	// that download (2.7% of the thread in a match).
-	if (m_gpu_modified_ranges.Intersects(vaddr, size)) {
+	// The same ranges are asked about again and again (read logs, color clears) while the set
+	// stays the same: the map lookup per question was 1.9% of the execution thread. Only the
+	// execution thread changes the set.
+	struct Answer {
+		uint64_t vaddr   = ~uint64_t {0};
+		uint64_t size    = 0;
+		uint64_t version = 0;
+		bool     dirty   = false;
+	};
+	static thread_local std::array<Answer, 64> answers {};
+	auto&      answer  = answers[((vaddr >> 12u) ^ (vaddr >> 4u) ^ size) & 63u];
+	const auto version = m_gpu_modified_ranges.Version();
+	if (answer.vaddr != vaddr || answer.size != size || answer.version != version) {
+		answer = {vaddr, size, version, m_gpu_modified_ranges.Intersects(vaddr, size)};
+	}
+	if (answer.dirty) {
 		return true;
 	}
 	if (m_pending_guest_reads.empty()) {
@@ -2793,7 +2909,7 @@ void BufferCache::NoteDirtyRead(uint64_t vaddr, uint64_t size, bool changed, con
 }
 
 bool BufferCache::IsStrictRefused(uint64_t vaddr, uint64_t size) {
-	if (size == 0 || size > SpecMaxBytes || !Common::Experiments::Enabled(Common::Experiments::SpeculateStrict)) {
+	if (size == 0 || size > SpecMaxBytes || !Common::Experiments::EnvEnabled(Common::Experiments::EnvBit::SpeculateStrict)) {
 		return false;
 	}
 	std::scoped_lock lock(g_spec_mutex);
@@ -2847,7 +2963,7 @@ bool BufferCache::TrySpeculativeRead(uint64_t vaddr, void* data, uint64_t size) 
 		// Experiment SpeculateStrict: bytes the GPU really changes (seen changing twice, or a
 		// wrong guess) are always downloaded. A wrong guess is only found after the frame used
 		// it, so NHL 27's lighting tables that change now and then must not be guessed.
-		if (Common::Experiments::Enabled(Common::Experiments::SpeculateStrict) &&
+		if (Common::Experiments::EnvEnabled(Common::Experiments::EnvBit::SpeculateStrict) &&
 		    (it->second.changed >= 2 || it->second.mispredicts > 0)) {
 			return false;
 		}

@@ -67,7 +67,20 @@ uint64_t EnvironmentMask() {
 	set("KYTY_EXEC_BRANCH_MEMORY", ExecBranchMemory, true);
 	set("KYTY_EXEC_BRANCH_CONTINUE", ExecBranchContinue, true);
 	set("KYTY_F16_LANE_VIEWS", F16LaneViews, true);
-	set("KYTY_BDA_LOAD_GROUPS", BdaLoadGroups, false);
+	set("KYTY_EARLY_LATE_FRAGMENT_TESTS", EarlyLateFragmentTests, true);
+	set("KYTY_UNDEF_VGPRS", UndefVgprs, true);
+	set("KYTY_FTZ32", Ftz32, true);
+	set("KYTY_MOVREL_BOUNDS", MovRelBounds, true);
+	set("KYTY_F16_CONVERTS", F16Converts, true);
+	set("KYTY_F16_IMAGE_PACK", F16ImagePack, true);
+	set("KYTY_EXEC_RUN_TRANSPARENT", ExecRunTransparent, true);
+	set("KYTY_EXEC_RUN_CONST_READS", ExecRunConstReads, true);
+	set("KYTY_ALIGNED_BUFFER_OFFSETS", AlignedBufferOffsets, true);
+	set("KYTY_NATIVE_FRACT", NativeFract, true);
+	set("KYTY_NATIVE_F16_OPS", NativeF16Ops, true);
+	set("KYTY_MOVREL_ARRAYS", MovRelArrays, true);
+	set("KYTY_BDA_TWO_LOOKUPS", BdaTwoLookups, true);
+	set("KYTY_BDA_LOAD_GROUPS", BdaLoadGroups, true);
 	// On since 2026-10-22: with the stage cores kept for the stages, the resolve thread limited the
 	// heavier scenes; sharing its core with the game, the second resolver took 60 Hz play 57.4 ->
 	// 59.4 fps (paired rounds 413 / 447). Measured on 16 logical CPUs (its default CPU is 14): with
@@ -84,7 +97,7 @@ uint64_t EnvironmentMask() {
 	set("KYTY_EARLY_SUBMIT_WRITERS", EarlySubmitWriters, false);
 	set("KYTY_READBACK_COMPUTE", ReadbackCompute, true);
 	set("KYTY_ROBUST_LOADS", RobustLoads, true);
-	set("KYTY_FUSED_MAD", FusedMad, false);
+	set("KYTY_FUSED_MAD", FusedMad, true);
 	set("KYTY_FAULT_PAGE_DIRECT", FaultPageDirect, true);
 	set("KYTY_BACKING_READ_MRU", BackingReadMru, true);
 	set("KYTY_DISPATCH_AHEAD", DispatchAhead, true);
@@ -93,7 +106,8 @@ uint64_t EnvironmentMask() {
 	set("KYTY_COMPUTE_UNLOCKED", ComputeUnlocked, true);
 	set("KYTY_AHEAD_UNLOCKED", AheadUnlocked, true);
 	set("KYTY_BACKING_LOOKUP_CACHE", BackingLookupCache, true);
-	set("KYTY_PROTECT_SHARED_LOCK", ProtectSharedLock, false);
+	set("KYTY_SCC_BRANCHES", SccBranches, true);
+	set("KYTY_LANE_SKIPS", LaneSkips, true);
 	set("KYTY_CLOCK_WAIT_PREDICT", ClockWaitPredict, false);
 	// On: the command processor's and guest threads' reads of bytes the GPU never wrote, on pages
 	// protected for other GPU-written bytes, use the backing (exact, no speculation): the execution
@@ -107,12 +121,6 @@ uint64_t EnvironmentMask() {
 	set("KYTY_GUEST_OFF_STAGE_CORES", GuestOffStageCores, cpus >= 12);
 	set("KYTY_GUEST_OFF_COPY_CORE", GuestOffCopyCore, false);
 	set("KYTY_GUEST_OFF_CP_CORES", GuestOffCpCores, false);
-	set("KYTY_SPECULATE_STRICT", SpeculateStrict, false);
-	set("KYTY_ASYNC_READBACK", AsyncReadback, false);
-	set("KYTY_DIRECT_GPU_READS", DirectGpuReads, false);
-	set("KYTY_PROGRAM_LOCK_SPLIT", ProgramLockSplit, false);
-	set("KYTY_UNMAP_BUFFER_WAIT", UnmapBufferWait, false);
-	set("KYTY_FILL_PATTERNS", FillPatterns, false);
 	return mask;
 }
 
@@ -240,6 +248,18 @@ bool DirectGpuReadsMemory() noexcept {
 bool SrtUnionDirty() noexcept {
 	static const bool enabled = EnvSwitch("KYTY_SRT_UNION_DIRTY", false);
 	return enabled;
+}
+
+bool EnvEnabled(EnvBit bit) noexcept {
+	static const std::array<bool, 6> enabled = {
+	    EnvSwitch("KYTY_PROGRAM_LOCK_SPLIT", false),
+	    EnvSwitch("KYTY_FILL_PATTERNS", false),
+	    EnvSwitch("KYTY_UNMAP_BUFFER_WAIT", false),
+	    EnvSwitch("KYTY_DIRECT_GPU_READS", false),
+	    EnvSwitch("KYTY_ASYNC_READBACK", false),
+	    EnvSwitch("KYTY_SPECULATE_STRICT", false),
+	};
+	return enabled[static_cast<size_t>(bit)];
 }
 
 namespace Detail {

@@ -39,9 +39,18 @@ if(GIT_EXECUTABLE)
 		if(NOT GIT_DIRTY_RESULT EQUAL 0)
 			string(APPEND KYTY_GIT_HASH "-dirty")
 		endif()
-		set(SHADER_DIRS src/graphics/shader src/graphics/host_gpu/renderer/pipeline)
+		# The translator and the program cache's own files: the bindings code beside them in
+		# renderer/pipeline (descriptors, heaps, blend mapping, barriers) does not change programs.
+		set(PIPELINE_DIR src/graphics/host_gpu/renderer/pipeline)
+		set(SHADER_DIRS src/graphics/shader ${PIPELINE_DIR}/pipelineCache.cpp ${PIPELINE_DIR}/pipelineCache.h
+		    ${PIPELINE_DIR}/pipelineRecord.cpp ${PIPELINE_DIR}/pipelineRecord.h ${PIPELINE_DIR}/programStore.h
+		    ${PIPELINE_DIR}/resourceMemo.h ${PIPELINE_DIR}/shaders.cpp)
+		set(SHADER_TREE_ARGS "")
+		foreach(path ${SHADER_DIRS})
+			list(APPEND SHADER_TREE_ARGS "HEAD:${path}")
+		endforeach()
 		execute_process(
-			COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD:src/graphics/shader HEAD:src/graphics/host_gpu/renderer/pipeline
+			COMMAND "${GIT_EXECUTABLE}" rev-parse ${SHADER_TREE_ARGS}
 			WORKING_DIRECTORY "${GIT_WORKING_DIRECTORY}"
 			OUTPUT_VARIABLE SHADER_TREES
 			OUTPUT_STRIP_TRAILING_WHITESPACE

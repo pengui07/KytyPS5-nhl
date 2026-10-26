@@ -866,6 +866,219 @@ bool IsBufferDwordLoad(Decoder::Opcode opcode) {
 	}
 }
 
+// Experiment MovRelBounds: how many VGPRs from its base each V_MOVRELS/V_MOVRELD_B32 can reach,
+// by pc. Without it every one selects over all the registers after its base (NHL 27's compute
+// 6cb32e43: 31 of them over up to 128 registers, 2.7k guest instructions became 19.5k host ones and
+// 256 VGPRs plus scratch). The guest compiler indexes register arrays by M0 = index * stride, with
+// the index in an SGPR: within a block, M0's value is traced to such an SGPR and stride, and an
+// index variable's count is the fewest elements any of its arrays has before the next array that
+// variable indexes (the arrays a loop counter indexes are live together). Without an array after
+// one of them, or with M0 not traced, the full range stays. Counts are in units of the index SGPR, so
+// a stride hidden in it keeps them valid; bases closer than 4 (or the stride) are one array's
+// components (a vec3 at v0, v1 and v2 by M0 = index * 3, a pair at v0 and v1).
+std::unordered_map<uint32_t, uint32_t> MovRelExtents(const Decoder::Program& decoded, const CFG::Graph& cfg,
+                                                      uint32_t vector_limit) {
+	struct Sym {
+		int32_t  var  = -1; // the SGPR holding the index
+		uint32_t mult = 0;
+		// The index's largest value when it was masked by a constant (S_AND_B32 with 3: an index
+		// of 0..3), else UINT32_MAX; such an index bounds its MOVRELs by itself.
+		uint32_t max = UINT32_MAX;
+
+		bool operator==(const Sym&) const = default;
+	};
+	struct MovRel {
+		uint32_t pc   = 0;
+		uint32_t base = 0;
+		Sym      index;
+	};
+	const auto key_of = [](const Decoder::Operand& operand) -> int32_t {
+		switch (operand.kind) {
+			case Decoder::OperandKind::Sgpr: return static_cast<int32_t>(operand.reg);
+			case Decoder::OperandKind::VccLo: return 1000;
+			case Decoder::OperandKind::VccHi: return 1001;
+			case Decoder::OperandKind::M0: return 1002;
+			default: return -1;
+		}
+	};
+	const auto constant_of = [](const Decoder::Operand& operand, uint32_t& value) {
+		if (operand.kind == Decoder::OperandKind::LiteralConstant ||
+		    operand.kind == Decoder::OperandKind::IntegerInlineConstant) {
+			value = operand.value;
+			return true;
+		}
+		return false;
+	};
+	std::vector<MovRel> movrels;
+	// A block starts with what all its predecessors agree on at their ends (predecessors not
+	// visited yet are skipped; the pass repeats until the block ends stop changing, so loop
+	// back edges are met too).
+	std::unordered_map<uint32_t, std::unordered_map<int32_t, Sym>> block_end;
+	bool stable = false;
+	for (uint32_t pass = 0; pass < 8 && !stable; pass++) {
+	stable = true;
+	movrels.clear();
+	for (const auto& cfg_block: cfg.blocks) {
+		std::unordered_map<int32_t, Sym> sym;
+		bool first = true;
+		for (const auto predecessor: cfg_block.predecessors) {
+			const auto found = block_end.find(predecessor);
+			if (found == block_end.end()) continue;
+			if (first) {
+				sym   = found->second;
+				first = false;
+				continue;
+			}
+			std::erase_if(sym, [&](const auto& entry) {
+				const auto other = found->second.find(entry.first);
+				return other == found->second.end() || !(other->second == entry.second);
+			});
+		}
+		const auto forget = [&](const Decoder::Operand& operand) {
+			const auto key = key_of(operand);
+			if (key < 0) return;
+			if (key < 1000) {
+				for (int32_t r = key; r < key + 16; r++) sym.erase(r); // up to an SMEM X16 load
+			} else {
+				sym.erase(key);
+			}
+		};
+		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end && index < decoded.instructions.size();
+		     index++) {
+			const auto& inst = decoded.instructions[index];
+			const auto  dst  = key_of(inst.dst);
+			uint32_t    k    = 0;
+			if (inst.opcode == Decoder::Opcode::V_MOVRELS_B32 || inst.opcode == Decoder::Opcode::V_MOVRELD_B32) {
+				const auto found = sym.find(1002);
+				movrels.push_back({inst.pc,
+				                   inst.opcode == Decoder::Opcode::V_MOVRELS_B32 ? inst.src0.reg : inst.dst.reg,
+				                   found != sym.end() ? found->second : Sym {}});
+				continue;
+			}
+			if (inst.opcode == Decoder::Opcode::S_MOV_B32 && dst >= 0) {
+				const auto src = key_of(inst.src0);
+				if (const auto found = sym.find(src); src >= 0 && found != sym.end()) {
+					sym[dst] = found->second;
+				} else if (src >= 0 && src != 1002) {
+					sym[dst] = {src, 1};
+				} else {
+					sym.erase(dst);
+				}
+				continue;
+			}
+			if (inst.opcode == Decoder::Opcode::S_MUL_I32 && dst >= 0) {
+				const Decoder::Operand* reg = nullptr;
+				if (constant_of(inst.src1, k) && key_of(inst.src0) >= 0 && key_of(inst.src0) != 1002) {
+					reg = &inst.src0;
+				} else if (constant_of(inst.src0, k) && key_of(inst.src1) >= 0 && key_of(inst.src1) != 1002) {
+					reg = &inst.src1;
+				}
+				const auto src = reg != nullptr ? key_of(*reg) : -1;
+				const auto found = sym.find(src);
+				if (reg != nullptr && k != 0 && k <= 64) {
+					sym[dst] = found != sym.end()
+					               ? Sym {found->second.var, found->second.mult * k, found->second.max}
+					               : Sym {src, k};
+				} else {
+					sym.erase(dst);
+				}
+				continue;
+			}
+			// An index masked by a small constant.
+			if (inst.opcode == Decoder::Opcode::S_AND_B32 && dst >= 0 && dst != 1002 &&
+			    (constant_of(inst.src1, k) || constant_of(inst.src0, k)) && k < 256) {
+				sym[dst] = {dst, 1, k};
+				continue;
+			}
+			forget(inst.dst);
+			forget(inst.dst2);
+			// Compares and carries write VCC without naming it.
+			if (inst.family == Decoder::Family::VOPC || inst.opcode == Decoder::Opcode::V_ADDC_U32 ||
+			    inst.opcode == Decoder::Opcode::V_SUB_CO_CI_U32 ||
+			    inst.opcode == Decoder::Opcode::V_SUBREV_CO_CI_U32) {
+				sym.erase(1000);
+				sym.erase(1001);
+			}
+			if (inst.opcode == Decoder::Opcode::S_SWAPPC_B64 || inst.opcode == Decoder::Opcode::S_SETPC_B64) {
+				sym.clear();
+			}
+		}
+		auto& end = block_end[cfg_block.id];
+		if (!(end == sym)) {
+			end    = std::move(sym);
+			stable = false;
+		}
+	}
+	}
+	if (!stable) {
+		return {};
+	}
+	// Per index SGPR: its bases, and the fewest elements an array before another one has.
+	std::unordered_map<int32_t, std::vector<const MovRel*>> by_var;
+	for (const auto& movrel: movrels) {
+		if (movrel.index.var >= 0 && movrel.index.var < 1000 && movrel.index.mult != 0) {
+			by_var[movrel.index.var].push_back(&movrel);
+		}
+	}
+	std::unordered_map<uint32_t, uint32_t> extents;
+	// Masked indexes bound their MOVRELs exactly.
+	for (const auto& movrel: movrels) {
+		if (movrel.index.var >= 0 && movrel.index.mult != 0 && movrel.index.max != UINT32_MAX) {
+			extents[movrel.pc] = std::min(movrel.index.max * movrel.index.mult + 1u,
+			                              vector_limit > movrel.base ? vector_limit - movrel.base : 1u);
+		}
+	}
+	for (const auto& [var, list]: by_var) {
+		uint32_t count = UINT32_MAX;
+		for (const auto* movrel: list) {
+			// Bases closer than the stride (or than 4) with the same stride are components of one
+			// array (a vec3 array at v0, v1 and v2): the next array starts after the group.
+			const uint32_t gap   = std::max(movrel->index.mult, 4u);
+			uint32_t       first = movrel->base;
+			uint32_t       last  = movrel->base;
+			for (bool grew = true; grew;) {
+				grew = false;
+				for (const auto* other: list) {
+					if (other->index.mult != movrel->index.mult) continue;
+					if (other->base < first && first - other->base < gap) {
+						first = other->base;
+						grew  = true;
+					} else if (other->base > last && other->base - last < gap) {
+						last = other->base;
+						grew = true;
+					}
+				}
+			}
+			uint32_t next = UINT32_MAX;
+			for (const auto* other: list) {
+				if (other->base > last) {
+					next = std::min(next, other->base);
+				}
+			}
+			if (next != UINT32_MAX) {
+				count = std::min(count, (next - movrel->base - 1u) / movrel->index.mult + 1u);
+			}
+		}
+		if (count == UINT32_MAX) continue;
+		for (const auto* movrel: list) {
+			if (extents.contains(movrel->pc)) continue;
+			const auto extent = (count - 1u) * movrel->index.mult + 1u;
+			extents[movrel->pc] = std::min(extent, vector_limit > movrel->base ? vector_limit - movrel->base : 1u);
+		}
+	}
+	static const bool debug = std::getenv("KYTY_DBG_MOVREL") != nullptr;
+	if (debug && !movrels.empty()) {
+		std::printf("NHL27MOVREL: %zu movrels, %zu bounded\n", movrels.size(), extents.size());
+		for (const auto& movrel: movrels) {
+			const auto found = extents.find(movrel.pc);
+			std::printf("NHL27MOVREL: pc=0x%x base=v%u index=s%d*%u extent=%u\n", movrel.pc, movrel.base,
+			            movrel.index.var, movrel.index.mult, found != extents.end() ? found->second : 0u);
+		}
+		std::fflush(stdout);
+	}
+	return extents;
+}
+
 void IncludeInstructionVectorRegisters(const Decoder::Instruction& inst, uint32_t& vector_limit) {
 	const auto include_vector = [&](const Decoder::Operand& operand, uint32_t count = 1u) {
 		if (operand.kind == Decoder::OperandKind::Vgpr) {
@@ -1065,6 +1278,8 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			IncludeInstructionVectorRegisters(instruction, vector_limit);
 		}
 	}
+	const auto movrel_extents = ShaderMovRelBounds() ? MovRelExtents(decoded, cfg, vector_limit)
+	                                                 : std::unordered_map<uint32_t, uint32_t> {};
 	// KYTY_DBG_SHADER_SHAPE=1: the guest program's size and VGPR use, to compare with the host's.
 	static const bool shape_debug = std::getenv("KYTY_DBG_SHADER_SHAPE") != nullptr;
 	if (shape_debug) {
@@ -1421,6 +1636,7 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 		Translator translator(result, block, vector_limit, flush_f32_inputs,
 		    options.stage == ShaderType::Compute && !options.input_info.compute->async_compute,
 		    fp16_coverage_ptr);
+		translator.SetMovRelExtents(&movrel_extents);
 		for (uint32_t index = cfg_block.inst_begin; index < cfg_block.inst_end; index++) {
 			const auto& instruction = decoded.instructions[index];
 			if (IsCodeTableLoad(cfg, instruction.pc)) {

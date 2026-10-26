@@ -10,6 +10,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <source_location>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -205,6 +206,12 @@ private:
 // The vkCmd* subset used by the renderer. A recorder either calls the Vulkan command buffer
 // directly or appends the command to a CommandStream; the method names and signatures follow
 // vk::CommandBuffer so recording code does not depend on the mode.
+class CommandRecorder;
+// KYTY_IDLE_TRACE: GPU timestamps around the emulator's own commands (copies, clears, blits,
+// barriers), reported like draws with identity 0x4057'0000'0000'00xx; 0 when not capturing.
+uint32_t HostTraceBegin(const CommandRecorder& cmd, const char* kind, uint64_t identity);
+void     HostTraceEnd(const CommandRecorder& cmd, uint32_t slot_plus_one);
+
 class CommandRecorder {
 public:
 	CommandRecorder() = default;
@@ -242,10 +249,13 @@ public:
 	                     vk::DependencyFlags dependency, uint32_t memory_count,
 	                     const vk::MemoryBarrier* memory, uint32_t buffer_count,
 	                     const vk::BufferMemoryBarrier* buffers, uint32_t image_count,
-	                     const vk::ImageMemoryBarrier* images) const;
-	void pipelineBarrier2(const vk::DependencyInfo& dependency) const;
-	void pipelineBarrier2(const vk::DependencyInfo* dependency) const {
-		pipelineBarrier2(*dependency);
+	                     const vk::ImageMemoryBarrier* images,
+	                     std::source_location where = std::source_location::current()) const;
+	void pipelineBarrier2(const vk::DependencyInfo& dependency,
+	                      std::source_location where = std::source_location::current()) const;
+	void pipelineBarrier2(const vk::DependencyInfo* dependency,
+	                      std::source_location where = std::source_location::current()) const {
+		pipelineBarrier2(*dependency, where);
 	}
 
 	void bindPipeline(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) const {
@@ -266,6 +276,10 @@ public:
 	                          uint32_t set, vk::ArrayProxy<const vk::WriteDescriptorSet> const& writes) const {
 		pushDescriptorSetKHR(bind_point, layout, set, writes.size(), writes.data());
 	}
+	// Not a command: vkUpdateDescriptorSets on a set no recorded command used yet, done at its place
+	// in the stream (on the recording thread) instead of by the thread that records.
+	void updateDescriptorSets(vk::Device device, uint32_t write_count,
+	                          const vk::WriteDescriptorSet* writes) const;
 	void pushConstants(vk::PipelineLayout layout, vk::ShaderStageFlags stages, uint32_t offset,
 	                   uint32_t size, const void* values) const;
 
@@ -373,7 +387,8 @@ public:
 	}
 
 	void copyBuffer(vk::Buffer source, vk::Buffer destination, uint32_t count,
-	                const vk::BufferCopy* regions) const;
+	                const vk::BufferCopy* regions,
+	                std::source_location where = std::source_location::current()) const;
 	void updateBuffer(vk::Buffer buffer, vk::DeviceSize offset, vk::DeviceSize size,
 	                  const void* data) const;
 	void writeTimestamp(vk::PipelineStageFlagBits stage, vk::QueryPool pool, uint32_t query) const {

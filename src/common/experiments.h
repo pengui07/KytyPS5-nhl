@@ -28,13 +28,10 @@ enum Bit : uint64_t {
 	ReadbackCompute    = 1u << 2u, // KYTY_READBACK_COMPUTE (default on; second-queue readbacks on a compute-only queue family)
 	CpuCopyForward     = 1u << 3u, // KYTY_CPU_COPY_FORWARD (default off)
 	RobustLoads        = 1u << 8u, // KYTY_ROBUST_LOADS (default on; storage-buffer loads without per-load exec and bounds branches, relying on robustBufferAccess2; part of shader keys; was ReadbackTransfer)
-	FusedMad           = 1u << 9u, // KYTY_FUSED_MAD (default off; V_MAD/V_MAC_F32 as one fused multiply-add, part of shader keys; was ReadbackSpin)
+	FusedMad           = 1u << 9u, // KYTY_FUSED_MAD (default on; V_MAD/V_MAC_F32 of pixel and compute shaders as one fused multiply-add, part of shader keys; was ReadbackSpin)
 	CpBackingReads     = 1u << 4u, // KYTY_CP_BACKING_READS (default on; command-processor reads of read-protected pages go through the execution thread and the backing store instead of faulting; was SrtJit, now env-only KYTY_SRT_JIT)
 	FaultPageDirect    = 1u << 5u, // KYTY_FAULT_PAGE_DIRECT (default on; direct SRT reads and read-ahead checks of pages that faulted before use the backing)
 	WideWriteDownloads = 1u << 6u, // KYTY_WIDE_WRITE_DOWNLOADS (default on; a guest store into a GPU-written page downloads the GPU-written bytes of its 64 KiB window at once; was FalseShareReads, now env-only KYTY_FALSE_SHARE_READS)
-	ProgramLockSplit   = uint64_t {1} << 38u, // KYTY_PROGRAM_LOCK_SPLIT (default off; the resolve thread walks shader tables without holding the program lock)
-	FillPatterns       = uint64_t {1} << 39u, // KYTY_FILL_PATTERNS (default off; a proven compute fill of a repeating 2-4 word pattern is remembered like a uniform fill, so color-clear decoding needs no readback)
-	UnmapBufferWait    = uint64_t {1} << 40u, // KYTY_UNMAP_BUFFER_WAIT (default off; an unmap of GPU-written buffer bytes waits only for their writers, not for the whole GPU)
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (default on; also read by the program cache)
 	DirectSrtReads     = 1u << 10u, // KYTY_DIRECT_SRT_READS (default on; SRT reads without the IR walk)
 	GpuConditionsBothPaths = 1u << 13u, // KYTY_GPU_CONDITIONS_BOTH_PATHS (default on; a resource walk takes both paths of a branch on GPU-written bytes instead of waiting for them; was ClockWaitAhead, now env-only)
@@ -57,7 +54,7 @@ enum Bit : uint64_t {
 	AsyncGuestReads      = 1u << 28u, // KYTY_ASYNC_GUEST_READS (default off; a guest thread waits for its own readback)
 	BdaDirtyRegions      = 1u << 29u, // KYTY_BDA_DIRTY_REGIONS (default off; BDA preparation syncs only CPU-written regions)
 	LdsLaneSlots         = 1u << 30u, // KYTY_LDS_LANE_SLOTS (default on; per-lane LDS slots of non-compute stages as a small array, part of shader keys)
-	ProtectSharedLock    = uint64_t {1} << 32u, // KYTY_PROTECT_SHARED_LOCK (default off; page-tracking protections of different pages run in parallel)
+	SccBranches          = uint64_t {1} << 32u, // KYTY_SCC_BRANCHES (default on; branches on SCC test the uniform condition itself instead of a ballot of it, so loops tested at the top can be rotated; part of shader keys; was ProtectSharedLock, no longer read)
 	ClockWaitPredict     = uint64_t {1} << 33u, // KYTY_CLOCK_WAIT_PREDICT (default off; WAIT_REG_MEM on a pending clock write need not wait for it)
 	FalseShareAnyThread  = uint64_t {1} << 34u, // KYTY_FALSE_SHARE_ANY_THREAD (default on; CP and guest reads of clean bytes on GPU-dirty pages use the backing)
 	CpCleanRegReads      = uint64_t {1} << 35u, // KYTY_CP_CLEAN_REG_READS (default off; the command processor reads clean indirect register tables from the backing)
@@ -65,21 +62,50 @@ enum Bit : uint64_t {
 	ExecBranches         = uint64_t {1} << 39u, // KYTY_EXEC_BRANCHES (default on; runs of lane-wise instructions under one partial EXEC run in a divergent branch instead of selecting each written VGPR per lane; part of shader keys)
 	ExecBranchMemory     = uint64_t {1} << 40u, // KYTY_EXEC_BRANCH_MEMORY (default on; ExecBranches runs also take memory operations under their EXEC; part of shader keys)
 	DispatchResolver     = uint64_t {1} << 41u, // KYTY_DISPATCH_RESOLVER (default off; a second resolve thread resolves dispatches ahead while the first resolves draws)
-	BdaLoadGroups        = uint64_t {1} << 42u, // KYTY_BDA_LOAD_GROUPS (default off; consecutive DWORD loads through an address share one page lookup; part of shader keys)
+	BdaLoadGroups        = uint64_t {1} << 42u, // KYTY_BDA_LOAD_GROUPS (default on since 2026-10-23; consecutive DWORD loads through an address share one page lookup; part of shader keys)
 	DrawResolver         = uint64_t {1} << 43u, // KYTY_DRAW_RESOLVER (default on since 2026-10-22; earlier off for 2 guest job-thread crashes in 8 boots, since fixed causes; a second resolve thread resolves about half of the draws ahead, by shader addresses)
 	SpeculateDirtyReads  = uint64_t {1} << 37u, // KYTY_SPECULATE_DIRTY_READS (default off; shader-table reads of GPU-written bytes the GPU keeps rewriting unchanged use the backing, checked later)
-	DirectGpuReads       = uint64_t {1} << 41u, // KYTY_DIRECT_GPU_READS (default off; downloads of bytes whose GPU writer already finished read the mapped game buffer, needs the same variable at startup)
-	AsyncReadback        = uint64_t {1} << 42u, // KYTY_ASYNC_READBACK (default off; guest and command-processor downloads wait on their own thread, not the execution thread)
-	SpeculateStrict      = uint64_t {1} << 43u, // KYTY_SPECULATE_STRICT (default off; with SpeculateDirtyReads, never guess bytes that changed twice or were guessed wrong once)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
-	// A/B only, like AbLegacy, for the changes made after it was taken (AbLegacy also turns off
-	// the earlier changes it still selects).
+	// A/B only and read by nothing else (KytyPS5-tools/abmulti.sh), so that one boot can compare
+	// pending changes.
 	AbPending = uint64_t {1} << 38u,
-	// More A/B-only bits, so that one boot can compare several pending changes (KytyPS5-toolsbmulti.sh).
-	AbPending2 = uint64_t {1} << 44u,
-	AbPending3 = uint64_t {1} << 45u,
-	AbPending4 = uint64_t {1} << 49u,
+	// KYTY_BDA_TWO_LOOKUPS (default on): a scalar BDA load group that crosses a page looks up the
+	// group's first and last pages only, instead of each DWORD's; part of shader keys. Was AbPending2.
+	BdaTwoLookups = uint64_t {1} << 44u,
+	// KYTY_LANE_SKIPS (default on): a selection skipped by a branch on EXEC or VCC branches per lane
+	// where its body cannot tell (FindLaneSkip); part of shader keys. Was AbPending4.
+	LaneSkips = uint64_t {1} << 49u,
+	// KYTY_EXEC_RUN_CONST_READS (default on; with ExecRunTransparent): scalar constant reads
+	// (ReadConstBuffer, ReadConst) and image address operands (MakeImageAddress, no code of its own)
+	// no longer end an ExecBranches run; part of shader keys. Was AbPending3.
+	ExecRunConstReads = uint64_t {1} << 45u,
+	// KYTY_MOVREL_ARRAYS (default on): a V_MOVRELS/D_B32 with a bounded register array (see
+	// MovRelBounds) reads or writes a function-local array of those registers (RegArrayLoad /
+	// RegArrayStore) instead of selecting over each of them; part of shader keys. Was AbPending5.
+	MovRelArrays = uint64_t {1} << 56u,
+	// KYTY_NATIVE_FRACT (default on; AMD devices): V_FRACT_F32 is GLSL Fract alone, which the AMD
+	// compiler emits as the same v_fract_f32 (clamped below one), without the clamp that
+	// x - floor(x) needs elsewhere; part of shader keys. Was AbPending6.
+	NativeFract = uint64_t {1} << 57u,
+	// KYTY_NATIVE_F16_OPS (default on; AMD devices with NativeFp16 and NativeMinMax): f16
+	// reciprocal, square root, its reciprocal, log2, exp2, floor, ceil, trunc, round-even, fract and
+	// min/max (scalar and packed) as host f16 ops instead of f32 emulation; part of shader keys.
+	// Was AbPending7.
+	NativeF16Ops = uint64_t {1} << 58u,
+	// KYTY_F16_CONVERTS (default on; with NativeFp16): f32 <-> f16 conversions as OpFConvert on f16
+	// instead of PackHalf2x16 / UnpackHalf2x16; part of shader keys.
+	F16Converts = uint64_t {1} << 59u,
+	// KYTY_F16_IMAGE_PACK (default on; with F16Converts): 16-bit float image results packed as f16
+	// pairs from OpFConvert instead of PackHalf2x16 per lane; part of shader keys.
+	F16ImagePack = uint64_t {1} << 60u,
+	// KYTY_EXEC_RUN_TRANSPARENT (default on; with ExecBranches): resource handles, lane ids and
+	// references no longer end an ExecBranches run; part of shader keys.
+	ExecRunTransparent = uint64_t {1} << 61u,
+	// KYTY_ALIGNED_BUFFER_OFFSETS (default on; on devices binding storage buffers at any dword):
+	// scalar buffer reads leave out the binding prefix, which is below one dword there; part of
+	// shader keys.
+	AlignedBufferOffsets = uint64_t {1} << 62u,
 	// KYTY_GUEST_OFF_STAGE_CORES (default on): threads without a CPU of their own (guest, driver
 	// and helper threads) keep off both logical CPUs of the execution and resolve threads' cores.
 	GuestOffStageCores = uint64_t {1} << 46u,
@@ -95,6 +121,18 @@ enum Bit : uint64_t {
 	// KYTY_F16_LANE_VIEWS (default on; with NativeFp16): scalar f16 ops read and write their
 	// 16-bit lanes as halves of an f16vec2 instead of masking them out of U32s; part of shader keys.
 	F16LaneViews = uint64_t {1} << 51u,
+	// KYTY_UNDEF_VGPRS (default on): VGPRs the hardware does not initialize read as undefined instead
+	// of 0 before their first write; part of shader keys. Bit 52 was LazyGuestBarriers (dropped).
+	UndefVgprs = uint64_t {1} << 52u,
+	// KYTY_FTZ32 (default on): shaders declare DenormFlushToZero for 32-bit floats (the guest's MODE
+	// flushes them) and transcendental inputs are no longer flushed by hand; part of shader keys.
+	Ftz32 = uint64_t {1} << 54u,
+	// KYTY_MOVREL_BOUNDS (default on): a V_MOVRELS/D_B32 selects over the registers of its array only
+	// (see MovRelExtents) instead of all after its base; part of shader keys.
+	MovRelBounds = uint64_t {1} << 55u,
+	// KYTY_EARLY_LATE_FRAGMENT_TESTS (default on): pixel shaders whose only side effects are the emulator's
+	// address fault records keep early depth tests (EarlyAndLateFragmentTestsAMD); shader key bit.
+	EarlyLateFragmentTests = uint64_t {1} << 53u,
 };
 
 namespace Detail {
@@ -133,6 +171,17 @@ extern std::atomic<uint64_t> g_mask;
 // Set by the walker while it evaluates such a condition: strict reads of GPU-dirty bytes then fail
 // instead of downloading (TryReadBufferBacking).
 inline thread_local bool g_no_wait_dirty_reads = false;
+
+// Experiments of the NHL 27 Stage 1.5/2 line, read from the environment only: the mask has no
+// bits left (they had taken bits 38-43 of the perf line's experiments).
+//   ProgramLockSplit: KYTY_PROGRAM_LOCK_SPLIT (default off; the resolve thread walks shader tables without holding the program lock)
+//   FillPatterns: KYTY_FILL_PATTERNS (default off; a proven compute fill of a repeating 2-4 word pattern is remembered like a uniform fill, so color-clear decoding needs no readback)
+//   UnmapBufferWait: KYTY_UNMAP_BUFFER_WAIT (default off; an unmap of GPU-written buffer bytes waits only for their writers, not for the whole GPU)
+//   DirectGpuReads: KYTY_DIRECT_GPU_READS (default off; downloads of bytes whose GPU writer already finished read the mapped game buffer, needs the same variable at startup)
+//   AsyncReadback: KYTY_ASYNC_READBACK (default off; guest and command-processor downloads wait on their own thread, not the execution thread)
+//   SpeculateStrict: KYTY_SPECULATE_STRICT (default off; with SpeculateDirtyReads, never guess bytes that changed twice or were guessed wrong once)
+enum class EnvBit { ProgramLockSplit, FillPatterns, UnmapBufferWait, DirectGpuReads, AsyncReadback, SpeculateStrict };
+[[nodiscard]] bool EnvEnabled(EnvBit bit) noexcept;
 
 } // namespace Common::Experiments
 

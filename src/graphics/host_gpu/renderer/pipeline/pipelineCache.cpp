@@ -33,6 +33,7 @@
 #include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
+#include <xmmintrin.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -492,6 +493,42 @@ static bool SameGuestBytes(const void* guest, const uint8_t* recorded, uint32_t 
 	}
 }
 
+void GuestReadLog::Prefetch() const {
+	const auto lines = [](const void* data, size_t bytes) {
+		const auto* p = static_cast<const char*>(data);
+		for (size_t at = 0; at < bytes && at < 4096; at += 64) {
+			_mm_prefetch(p + at, _MM_HINT_T0);
+		}
+	};
+	lines(m_entries.data(), m_entries.size() * sizeof(Entry));
+	lines(m_bytes.data(), m_bytes.size());
+}
+
+void ProgramResolution::Prefetch(int step) const {
+	if (step == 0) {
+		const auto* p = reinterpret_cast<const char*>(this);
+		for (size_t at = 0; at < sizeof(ProgramResolution); at += 64) {
+			_mm_prefetch(p + at, _MM_HINT_T0);
+		}
+		return;
+	}
+	const auto lines = [](const void* data, size_t bytes) {
+		const auto* p = static_cast<const char*>(data);
+		for (size_t at = 0; at < bytes && at < 2048; at += 64) {
+			_mm_prefetch(p + at, _MM_HINT_T0);
+		}
+	};
+	for (uint32_t i = 0; i < stages && i < MaxStages; i++) {
+		const auto& snapshot = resources[i];
+		lines(snapshot.buffers.data(), snapshot.buffers.size() * sizeof(snapshot.buffers[0]));
+		lines(snapshot.images.data(), snapshot.images.size() * sizeof(snapshot.images[0]));
+		lines(snapshot.samplers.data(), snapshot.samplers.size() * sizeof(snapshot.samplers[0]));
+		lines(snapshot.user_data.data(), snapshot.user_data.size() * sizeof(uint32_t));
+		lines(snapshot.flattened_srt.data(), snapshot.flattened_srt.size() * sizeof(uint32_t));
+	}
+	reads.Prefetch();
+}
+
 bool GuestReadLog::StillValid(bool without_faults) const {
 	const bool stats = FrameBreakdown::Enabled();
 	const auto stale = [&](std::atomic<uint64_t>& counter, uint64_t address) {
@@ -913,6 +950,24 @@ struct PipelineCache::ProgramCache {
 
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		// KYTY_DBG_SPIRV_OVERRIDE=<hex hash>=<file.spv>: compile that SPIR-V for the shader instead
+		// (a hand-edited or spirv-opt'ed dump of it, to try code-gen changes with isa-bench.ps1).
+		if (const char* override_spec = std::getenv("KYTY_DBG_SPIRV_OVERRIDE"); override_spec != nullptr) {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(override_spec, &end, 16);
+			if (end != override_spec && *end == '=' && hash == options.shader_hash) {
+				std::ifstream file(end + 1, std::ios::binary | std::ios::ate);
+				const auto    bytes = file ? static_cast<size_t>(file.tellg()) : size_t {0};
+				file.seekg(0);
+				std::vector<uint32_t> words(bytes / 4u, 0u);
+				file.read(reinterpret_cast<char*>(words.data()), static_cast<std::streamsize>(words.size() * 4u));
+				if (!words.empty()) {
+					std::printf("NHL27SPIRVOVERRIDE hash=%016llx words=%zu\n",
+					            static_cast<unsigned long long>(hash), words.size());
+					result.spirv = std::move(words);
+				}
+			}
+		}
 		if (ShaderRecompiler::Spirv::HalfVectorEnabled()) {
 			// KYTY_HALF_VECTOR=1: 16-bit lane reads/writes as f16vec2 operations (experiment).
 			ShaderRecompiler::Spirv::HalfLaneStats half_stats;
@@ -947,7 +1002,6 @@ struct PipelineCache::ProgramCache {
 		}
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv,
 		                         options.profile->maintenance8)) {
-
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
 			     options.shader_hash);
@@ -2411,11 +2465,44 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         return;
     }
     const auto start = std::chrono::steady_clock::now();
+    // KYTY_WARMUP_ONLY=<hex hash>[,...]: warm up only the pipelines using those shaders (with
+    // KYTY_DBG_PIPELINE_STATS and KYTY_EXIT_AFTER_WARMUP=1 a quick look at their host ISA).
+    std::vector<bool> wanted;
+    if (const char* only = std::getenv("KYTY_WARMUP_ONLY"); only != nullptr) {
+        std::unordered_set<uint64_t> hashes;
+        for (const char* cursor = only; *cursor != 0;) {
+            char* end = nullptr;
+            const auto hash = std::strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            hashes.insert(hash);
+            cursor = *end == ',' ? end + 1 : end;
+        }
+        wanted.assign(records.programs.size(), false);
+        const auto listed = [&](uint32_t program) {
+            return program < records.programs.size() && hashes.contains(records.programs[program].hash);
+        };
+        for (const auto& record: records.graphics) {
+            const bool ps = record.pixel_program != PipelineRecord::NoProgram;
+            if (listed(record.vertex_program) || (ps && listed(record.pixel_program))) {
+                wanted[record.vertex_program] = true;
+                if (ps) wanted[record.pixel_program] = true;
+            }
+        }
+        for (const auto& record: records.compute) {
+            if (listed(record.program)) wanted[record.program] = true;
+        }
+        // Listed programs without a recorded pipeline (pixel shaders of mesh pipelines) are
+        // translated too: their SPIR-V for KYTY_DBG_DUMP_SHADERS.
+        for (uint32_t program = 0; program < records.programs.size(); program++) {
+            if (listed(program)) wanted[program] = true;
+        }
+    }
     // Shared ProgramCache/compiler state is serialized; do not race translation or insertion.
     std::vector<ShaderProgram> handles(records.programs.size());
     std::vector<ShaderRecompiler::IR::ResourceSnapshot> snapshots(records.programs.size());
     for (size_t index = 0; index < records.programs.size(); ++index) {
         auto& source = records.programs[index];
+        if (!wanted.empty() && !wanted[index]) continue;
         if (source.user_data.size() > ShaderParams{}.user_data.size()) continue;
         if (source.stage == ShaderType::Vertex && source.vertex.native_draw.Enabled() &&
             !m_graphics.native_draw_parameters_enabled) continue;
@@ -2478,6 +2565,14 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         record.vertex.stage = compiled.at(vertex.id);
         if (ps_active) record.pixel.stage = compiled.at(pixel.id);
         auto pipeline = std::make_unique<Pipeline>();
+        // KYTY_DBG_WARMUP_TRACE=1: the shaders of each warm-up pipeline before it is created (to find
+        // one the driver fails on).
+        if (static const bool trace = std::getenv("KYTY_DBG_WARMUP_TRACE") != nullptr; trace) {
+            std::printf("NHL27WARMUP: graphics vs=%016llx ps=%016llx\n",
+                        static_cast<unsigned long long>(records.programs[record.vertex_program].hash),
+                        static_cast<unsigned long long>(ps_active ? records.programs[record.pixel_program].hash : 0));
+            std::fflush(stdout);
+        }
         CreatePipelineInternal(m_graphics, *pipeline, key.rendering, key.vertex_input,
             std::span<const ShaderVertexInputInfo>(&record.vertex, 1),
             ps_active ? &record.pixel : nullptr, programs, key.static_params, m_driver_cache);
@@ -2490,16 +2585,28 @@ void PipelineCache::WarmUp(PipelineRecord::Records& records) {
         record.compute.host_subgroup_size = records.programs[record.program].compute.host_subgroup_size;
         record.compute.lds_storage = records.programs[record.program].compute.lds_storage;
         auto pipeline = std::make_unique<Pipeline>();
+        if (static const bool trace = std::getenv("KYTY_DBG_WARMUP_TRACE") != nullptr; trace) {
+            std::printf("NHL27WARMUP: compute cs=%016llx\n",
+                        static_cast<unsigned long long>(records.programs[record.program].hash));
+            std::fflush(stdout);
+        }
         CreatePipelineInternal(m_graphics, *pipeline, record.compute, program.module, m_driver_cache);
         m_compute_pipelines.emplace(program.id, std::move(pipeline)); ++compute_count;
     }
-    if (m_driver_cache != nullptr) {
+    // A partial warm-up leaves the driver cache as it was.
+    if (m_driver_cache != nullptr && wanted.empty()) {
         WriteDriverCache();
     }
     PipelineCacheLog("Shader warm-up: {} programs, {} graphics and {} compute pipelines in {:.1f}s",
         std::ranges::count_if(handles, [](const auto& handle) { return bool(handle); }),
         graphics_count, compute_count,
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+    if (const char* exit_flag = std::getenv("KYTY_EXIT_AFTER_WARMUP"); exit_flag != nullptr && exit_flag[0] == '1') {
+        std::printf("NHL27WARMUP_DONE\n");
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::_Exit(0);
+    }
 }
 
 void PipelineCache::RecordGraphicsPipeline(const GraphicsPipelineKey&             key,
@@ -2684,7 +2791,7 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	uint32_t          push_data_cursor_stage =
 	    mesh_active ? ShaderRecompiler::IR::PushData::MeshDrawDwordCount : 0;
 	GraphicsPrograms       result;
-	if (ahead != nullptr && Common::Experiments::Enabled(Common::Experiments::ProgramLockSplit)) {
+	if (ahead != nullptr && Common::Experiments::EnvEnabled(Common::Experiments::EnvBit::ProgramLockSplit)) {
 		if (pixel_active) {
 			result.pixel = m_program_cache->GetAheadUnlocked(pixel_params, pixel_info,
 			                                                 push_data_cursor_stage, *ahead);

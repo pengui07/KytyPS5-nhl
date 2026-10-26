@@ -3,6 +3,7 @@
 
 #include "common/common.h"
 
+#include <atomic>
 #include <cstdint>
 #include <tracy/Tracy.hpp> // IWYU pragma: export
 
@@ -23,6 +24,13 @@ inline constexpr uint32_t DeepOrangeA200 = 0xff6e40;
 namespace Profiler {
 
 void SetThreadName(const char* name);
+
+// Whether zones record: set once the profiler started. tracy::ProfilerAvailable() is a call into
+// the client per zone, which on the execution thread alone was 0.6% of its time with no profiler.
+inline std::atomic<bool> g_zones_on {false};
+[[nodiscard]] inline bool ZonesOn() noexcept {
+	return g_zones_on.load(std::memory_order_relaxed);
+}
 
 void Initialize();
 void Shutdown();
@@ -51,7 +59,7 @@ struct Lifecycle {
 	                                           KYTY_PROFILER_COLOR_OR_DEFAULT(0, __VA_ARGS__)};    \
 	tracy::ScopedZone KYTY_PROFILER_CONCAT(kyty_profiler_block_, line)(                           \
 	    &KYTY_PROFILER_CONCAT(kyty_profiler_source_location_, line),                              \
-	    TRACY_CALLSTACK, tracy::ProfilerAvailable())
+	    TRACY_CALLSTACK, Profiler::ZonesOn())
 
 #define KYTY_PROFILER_FUNCTION(...) KYTY_PROFILER_BLOCK(nullptr __VA_OPT__(, ) __VA_ARGS__)
 

@@ -985,6 +985,12 @@ option(KYTY_LINE_TABLES "Emit line tables for the emulator (profiling; no codege
 if (KYTY_LINE_TABLES AND KYTY_CLANG_CL)
 	target_compile_options(kyty_emulator PRIVATE "-gline-tables-only")
 endif()
+# The execution thread's time by region of the draw and dispatch paths (KYTY_DBG_EXEC_REGIONS=1 at
+# run time prints NHL27REGIONS); without the option the marks compile to nothing.
+option(KYTY_EXEC_REGIONS "Execution-thread region timers (diagnostics)" OFF)
+if (KYTY_EXEC_REGIONS)
+	target_compile_definitions(kyty_emulator PRIVATE KYTY_EXEC_REGIONS=1)
+endif()
 # Profile-guided optimization of the emulator and common (clang-cl). KYTY_PGO=generate builds an
 # instrumented emulator that writes LLVM_PROFILE_FILE every 30 s (creating "pgo.reset" in the
 # working directory drops the counts so far, e.g. the boot); merge the .profraw with
@@ -994,7 +1000,14 @@ set(KYTY_PGO "" CACHE STRING "Profile-guided optimization (clang-cl): generate o
 set(KYTY_PGO_PROFILE "${CMAKE_CURRENT_SOURCE_DIR}/tools/pgo/nhl27.profdata" CACHE FILEPATH
 	"Merged .profdata for KYTY_PGO=use")
 set(KYTY_PGO_PROFILE_COMPILER "22.1.8" CACHE STRING "clang version that recorded KYTY_PGO_PROFILE")
-option(KYTY_THIN_LTO "ThinLTO for the emulator and common (clang-cl)" OFF)
+# ThinLTO is on by default where clang-cl links with lld-link (its objects need lld): with the
+# NHL 27 profile it took the execution thread's draws from 3.14 to 2.75 us (paused match, two
+# boots of each build).
+set(KYTY_THIN_LTO_DEFAULT OFF)
+if (KYTY_CLANG_CL AND CMAKE_LINKER MATCHES "lld-link")
+	set(KYTY_THIN_LTO_DEFAULT ON)
+endif()
+option(KYTY_THIN_LTO "ThinLTO for the emulator and common (clang-cl with lld-link)" ${KYTY_THIN_LTO_DEFAULT})
 if (KYTY_CLANG_CL AND KYTY_PGO STREQUAL "generate")
 	execute_process(COMMAND "${CMAKE_CXX_COMPILER}" /clang:-print-resource-dir
 		OUTPUT_VARIABLE KYTY_CLANG_RESOURCE_DIR OUTPUT_STRIP_TRAILING_WHITESPACE)

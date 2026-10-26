@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+#include "graphics/shader/shader.h"
 
 #include <algorithm>
 #include <array>
@@ -132,6 +133,8 @@ struct EmitterState {
 	uint32_t                                         lds_variable            = 0;
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
+	// Experiment MovRelArrays: the function-local variable of each register array, per lane half.
+	std::unordered_map<uint32_t, std::array<uint32_t, 2>> reg_array_variables;
 	std::array<ImageDefinition, IR::ImageBindingCount> images {};
 	std::array<ImageDefinition, IR::ImageBindingCount> heap_images {};
 	uint32_t                   sampler_variable                      = 0;
@@ -643,6 +646,61 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	const auto initial   = state.builder.AllocateId();
 	const auto observed  = state.builder.AllocateId();
 	const auto exchanged = state.builder.AllocateId();
+	if (UniformAtomicLoops()) {
+		// KYTY_UNIFORM_ATOMIC_LOOPS (shader.h): lanes that succeeded wait in the loop until every lane of
+		// the subgroup has, so the loop's exit is subgroup-uniform.
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+		const auto body      = state.builder.AllocateId();
+		const auto attempt   = state.builder.AllocateId();
+		const auto join      = state.builder.AllocateId();
+		const auto done      = state.builder.AllocateId();
+		const auto succeeded = state.builder.AllocateId();
+		const auto next_done = state.builder.AllocateId();
+		const auto next_seen = state.builder.AllocateId();
+		const auto waiting   = state.builder.AllocateId();
+		const auto again     = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBranch, preheader);
+		EmitLabel(state, preheader);
+		state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), initial, pointer,
+		                          ConstantU32(state, scope),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+		state.builder.AddFunction(spv::OpBranch, header);
+		EmitLabel(state, header);
+		state.builder.AddFunction(spv::OpPhi, TypeU32(state), observed, initial, preheader, next_seen,
+		                          cont);
+		state.builder.AddFunction(spv::OpPhi, TypeBool(state), done, ConstantBool(state, false), preheader,
+		                          next_done, cont);
+		state.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone);
+		state.builder.AddFunction(spv::OpBranch, body);
+		EmitLabel(state, body);
+		state.builder.AddFunction(spv::OpSelectionMerge, join, spv::SelectionControlMaskNone);
+		state.builder.AddFunction(spv::OpBranchConditional, done, join, attempt);
+		EmitLabel(state, attempt);
+		const auto next = desired(observed);
+		state.builder.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), exchanged, pointer,
+		                          ConstantU32(state, scope),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone),
+		                          ConstantU32(state, spv::MemorySemanticsMaskNone), next, observed);
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), succeeded, exchanged, observed);
+		// `desired` may have emitted blocks of its own: branch from wherever it left off.
+		const auto attempt_exit = state.current_label;
+		state.builder.AddFunction(spv::OpBranch, join);
+		EmitLabel(state, join);
+		state.builder.AddFunction(spv::OpPhi, TypeBool(state), next_done, done, body, succeeded, attempt_exit);
+		// On success exchanged == observed, so the value carried on is the old value either way.
+		state.builder.AddFunction(spv::OpPhi, TypeU32(state), next_seen, observed, body, exchanged,
+		                          attempt_exit);
+		state.builder.AddFunction(spv::OpBranch, cont);
+		EmitLabel(state, cont);
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), waiting, next_done);
+		state.builder.AddFunction(spv::OpGroupNonUniformAny, TypeBool(state), again,
+		                          ConstantU32(state, spv::ScopeSubgroup), waiting);
+		state.builder.AddFunction(spv::OpBranchConditional, again, header, merge);
+		EmitLabel(state, merge);
+		EmitAtomicMemoryBarrier(state, kind);
+		return next_seen;
+	}
 	state.builder.AddFunction(spv::OpBranch, preheader);
 	EmitLabel(state, preheader);
 	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), initial, pointer,

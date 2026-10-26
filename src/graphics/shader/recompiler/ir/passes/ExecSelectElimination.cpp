@@ -166,6 +166,9 @@ bool IsLaneWise(ValueOpcode op) {
 		case ValueOpcode::FPMul16Low:
 		case ValueOpcode::FPFma16Low:
 		case ValueOpcode::F16x2Swizzle:
+		case ValueOpcode::FPUnary16Low:
+		case ValueOpcode::FPMinMax16Low:
+		case ValueOpcode::FPMinMax16x2:
 		case ValueOpcode::FPAdd64:
 		case ValueOpcode::FPMul64:
 		case ValueOpcode::FPFma64:

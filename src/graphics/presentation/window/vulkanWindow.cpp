@@ -623,6 +623,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		image_atomic_int64.pNext = supported_features2.pNext;
 		supported_features2.pNext = &image_atomic_int64;
 	}
+	const bool early_late_extension =
+	    HasExtension(device_extensions, VK_AMD_SHADER_EARLY_AND_LATE_FRAGMENT_TESTS_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderEarlyAndLateFragmentTestsFeaturesAMD early_late {};
+	if (early_late_extension) {
+		early_late.pNext          = supported_features2.pNext;
+		supported_features2.pNext = &early_late;
+	}
 	const bool conditional_rendering_extension =
 	    HasExtension(device_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);
 	vk::PhysicalDeviceConditionalRenderingFeaturesEXT conditional_rendering {};
@@ -637,7 +644,21 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_barycentric.pNext = supported_features2.pNext;
 		supported_features2.pNext   = &supported_barycentric;
 	}
+	const bool maximal_reconvergence_extension =
+	    HasExtension(device_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+	vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR maximal_reconvergence {};
+	if (maximal_reconvergence_extension) {
+		maximal_reconvergence.pNext = supported_features2.pNext;
+		supported_features2.pNext   = &maximal_reconvergence;
+	}
 	physical_device.getFeatures2(&supported_features2);
+	const bool maximal_reconvergence_enabled =
+	    maximal_reconvergence_extension && maximal_reconvergence.shaderMaximalReconvergence == VK_TRUE;
+	g_shader_maximal_reconvergence.store(maximal_reconvergence_enabled, std::memory_order_relaxed);
+	if (MaximalReconvergenceRequested()) {
+		std::printf("KYTY_MAXIMAL_RECONVERGENCE: maximal reconvergence %s\n",
+		            maximal_reconvergence_enabled ? "enabled" : "unavailable");
+	}
 	const bool barycentric_supported =
 	    barycentric_extension && supported_barycentric.fragmentShaderBarycentric == VK_TRUE;
 	if (!barycentric_supported) {
@@ -646,6 +667,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    "Some games may render incorrectly or crash.\n");
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	const bool early_late_enabled = early_late_extension && early_late.shaderEarlyAndLateFragmentTests == VK_TRUE;
+	g_shader_early_late_tests.store(early_late_enabled, std::memory_order_relaxed);
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
@@ -799,6 +822,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	graphics.sample_rate_shading_enabled                 = true;
 	device_features.shaderInt64 = VK_TRUE;
+	g_shader_ftz32.store(float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE &&
+	                         float_controls.denormBehaviorIndependence !=
+	                             vk::ShaderFloatControlsIndependence::eNone,
+	                     std::memory_order_relaxed);
+	g_shader_storage_align4.store(properties2.properties.limits.minStorageBufferOffsetAlignment <= 4u,
+	                              std::memory_order_relaxed);
+	std::printf("NHL27CODEGEN storage_offset_align=%llu\n",
+	            static_cast<unsigned long long>(
+	                properties2.properties.limits.minStorageBufferOffsetAlignment));
+	std::printf("NHL27CODEGEN ftz32=%d (flush32 %d independence %d)\n", g_shader_ftz32.load() ? 1 : 0,
+	            float_controls.shaderDenormFlushToZeroFloat32 == VK_TRUE ? 1 : 0,
+	            static_cast<int>(float_controls.denormBehaviorIndependence));
 	device_features.shaderFloat64 =
 	    supported_features2.features.shaderFloat64 &&
 	    float_controls.shaderSignedZeroInfNanPreserveFloat64;
@@ -910,6 +945,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		pipeline_executable.pNext                  = const_cast<void*>(create_info.pNext);
 		pipeline_executable.pipelineExecutableInfo = VK_TRUE;
 		create_info.pNext                          = &pipeline_executable;
+	}
+	vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR maximal_reconvergence_enable {};
+	if (maximal_reconvergence_enabled) {
+		maximal_reconvergence_enable.pNext                      = const_cast<void*>(create_info.pNext);
+		maximal_reconvergence_enable.shaderMaximalReconvergence = VK_TRUE;
+		create_info.pNext                                       = &maximal_reconvergence_enable;
+	}
+	vk::PhysicalDeviceShaderEarlyAndLateFragmentTestsFeaturesAMD early_late_enable {};
+	if (early_late_enabled) {
+		early_late_enable.pNext                           = const_cast<void*>(create_info.pNext);
+		early_late_enable.shaderEarlyAndLateFragmentTests = VK_TRUE;
+		create_info.pNext                                 = &early_late_enable;
 	}
 	// VK_EXT_device_fault: lets a device loss report the faulting GPU address.
 	vk::PhysicalDeviceFaultFeaturesEXT device_fault {};
@@ -1359,7 +1406,8 @@ void WindowContext::CreateVulkan() {
 		                             VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME,
 		                             VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME,
 		                             VK_EXT_DEVICE_FAULT_EXTENSION_NAME,
-		                             VK_AMD_BUFFER_MARKER_EXTENSION_NAME}) {
+		                             VK_AMD_BUFFER_MARKER_EXTENSION_NAME,
+		                             VK_AMD_SHADER_EARLY_AND_LATE_FRAGMENT_TESTS_EXTENSION_NAME}) {
 			if (RenderDocSkipsExtension(extension)) {
 				LOGF("RenderDoc compat: skipping %s\n", extension);
 				continue;
@@ -1367,6 +1415,14 @@ void WindowContext::CreateVulkan() {
 			if (HasExtension(available_extensions, extension)) {
 				device_extensions.push_back(extension);
 			}
+		}
+		// KYTY_MAXIMAL_RECONVERGENCE=1 (shader.h): compute shaders declare MaximallyReconvergesKHR when the
+		// device has it.
+		if (MaximalReconvergenceRequested() &&
+		    HasExtension(available_extensions, VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME) &&
+		    HasExtension(available_extensions, VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+			device_extensions.push_back(VK_KHR_SHADER_SUBGROUP_UNIFORM_CONTROL_FLOW_EXTENSION_NAME);
 		}
 		if (HasExtension(available_extensions, VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME)) {
 			device_extensions.push_back(VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME);

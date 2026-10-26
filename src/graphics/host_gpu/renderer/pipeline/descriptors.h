@@ -12,7 +12,9 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -78,7 +80,19 @@ struct ProgramImageMemo {
 	// PreparedBindings::images; `holder` has them meanwhile).
 	std::vector<TextureBinding> bindings;
 	const void*                 holder = nullptr;
+	// The texture epoch (g_texture_epoch) at which every image slot of the last draw found its
+	// description's lookup still holding, unchanged until that draw ended: while the epoch keeps
+	// it, the same T#s find the same images and views (UINT64_MAX: none).
+	uint64_t lean_epoch = UINT64_MAX;
+	// The image set epoch (g_image_set_epoch) then: with it unchanged, the bindings also hold while
+	// none of their images changed since lean_epoch (Image::binding_epoch).
+	uint64_t lean_set_epoch = 0;
+	// The attachments of that draw (RenderExecutor::m_lean_targets): its layout transitions hold
+	// for draws with the same ones.
+	uint64_t lean_targets = 0;
 };
+
+struct ProgramBufferMemo;
 
 struct PreparedBindings {
 	struct BufferSource {
@@ -100,6 +114,19 @@ struct PreparedBindings {
 		uint64_t                              generation = 0;
 	};
 	std::vector<BufferSlotKey> buffer_keys;
+	// CommitBindings(): the descriptor writes and image descriptors of `commit_program`, and its
+	// shader stage.
+	const void* commit_program = nullptr;
+	struct CommitCounts {
+		uint32_t             writes = 0;
+		uint32_t             images = 0;
+		vk::ShaderStageFlags stage;
+	} commit_counts;
+	// The DMA base registers' dwords the stage last found buffers for, with its program and the
+	// generations then (see RenderExecutor::CacheDmaBases()).
+	const void*           dma_program    = nullptr;
+	uint64_t              dma_generation = 0;
+	std::vector<uint32_t> dma_bases;
 	std::vector<vk::DescriptorBufferInfo> buffers;
 	// RebindBuffers: what each plain-read slot bound last (see BufferCache::PlainReadHolds()).
 	struct BufferSlotMemo {
@@ -138,6 +165,33 @@ struct PreparedBindings {
 	std::vector<ShaderRecompiler::IR::DescriptorValue> last_samplers;
 	// The image memo of `last_program` (RenderExecutor::m_program_image_memos).
 	ProgramImageMemo* image_memo = nullptr;
+	// The buffer memo of `last_program` (RenderExecutor::m_program_buffer_memos).
+	ProgramBufferMemo* buffer_memo = nullptr;
+	// The texture epoch when PrepareBindings() looked up the images, and whether it kept the
+	// bindings of the program's last draw (ProgramImageMemo::lean_epoch) instead.
+	uint64_t lookup_epoch     = 0;
+	uint64_t lookup_set_epoch = 0;
+	bool     lean             = false;
+	// Every direct image slot reuses its description's lookup (none written, none with dynamic
+	// mips, no tables): the bindings may be kept by a later draw.
+	bool lean_eligible = false;
+	// KYTY_LEAN_VERIFY: the layouts the kept bindings had.
+	std::vector<vk::ImageLayout> lean_layouts;
+};
+
+// A program's buffer slots (sources, V# keys and bind memos) while another program uses its stage:
+// swapped with the PreparedBindings ones, which `holder` has meanwhile.
+struct ProgramBufferMemo {
+	std::vector<PreparedBindings::BufferSource>   buffer_sources;
+	std::vector<PreparedBindings::BufferSlotKey>  buffer_keys;
+	std::vector<PreparedBindings::BufferSlotMemo> buffer_memos;
+	const void*                                   holder = nullptr;
+
+	void Swap(PreparedBindings& prepared) noexcept {
+		buffer_sources.swap(prepared.buffer_sources);
+		buffer_keys.swap(prepared.buffer_keys);
+		buffer_memos.swap(prepared.buffer_memos);
+	}
 };
 
 [[nodiscard]] vk::DescriptorType
@@ -159,6 +213,15 @@ template <typename T>
                                                    bool r128 = false);
 void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
                             const ShaderTextureResource& descriptor, uint64_t size);
+
+// KYTY_DBG_DRAW_REPEATS=1: how each draw's stage resources compare with the last use of the same
+// program (NHL27REPEATS every 5 s). Begin/End bracket the stages of one draw.
+namespace DrawRepeats {
+[[nodiscard]] bool Enabled();
+void DrawBegin();
+void DrawEnd();
+} // namespace DrawRepeats
+
 
 } // namespace Libs::Graphics
 

@@ -30,6 +30,7 @@
 #include <span>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -785,12 +786,27 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	return params;
 }
 
+// KYTY_DBG_GUEST_VGPRS=1: the guest's VGPR allocation of each pixel and compute shader, once
+// (NHL27GUESTREGS; RSRC1.VGPRS counts blocks of 8 VGPRs in wave32 and of 4 in wave64).
+static void DbgPrintGuestRegisters(const char* stage, uint64_t hash, uint32_t vgprs, uint32_t wave_size) {
+	static const bool enabled = std::getenv("KYTY_DBG_GUEST_VGPRS") != nullptr;
+	if (!enabled) return;
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen;
+	std::lock_guard lock(mutex);
+	if (!seen.insert(hash).second) return;
+	std::printf("NHL27GUESTREGS %s hash=%016llx wave=%u vgprs=%u\n", stage, static_cast<unsigned long long>(hash),
+	            wave_size, (vgprs + 1u) * (wave_size == 32u ? 8u : 4u));
+	std::fflush(stdout);
+}
+
 ShaderParams PrepareProgram(
     const HW::PixelShaderInfo& regs, const HW::ShaderRegisters& sh,
     std::span<const Prospero::ColorComponentMapping, 8> target_export_mapping,
     ShaderPixelInputInfo&                               ps_info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.ps_regs.data_addr, "ShaderGetInputInfoPS():");
 	ShaderGetStaticInputInfoPS(regs, sh, target_export_mapping, data, ps_info);
+	DbgPrintGuestRegisters("ps", hash, regs.ps_regs.rsrc1.vgprs, ps_info.wave_size);
 	return GetShaderParams(
 	    regs.ps_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.ps_user_sgpr.value, regs.ps_regs.rsrc2.user_sgpr), data);
@@ -800,6 +816,7 @@ ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderR
                             ShaderComputeInputInfo& info) {
 	const auto [data, hash] = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
 	ShaderGetStaticInputInfoCS(regs, sh, data, info);
+	DbgPrintGuestRegisters("cs", hash, regs.cs_regs.vgprs, info.wave_size);
 	return GetShaderParams(
 	    regs.cs_regs.data_addr, hash,
 	    std::span<const uint32_t>(regs.cs_user_sgpr.value, regs.cs_regs.user_sgpr), data);

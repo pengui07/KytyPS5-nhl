@@ -125,7 +125,10 @@ constexpr std::array PAD_DEFAULTS = {
     PadDefault {"R2", "RightTrigger"},     PadDefault {"Up", "DpadUp"},
     PadDefault {"Down", "DpadDown"},       PadDefault {"Left", "DpadLeft"},
     PadDefault {"Right", "DpadRight"},     PadDefault {"TouchPad", "Touchpad"},
-    PadDefault {"GyroToggle", "Back"},
+    // View / Back / Create presses the touch pad: pads without one have no other way to. Gyro
+    // emulation has no default button: on a pad without a gyro it takes over the right stick, and
+    // games that do not use motion (NHL 27) then lose the stick until it is toggled off again.
+    PadDefault {"TouchPad", "Back"},
 };
 
 constexpr std::string_view PAD_PREFIX = "Pad:";
@@ -324,8 +327,9 @@ public:
 			Add(binding);
 		}
 		if (!m_custom_pad) {
+			// Defaults may give a control two sources (the touch pad).
 			for (const auto& item: PAD_DEFAULTS) {
-				AssignPad(ControlFromName(item.control), SourceFromName(item.source));
+				m_pad_controls[SourceFromName(item.source)] = ControlFromName(item.control);
 			}
 		}
 	}
