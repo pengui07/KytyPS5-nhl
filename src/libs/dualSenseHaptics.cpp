@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <vector>
@@ -26,6 +28,42 @@ struct Stream {
 };
 
 namespace {
+
+// KYTY_DBG_HAPTICS=1: the haptic audio that a non-DualSense pad's rumble stands in for (NHL27HAPTICS
+// every 5 s: audio blocks by the louder channel's peak and RMS, from <0.02 to >=0.4).
+void NoteHapticBlock(float peak, float rms) {
+	static const bool enabled = std::getenv("KYTY_DBG_HAPTICS") != nullptr;
+	if (!enabled) {
+		return;
+	}
+	static std::array<uint64_t, 6> peaks {};
+	static std::array<uint64_t, 6> rmss {};
+	static uint64_t                start = SDL_GetTicks();
+	constexpr std::array<float, 5> Edges {0.02f, 0.05f, 0.1f, 0.2f, 0.4f};
+	const auto                     bucket = [&](float value) {
+        size_t index = 0;
+        while (index < Edges.size() && value >= Edges[index]) {
+            index++;
+        }
+        return index;
+	};
+	peaks[bucket(peak)]++;
+	rmss[bucket(rms)]++;
+	if (SDL_GetTicks() - start < 5000) {
+		return;
+	}
+	std::printf("NHL27HAPTICS: peak %llu %llu %llu %llu %llu %llu | rms %llu %llu %llu %llu %llu %llu\n",
+	            static_cast<unsigned long long>(peaks[0]), static_cast<unsigned long long>(peaks[1]),
+	            static_cast<unsigned long long>(peaks[2]), static_cast<unsigned long long>(peaks[3]),
+	            static_cast<unsigned long long>(peaks[4]), static_cast<unsigned long long>(peaks[5]),
+	            static_cast<unsigned long long>(rmss[0]), static_cast<unsigned long long>(rmss[1]),
+	            static_cast<unsigned long long>(rmss[2]), static_cast<unsigned long long>(rmss[3]),
+	            static_cast<unsigned long long>(rmss[4]), static_cast<unsigned long long>(rmss[5]));
+	std::fflush(stdout);
+	peaks.fill(0);
+	rmss.fill(0);
+	start = SDL_GetTicks();
+}
 
 constexpr int      FRAME_BYTES  = 4 * sizeof(float);
 constexpr uint32_t MAX_QUEUE_MS = 80;
@@ -345,24 +383,34 @@ uint64_t Queue(Stream* stream, int controller, const void* data, uint32_t frames
 		CloseDevice(stream);
 		stream->next_check = 0;
 		// Non-DualSense pads have no haptic audio path: approximate it with the rumble motors.
-		float peak[2] = {0.0f, 0.0f};
+		float energy[2] = {0.0f, 0.0f};
+		float raw_peak  = 0.0f;
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			for (uint32_t ch = 0; ch < 2; ch++) {
 				const auto src_ch = channels == 1 ? 0 : ch;
 				const auto index  = (static_cast<size_t>(first_frame) + frame) * channels + src_ch;
 				float      value  = is_float ? static_cast<const float*>(data)[index]
 				                             : static_cast<const int16_t*>(data)[index] / 32768.0f;
-				value *= volume[src_ch] / 32768.0f * gain * (gains != nullptr ? gains[src_ch] : 1.0f);
-				peak[ch] = std::max(peak[ch], std::fabs(value));
+				// Before the vibration intensity setting, which scales the motors below.
+				value *= volume[src_ch] / 32768.0f * (gains != nullptr ? gains[src_ch] : 1.0f);
+				raw_peak = std::max(raw_peak, std::fabs(value));
+				energy[ch] += value * value;
 			}
 		}
-		const auto to_motor = [](float v) {
-			return static_cast<uint16_t>(std::clamp(v * 2.0f, 0.0f, 1.0f) * 65535.0f);
+		NoteHapticBlock(raw_peak, std::sqrt(std::max(energy[0], energy[1]) / static_cast<float>(frames)));
+		// The motors follow the block's RMS above a floor. Haptic audio carries a continuous texture
+		// for the DualSense's voice coils (NHL 27: RMS 0.02-0.1 in presentation scenes) that rumble
+		// motors turned into constant shaking unrelated to the game (the peak, doubled, drove them);
+		// its events reach RMS 0.2-0.5 (NHL27HAPTICS, KYTY_DBG_HAPTICS=1).
+		const auto to_motor = [&](uint32_t ch) {
+			const float rms   = std::sqrt(energy[ch] / static_cast<float>(frames)) * gain;
+			const float level = std::clamp((rms - 0.1f) / 0.3f, 0.0f, 1.0f);
+			return static_cast<uint16_t>(level * 65535.0f);
 		};
 		SDL_LockJoysticks();
 		if (auto* pad = SDL_GetGamepadFromID(static_cast<SDL_JoystickID>(controller));
 		    pad != nullptr) {
-			(void) SDL_RumbleGamepad(pad, to_motor(peak[0]), to_motor(peak[1]), 100);
+			(void) SDL_RumbleGamepad(pad, to_motor(0), to_motor(1), 100);
 		}
 		SDL_UnlockJoysticks();
 		return static_cast<uint64_t>(frames) * 1000000 / stream->freq;

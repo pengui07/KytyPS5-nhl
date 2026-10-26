@@ -22,6 +22,7 @@
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/depthAliasLog.h"
+#include "graphics/host_gpu/renderer/execRegions.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
 #include <xmmintrin.h>
@@ -498,10 +499,13 @@ struct RenderExecutor::ResolvedDraw {
 	std::atomic_bool  busy {false};
 };
 
-// More resolutions than operations can wait between the resolve and execution threads, so the
-// resolve thread only ever waits for room in that queue.
+// A resolver that gets this far ahead of the execution thread waits for the oldest resolution to be
+// released. Each resolution is about 38 KB: 320 of them (12 MB) did not stay in cache or in the TLB's
+// reach, and the execution thread read them cold (paused in-boot A/B, 48 per draw resolver instead of
+// 160: draw -1.2%, dispatch -1.9%). In play the resolvers need the slack: at 48 the execution thread
+// waited for them (idle 163 vs 94 ms/s, about -6% fps); 96 did not (idle 171 vs 212 ms/s).
 struct RenderExecutor::ResolvedDrawRing {
-	static constexpr size_t Size = 320;
+	static constexpr size_t Size = 192;
 
 	std::array<ResolvedDraw, Size> draws;
 	size_t                         next = 0;
@@ -1620,6 +1624,7 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
 		}
 	}
 	mrt_mask &= color_output_mask;
+	ExecRegions::InDraw(ExecRegions::StateMasks);
 	m_render_targets_reused =
 	    TryReuseRenderTargets(buffer.GetRegisters(), mrt_mask, render_target_slice_offset, state);
 	if (!m_render_targets_reused) {
@@ -1889,6 +1894,44 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                              index_source.guest_element_size);
 	}
 	LogDrawPhase(draw.Name(), "PrepareBindings");
+	// KYTY_DBG_EXEC_REGIONS: how much a draw repeats the draw before it.
+	if (ExecRegions::Enabled()) {
+		struct Last {
+			uint64_t                                           context = 0;
+			std::array<const void*, 5>                         programs {};
+			std::array<std::vector<ShaderRecompiler::IR::DescriptorValue>, 5> images, samplers, buffers;
+			std::array<std::vector<uint32_t>, 5>               user;
+		};
+		static Last last;
+		std::array<const ShaderStageRuntime*, 5> runtimes {};
+		for (uint32_t i = 0; i < vertex_stages.size() && i < 4; i++) runtimes[i] = &state.vertex_info[i].stage;
+		if (state.ps_active) runtimes[4] = &state.ps_input_info.stage;
+		bool same_programs = true, same_textures = true, same_buffers = true, same_user = true;
+		for (uint32_t i = 0; i < 5; i++) {
+			const void* program = runtimes[i] != nullptr ? runtimes[i]->program : nullptr;
+			same_programs &= program == last.programs[i];
+			last.programs[i] = program;
+			if (runtimes[i] == nullptr) continue;
+			const auto& snapshot = *runtimes[i]->resources;
+			same_textures &= snapshot.images == last.images[i] && snapshot.samplers == last.samplers[i];
+			same_buffers &= snapshot.buffers == last.buffers[i];
+			same_user &= snapshot.user_data == last.user[i];
+			last.images[i]   = snapshot.images;
+			last.samplers[i] = snapshot.samplers;
+			last.buffers[i]  = snapshot.buffers;
+			last.user[i]     = snapshot.user_data;
+		}
+		if (m_context_id != 0 && m_context_id == last.context) ExecRegions::Note(ExecRegions::SameContext);
+		last.context = m_context_id;
+		if (same_programs) ExecRegions::Note(ExecRegions::SamePrograms);
+		if (same_programs && same_textures) ExecRegions::Note(ExecRegions::SameTextures);
+		if (same_programs && same_buffers) ExecRegions::Note(ExecRegions::SameBufferVs);
+		if (same_programs && same_user) ExecRegions::Note(ExecRegions::SameUserData);
+		if (same_programs && same_textures && m_render_targets_reused) ExecRegions::Note(ExecRegions::SameAllButData);
+		if (m_render_targets_reused) ExecRegions::Note(ExecRegions::TargetsReused);
+		ExecRegions::g_lean = same_programs && same_textures && m_render_targets_reused;
+	}
+	ExecRegions::To(ExecRegions::DrawEntry);
 	BufferCache::PerfTimerScope section(BufferCache::PerfTimer::DrawBindPrepare);
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
@@ -1924,8 +1967,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (source.count_addr != 0) (void)cache.FindBuffer(source.count_addr, sizeof(uint32_t));
 	}
 	section.Stop();
+	ExecRegions::To(ExecRegions::DrawStages);
 	BufferCache::PerfTimerScope resolve_section(BufferCache::PerfTimer::DrawBindResolve);
 	PrepareGraphicsBindings(stages, std::span {state.colors, state.color_count});
+	ExecRegions::To(ExecRegions::DrawBuffers);
 	resolve_section.Stop();
 	BufferCache::PerfTimerScope vertex_section(BufferCache::PerfTimer::DrawVertex);
 	PreparedVertexBuffers vertex_bindings;
@@ -1983,15 +2028,59 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        {}, 1, &copied, 0, nullptr, 0, nullptr);
 	}
 	vertex_section.Stop();
+	ExecRegions::To(ExecRegions::DrawVertex);
 	BufferCache::PerfTimerScope pipeline_section(BufferCache::PerfTimer::DrawPipeline);
 	// Pipeline bucket: paused around CommitBindings (its own bucket) and stopped after the draw.
 	std::optional<FrameBreakdown::Timer> pipeline_timer;
 	pipeline_timer.emplace(FrameBreakdown::g_counters.dp_pipeline_ns);
-	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
-	    std::span {state.colors, state.color_count}, *state.depth, vertex_stages, buffer,
-	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
-	    state.programs);
+	// A draw with the register snapshot (context id), programs, topology, attachment formats and no
+	// fixed-function vertex input of the draw before it gets that draw's pipeline: every input of
+	// the pipeline key is the same (GetGraphicsPipeline builds a key of several hundred bytes and
+	// compares it). KYTY_PIPELINE_FRONT_VERIFY=1 looks the pipeline up anyway and compares.
+	struct PipelineFront {
+		uint64_t                 context_id = 0;
+		std::array<uint64_t, 4>  programs {};
+		uint64_t                 attachments = 0;
+		uint32_t                 topology    = 0;
+		PipelineCache::Pipeline* pipeline    = nullptr;
+	};
+	static PipelineFront front;
+	static const bool    front_verify = std::getenv("KYTY_PIPELINE_FRONT_VERIFY") != nullptr;
+	const auto&          front_vs     = vertex_stages.front();
+	uint64_t             attachments  = 0;
+	{
+		const auto mix = [&attachments](uint64_t value) { attachments = (attachments ^ value) * 0x100000001b3ull; };
+		mix(state.color_count);
+		for (uint32_t i = 0; i < state.color_count; i++) {
+			const auto& color = state.colors[i];
+			mix((uint64_t {color.target_slot} << 48u) | (uint64_t {color.export_mapping.packed} << 40u) |
+			    (uint64_t {color.desc.info.samples} << 32u) | static_cast<uint64_t>(color.desc.view_info.format));
+			mix(static_cast<uint64_t>(color.desc.info.guest_format));
+		}
+		mix((static_cast<uint64_t>(state.depth->image_id ? 1 : 0) << 63u) |
+		    (uint64_t {state.depth->depth_test_enable} << 62u) | (uint64_t {state.depth->desc.info.samples} << 32u) |
+		    static_cast<uint64_t>(state.depth->desc.view_info.format));
+	}
+	const std::array<uint64_t, 4> front_programs {state.programs.vertex[0].id, state.programs.vertex[1].id,
+	                                              state.programs.vertex[2].id,
+	                                              state.ps_active ? state.programs.pixel.id : ~uint64_t {0}};
+	const uint32_t                front_topology = static_cast<uint32_t>(topology) | (primitive_restart_enable ? 0x100u : 0u);
+	const bool front_hit = m_context_id != 0 && front.pipeline != nullptr && front.context_id == m_context_id &&
+	                       front.programs == front_programs && front.attachments == attachments &&
+	                       front.topology == front_topology && front_vs.buffers_num == 0 &&
+	                       front_vs.resources_num == 0;
+	auto& pipeline = front_hit && !front_verify
+	                     ? *front.pipeline
+	                     : m_context.GetPipelineCache().GetGraphicsPipeline(
+	                           std::span {state.colors, state.color_count}, *state.depth, vertex_stages, buffer,
+	                           state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
+	                           state.programs);
+	if (front_hit && front_verify && &pipeline != front.pipeline) {
+		EXIT("pipeline front: draw with the last draw's context, programs and attachments needs another pipeline\n");
+	}
+	front = {m_context_id, front_programs, attachments, front_topology, &pipeline};
 	pipeline_section.Stop();
+	ExecRegions::To(ExecRegions::DrawPipeline);
 	BufferCache::PerfTimerScope attachments_section(BufferCache::PerfTimer::DrawAttachments);
 	vk::ImageAspectFlags feedback_aspects;
 	FrameBreakdown::Timer targets_timer(FrameBreakdown::g_pl.targets_ns, FrameBreakdown::Verbose());
@@ -1999,6 +2088,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	    AcquireRenderTargets(buffer, state.colors, state.color_count, *state.depth,
 	                         feedback_aspects, stages);
 	attachments_section.Stop();
+	// The attachments and their layouts, and whether the draw binds a storage image: the layouts
+	// its textures take depend on them (see CommitBindings()).
+	{
+		uint64_t signature = m_bound_storage ? 0x9e3779b97f4a7c15ull : 0x2545f4914f6cdd1dull;
+		const auto mix = [&signature](uint64_t value) { signature = (signature ^ value) * 0x100000001b3ull; };
+		for (uint32_t i = 0; i < rendering.num_color_attachments; i++) {
+			const auto& attachment = rendering.color_attachments[i];
+			mix(reinterpret_cast<uint64_t>(static_cast<VkImageView>(attachment.image_view)));
+			mix(static_cast<uint64_t>(attachment.image_layout));
+		}
+		mix(reinterpret_cast<uint64_t>(static_cast<VkImageView>(rendering.depth_stencil_attachment.image_view)));
+		mix(static_cast<uint64_t>(rendering.depth_stencil_attachment.image_layout));
+		m_lean_targets = signature;
+	}
+	ExecRegions::To(ExecRegions::DrawTargets);
 	BufferCache::PerfTimerScope commit_section(BufferCache::PerfTimer::DrawCommit);
 	targets_timer.Stop();
 
@@ -2018,7 +2122,10 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	pipeline_timer.reset();
 	{
 		FrameBreakdown::Timer descriptors_timer(FrameBreakdown::g_counters.dp_descriptors_ns);
+		ExecRegions::To(ExecRegions::DrawRecord);
 		CommitBindings(buffer, vk::PipelineBindPoint::eGraphics, pipeline, stages);
+		FinishLeanBindings(stages);
+		ExecRegions::To(ExecRegions::DrawDescriptors);
 	}
 	pipeline_timer.emplace(FrameBreakdown::g_counters.dp_pipeline_ns);
 	std::optional<FrameBreakdown::Timer> vcommit2_timer;
@@ -2097,8 +2204,30 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		if (foreign_state) {
 			dynamic_state.Invalidate();
 		}
-		UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), *state.depth,
-		                           rendering);
+		// A draw's dynamic state follows from the registers (the context id), the last vertex
+		// stage's program (indexed viewports) and the attachments (m_lean_targets: their views
+		// give the extent): with those of the draw that last set it, it holds the same values.
+		// Only this function writes them (an invalidation marks them all to be recorded again).
+		// KYTY_DYNAMIC_STATE_VERIFY=1 sets them anyway and exits if one changed.
+		static uint64_t    dynamic_context = 0;
+		static const void* dynamic_program = nullptr;
+		static uint64_t    dynamic_targets = 0;
+		static const bool  dynamic_verify  = std::getenv("KYTY_DYNAMIC_STATE_VERIFY") != nullptr;
+		const void*        last_program    = vertex_stages.back().stage.program;
+		const bool         dynamic_same    = m_context_id != 0 && m_context_id == dynamic_context &&
+		                          last_program == dynamic_program && m_lean_targets == dynamic_targets;
+		if (!dynamic_same || dynamic_verify) {
+			const auto dirty_before = dynamic_state.dirty_state;
+			UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), *state.depth,
+			                           rendering);
+			if (dynamic_same &&
+			    std::memcmp(&dirty_before, &dynamic_state.dirty_state, sizeof(dirty_before)) != 0) {
+				EXIT("dynamic state: draw with the last draw's context, program and attachments changed it\n");
+			}
+			dynamic_context = m_context_id;
+			dynamic_program = last_program;
+			dynamic_targets = m_lean_targets;
+		}
 		dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 		dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
 	}
@@ -2309,6 +2438,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x700u);
 	}
+	ExecRegions::To(ExecRegions::DrawRecord);
 }
 
 // DIAGNOSTIC (KYTY_DBG_ZERO_INSTANCE): a draw dropped by the zero index/vertex or instance
@@ -2419,6 +2549,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
                                const DrawIndexArgs& args) {
 	KYTY_PROFILER_FUNCTION();
+	ExecRegions::Scope regions(ExecRegions::DrawExit);
 	std::optional<DrawCostScope> draw_cost;
 	if (DrawCostScope::Enabled()) {
 		const auto& vs_info = buffer.GetShaders().GetVs();
@@ -2428,7 +2559,8 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().PopPendingOperations(false);
+	ExecRegions::To(ExecRegions::PrePending);
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -2442,6 +2574,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		                    args.instance_source, args.instance_args_addr);
 		return true;
 	}
+	ExecRegions::To(ExecRegions::PreLock);
 
 	if (ConsumeMetadataColorOperation(buffer, args.render_target_slice_offset) ||
 	    DepthStencilCopy(buffer) ||
@@ -2450,6 +2583,7 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 		ResetBindings();
 		return true;
 	}
+	ExecRegions::To(ExecRegions::PreSpecial);
 
 	if (!DrawHasValidVertexShader(sh_ctx)) {
 		return true;
@@ -2520,13 +2654,16 @@ bool RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 	const DrawCallInfo draw {CommandBufferDebugOp::DrawIndex, args.index_count,
 	                        args.instance_count, args.first_instance};
 	bool               shaders_resolved = false;
+	ExecRegions::To(ExecRegions::EntryPre);
 	auto& state = AcquireDrawRenderState(ucfg.GetPrimType() == Prospero::PrimitiveType::kPatch,
 	                                     shaders_resolved);
+	ExecRegions::To(ExecRegions::EntryAcquire);
 	if (!PrepareDrawRenderState(buffer, shaders_resolved, draw, args.render_target_slice_offset,
 	                            state)) {
 		ResetBindings();
 		return true;
 	}
+	ExecRegions::To(ExecRegions::EntryState);
 
 	LogDrawStateIfNeeded(buffer, draw, state, args.index_type_and_size,
 	                     args.index_addr);
@@ -2546,7 +2683,7 @@ bool RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	EXIT_IF(buffer.IsInvalid());
 	EXIT_IF(args.offset_source == DrawOffsetSource::DrawState && args.first_instance != 0);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().PopPendingOperations(false);
 	auto& ucfg   = buffer.GetUserConfig();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -2652,7 +2789,7 @@ bool RenderExecutor::DrawAutoIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	    (source.args_addr & 3u) != 0 || (source.count_addr & 3u) != 0 ||
 	    !m_context.IsMapped(source.args_addr, source.ArgsSize()) ||
 	    (source.count_addr != 0 && !m_context.IsMapped(source.count_addr, sizeof(uint32_t)))) return false;
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().PopPendingOperations(false);
 	Common::LockGuard lock(m_context.GetMutex());
 	auto& ucfg = buffer.GetUserConfig();
 	const auto& ctx = buffer.GetRegisters();

@@ -3,6 +3,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/experiments.h"
+#include "graphics/host_gpu/renderer/execRegions.h"
 #include "common/file.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -973,9 +974,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
                                     uint32_t thread_group_x, uint32_t thread_group_y,
                                     uint32_t thread_group_z, uint32_t mode, bool async_compute,
                                     ResolvedDispatch* resolved) {
+	ExecRegions::Scope regions(ExecRegions::Dispatch);
 	BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::Dispatch);
 	EXIT_IF(buffer.IsInvalid());
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().PopPendingOperations(false);
 	auto& ctx    = buffer.GetRegisters();
 	auto& sh_ctx = buffer.GetShaders();
 
@@ -1058,6 +1060,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	}();
 	program_timer.Stop();
+	ExecRegions::To(ExecRegions::DispProgram);
 	if (!compute_program) {
 		// NHL debugging: the shader failed to build (KYTY_DBG_SKIP_BAD_SHADERS=1); skip the dispatch.
 		ResetBindings();
@@ -1198,16 +1201,19 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		}
 	}
 
+	ExecRegions::To(ExecRegions::DispFill);
 	buffer.EndRendering();
 	FrameBreakdown::Timer pipeline_timer(FrameBreakdown::g_counters.dc_pipeline_ns);
 	FrameBreakdown::Timer cs_get_timer(FrameBreakdown::g_pl.cs_get_ns, FrameBreakdown::Verbose());
 	auto& pipeline =
 	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	cs_get_timer.Stop();
+	ExecRegions::To(ExecRegions::DispPipeline);
 	auto& bindings = m_compute_bindings;
 	FrameBreakdown::Timer cs_prep_timer(FrameBreakdown::g_pl.cs_prep_ns, FrameBreakdown::Verbose());
 	PrepareBindings(input_info.stage, bindings);
 	cs_prep_timer.Stop();
+	ExecRegions::To(ExecRegions::DispStages);
 	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
 		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
 		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
@@ -1222,22 +1228,25 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 		if (program.info.uses_dma) {
 			FrameBreakdown::Timer bda_timer(FrameBreakdown::g_counters.dc_bda_ns);
-			m_context.CacheDmaBases(input_info.stage);
+			CacheDmaBases(bindings);
 			m_context.PrepareBda();
 		}
 	}
 	if (program.info.uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
 	}
+	ExecRegions::To(ExecRegions::DispFind);
 	{
 		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dc_textures_ns);
 		RebindImages(bindings);
 	}
+	ExecRegions::To(ExecRegions::DispImages);
 	{
 		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dc_buffers_ns);
 		BindSharedMemory(m_context, input_info, bindings);
 		RebindBuffers(bindings);
 	}
+	ExecRegions::To(ExecRegions::DispBuffers);
 
 	auto              vk_buffer        = buffer.Handle();
 	{
@@ -1245,6 +1254,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 		               std::span {&descriptor_stage, 1u});
 	}
+	ExecRegions::To(ExecRegions::DispCommit);
 	bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage) || indirect_writes;
 	has_storage_writes =
@@ -1567,8 +1577,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
                                       ResolvedDispatch* resolved) {
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0 ||
 	        (mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0);
+	ExecRegions::Scope regions(ExecRegions::Dispatch);
 	BufferCache::PerfTimerScope phase_timer(BufferCache::PerfTimer::Dispatch);
-	m_context.GetCommandScheduler().PopPendingOperations();
+	m_context.GetCommandScheduler().PopPendingOperations(false);
 	buffer.SetDebugInfo(static_cast<uint32_t>(CommandBufferDebugOp::DispatchIndirect), submit_id,
 	                    static_cast<uint32_t>(args_addr), static_cast<uint32_t>(args_addr >> 32u),
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
@@ -1601,6 +1612,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		return m_context.GetPipelineCache().GetComputeProgram(cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	}();
 	program_timer.Stop();
+	ExecRegions::To(ExecRegions::DispProgram);
 	if (!compute_program) {
 		// NHL debugging: the shader failed to build (KYTY_DBG_SKIP_BAD_SHADERS=1); skip the dispatch.
 		ResetBindings();
@@ -1633,7 +1645,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
 		if (program.info.uses_dma) {
 			FrameBreakdown::Timer bda_timer(FrameBreakdown::g_counters.dc_bda_ns);
-			m_context.CacheDmaBases(input_info.stage);
+			CacheDmaBases(bindings);
 			m_context.PrepareBda();
 		}
 		BindSharedMemory(m_context, input_info, bindings, args_addr);

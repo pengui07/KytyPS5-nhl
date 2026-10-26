@@ -8,12 +8,15 @@
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
+#include <algorithm>
 #include <atomic>
 #include <compare>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <optional>
 #include <span>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -25,6 +28,23 @@ class TileManager;
 struct ImageTestAccess;
 
 using ImageId = Common::SlotId;
+
+// Advances on every change of an image that texture bindings depend on: its lookup state (dirty
+// and modified flags, tracking, stencil association, usage), its layouts, its registration, its
+// replacement or deletion. A draw that binds the same T#s as the draw before it keeps that draw's
+// bindings while the epoch is unchanged (RenderExecutor's repeated draws), or while no image of
+// its own changed (Image::binding_epoch) and the set of images did not (g_image_set_epoch).
+inline std::atomic<uint64_t> g_texture_epoch {0};
+inline void                  TextureStateChanged() noexcept {
+	g_texture_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+// Advances (with g_texture_epoch) on the changes that are not of one image's own state: images
+// created, registered, unregistered, replaced or deleted, stencil associations.
+inline std::atomic<uint64_t> g_image_set_epoch {0};
+inline void                  ImageSetChanged() noexcept {
+	g_image_set_epoch.fetch_add(1, std::memory_order_relaxed);
+	TextureStateChanged();
+}
 
 struct CachedImageView {
 	ImageViewInfo info;
@@ -69,7 +89,50 @@ public:
 	[[nodiscard]] vk::ImageView PrepareShadowStorage(const ImageViewInfo& view_info);
 	// Copies shadow subresources prepared since the last flush back into the block image.
 	void FlushShadowStorage();
-	using Barriers = std::vector<vk::ImageMemoryBarrier2>;
+	// Transitions mostly need one barrier: up to Inline of them stay in the object (a heap
+	// allocation per transition was about 0.5% of the execution thread).
+	// The inline ones are left uninitialized: most transitions need none, and constructing two
+	// barriers for each of them would cost more than the allocation saved.
+	class Barriers {
+	public:
+		static constexpr size_t Inline = 2;
+		static_assert(std::is_trivially_copyable_v<vk::ImageMemoryBarrier2>);
+		Barriers() noexcept {}
+		Barriers(const Barriers& other) { *this = other; }
+		Barriers& operator=(const Barriers& other) {
+			if (this != &other) {
+				m_size = other.m_size;
+				m_heap = other.m_heap;
+				std::memcpy(static_cast<void*>(m_inline), other.m_inline,
+				            sizeof(vk::ImageMemoryBarrier2) * std::min(m_size, Inline));
+			}
+			return *this;
+		}
+		void push_back(const vk::ImageMemoryBarrier2& barrier) {
+			if (m_size < Inline) {
+				std::memcpy(static_cast<void*>(&m_inline[m_size]), &barrier, sizeof(barrier));
+			} else {
+				if (m_size == Inline) m_heap.assign(m_inline, m_inline + Inline);
+				m_heap.push_back(barrier);
+			}
+			m_size++;
+		}
+		[[nodiscard]] bool                           empty() const noexcept { return m_size == 0; }
+		[[nodiscard]] size_t                         size() const noexcept { return m_size; }
+		[[nodiscard]] const vk::ImageMemoryBarrier2* data() const noexcept {
+			return m_size > Inline ? m_heap.data() : m_inline;
+		}
+		[[nodiscard]] const vk::ImageMemoryBarrier2* begin() const noexcept { return data(); }
+		[[nodiscard]] const vk::ImageMemoryBarrier2* end() const noexcept { return data() + m_size; }
+		[[nodiscard]] const vk::ImageMemoryBarrier2& operator[](size_t index) const noexcept { return data()[index]; }
+
+	private:
+		union {
+			vk::ImageMemoryBarrier2 m_inline[Inline];
+		};
+		std::vector<vk::ImageMemoryBarrier2> m_heap;
+		size_t                               m_size = 0;
+	};
 	[[nodiscard]] Barriers GetBarriers(vk::ImageLayout                      destination_layout,
 	                                   vk::AccessFlags2                     destination_access,
 	                                   vk::PipelineStageFlags2              destination_stage,
@@ -86,7 +149,15 @@ public:
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
 
+	// The g_texture_epoch of this image's last change that texture bindings depend on (its lookup
+	// state, usage and layouts; see g_texture_epoch). Written by any thread that changes the image.
+	std::atomic<uint64_t> binding_epoch {0};
+	void                  StateChanged() noexcept {
+		binding_epoch.store(g_texture_epoch.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+	}
+
 	void MarkCpuDirty() {
+		if (!m_cpu_dirty || m_maybe_cpu_dirty) StateChanged();
 		m_cpu_dirty       = true;
 		m_maybe_cpu_dirty = false;
 		HeapChanged();
@@ -99,6 +170,7 @@ public:
 		if (!IsCpuDirty()) {
 			m_maybe_cpu_hash  = HashGuestEdges();
 			m_maybe_cpu_dirty = true;
+			StateChanged();
 			HeapChanged();
 		}
 	}
@@ -106,6 +178,7 @@ public:
 		if (!m_maybe_cpu_dirty || m_cpu_dirty) {
 			EXIT("image cannot resolve maybe-dirty hash\n");
 		}
+		StateChanged();
 		m_maybe_cpu_dirty = false;
 		m_cpu_dirty |= hash != m_maybe_cpu_hash;
 		return m_cpu_dirty;
@@ -115,20 +188,31 @@ public:
 		if (!IsCpuDirty()) {
 			EXIT("clean image cannot complete a refresh\n");
 		}
+		StateChanged();
 		m_cpu_dirty       = false;
 		m_maybe_cpu_dirty = false;
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
-	void               MarkGpuModified() noexcept { m_gpu_modified = true; }
-	void               ClearGpuModified() noexcept { m_gpu_modified = false; }
+	void               MarkGpuModified() noexcept {
+		if (!m_gpu_modified) StateChanged();
+		m_gpu_modified = true;
+	}
+	void ClearGpuModified() noexcept {
+		if (m_gpu_modified) StateChanged();
+		m_gpu_modified = false;
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
+		if (!m_buffer_modified) StateChanged();
 		m_buffer_modified = true;
 		HeapChanged();
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void ClearBufferModified() noexcept {
+		if (m_buffer_modified) StateChanged();
+		m_buffer_modified = false;
+	}
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {

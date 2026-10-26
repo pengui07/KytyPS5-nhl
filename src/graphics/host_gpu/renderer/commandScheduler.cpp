@@ -1275,7 +1275,7 @@ void CommandScheduler::Wait(uint64_t tick) {
 	}
 }
 
-void CommandScheduler::PopPendingOperations() {
+void CommandScheduler::PopPendingOperations(bool wait_priority) {
 	// Every draw and dispatch comes here: only query the timeline semaphore (a driver call) when
 	// the oldest operation is not already known to be free.
 	bool refreshed = false;
@@ -1316,6 +1316,16 @@ void CommandScheduler::PopPendingOperations() {
 				m_master.Refresh();
 				refreshed = true;
 				if (!m_master.IsFree(m_pending_operations.front().tick)) {
+					return;
+				}
+			}
+			// The priority thread still runs or has queued operations of this tick or earlier (its
+			// downloads): the operation waits for them, and draws do not wait for it (the execution
+			// thread waited there 1.5% of its time in play).
+			if (!wait_priority) {
+				const auto tick = m_pending_operations.front().tick;
+				if ((m_priority_active && m_priority_active_tick <= tick) ||
+				    (!m_priority_operations.empty() && m_priority_operations.front().tick <= tick)) {
 					return;
 				}
 			}

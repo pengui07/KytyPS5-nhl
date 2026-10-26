@@ -220,6 +220,7 @@ inline void GenCount(std::atomic<uint64_t>& counter) noexcept {
 } // namespace
 
 void TextureCache::BumpGeneration(uint64_t begin, uint64_t end) noexcept {
+	ImageSetChanged();
 	std::lock_guard lock {m_gen_log_mutex};
 	const uint64_t generation = m_generation.load(std::memory_order_relaxed) + 1;
 	m_gen_log[generation % GEN_LOG_SIZE] = {generation, begin, end};
@@ -304,6 +305,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	}
 	m_address_filter_versions[filter_index >> 4u].fetch_add(1, std::memory_order_release);
 	m_address_index_version.fetch_add(1, std::memory_order_release);
+	ImageSetChanged();
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
 	image.lru_tick   = m_gc_tick;
@@ -358,6 +360,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 		EXIT("TextureCache: image accounting underflow\n");
 	}
 	m_total_used_memory -= accounted;
+	ImageSetChanged();
 	image.registered = false;
 	const auto epoch = ++m_image_set_epoch;
 	ForEachPage(image.info.data.address, image.info.data.size,
@@ -557,6 +560,7 @@ void TextureCache::TrackImage(ImageId id) {
 		return;
 	}
 	if (!image.IsTracked()) {
+		image.StateChanged();
 		image.track_addr     = image_begin;
 		image.track_addr_end = image_end;
 		m_page_manager.UpdatePageWatchers<true>(image_begin, image.info.data.size);
@@ -583,6 +587,7 @@ void TextureCache::TrackImageHead(ImageId id) {
 		EXIT("TextureCache: invalid image head tracking range\n");
 	}
 	const auto size  = image.track_addr - image_begin;
+	image.StateChanged();
 	image.track_addr = image_begin;
 	m_page_manager.UpdatePageWatchers<true>(image_begin, size);
 }
@@ -601,6 +606,7 @@ void TextureCache::TrackImageTail(ImageId id) {
 	}
 	const auto address   = image.track_addr_end;
 	const auto size      = image_end - address;
+	image.StateChanged();
 	image.track_addr_end = image_end;
 	m_page_manager.UpdatePageWatchers<true>(address, size);
 }
@@ -614,6 +620,7 @@ void TextureCache::UntrackImage(ImageId id) {
 	GenCount(FrameBreakdown::g_delta.gen_untrack_skipped);
 	const auto address   = image.track_addr;
 	const auto size      = image.track_addr_end - image.track_addr;
+	image.StateChanged();
 	image.track_addr     = 0;
 	image.track_addr_end = 0;
 	if (size != 0) {
@@ -631,6 +638,7 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	GenCount(FrameBreakdown::g_delta.gen_untrack_skipped);
 	const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
 	const auto size    = address - begin;
+	image.StateChanged();
 	image.track_addr   = address;
 	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {
@@ -651,6 +659,7 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	GenCount(FrameBreakdown::g_delta.gen_untrack_skipped);
 	const auto address   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
 	const auto size      = end - address;
+	image.StateChanged();
 	image.track_addr_end = address;
 	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {
@@ -1785,6 +1794,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 			}
 			depth.stencil_ids.push_back(association);
 		}
+		ImageSetChanged();
 		record.info                 = plane;
 		record.depth_id             = depth_id;
 		record.stencil_subresources = depth.stencil_subresources;
@@ -2189,6 +2199,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	}
 	TouchImage(image);
 	image.MarkGpuModified();
+	if (!image.usage.render_target) image.StateChanged();
 	image.usage.render_target = true;
 	RefreshImage(id);
 	CommitGpuWrite(image);

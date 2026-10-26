@@ -1390,6 +1390,136 @@ Toward 120 fps (2026-10-23):
   no errors, frames normal. `KYTY_DBG_LANE_SKIPS=1` prints per shader the
   selections, those per lane and the repairs (`NHL27LANESKIP`), `=2` also why each other one kept its
   ballot (`NHL27LANESKIPNO`).
+* Where a draw's time goes on the execution thread (CMake `-DKYTY_EXEC_REGIONS=ON`, then
+  `KYTY_DBG_EXEC_REGIONS=1`: `NHL27REGIONS` every 5 s, ms per second by region of the draw and
+  dispatch paths, from the time stamp counter; without the option the marks compile to nothing). In
+  play about 205,000 draws and 65,000 dispatches a second at 70 fps: 3.4 us a draw, 2.4 us a dispatch.
+  A draw with the programs, T#s, S#s and render targets of the draw before it (55% of the draws, 79%
+  have the programs) takes 2.2 us, the others about 6 us, and every region costs two to three times as
+  much in them (their programs, memos, images and buffers are not in the cache). Two attempts at that
+  changed nothing measurable: grouping the fields lookups touch at the start of `Image`,
+  `TextureDescDerivation` and `TextureBinding` (79-82 vs 80-86 ns per image slot), and pulling the next
+  draws' programs, program memos and their arrays into the cache over three operations ahead (paused
+  draw cost -0.6%), and taking a changed V#'s buffer from the by-range memo of `RebindBuffers` instead
+  of the page table in `FindBuffers` (3.41 vs 3.47 us, noise). In a dispatch (2.4 us), `RebindBuffers` takes 1 us: 2.6 slot memo hits (33 ns plain,
+  110 ns written), 1.75 by-range memo hits (135 ns) and 1.5 lookups (280 ns) per dispatch.
+* A boot froze in the menus (once in about 20 boots today): the execution thread waited for a GPU
+  tick (a command processor read of GPU-written memory), the recording thread for the host copies of
+  that tick's submission, and the host copy thread was idle with every queued copy done; the trigger
+  is not confirmed. Looking for it found a real race: `ProgressCounter` (`spscQueue.h`) kept one wait
+  target for all waiters, and the host copy counter has two (the recording thread before each
+  submission, the execution thread in `HostCopyQueue::Drain()`). A waiter that finished reset the
+  target another had stored after it, and `Notify()` then never woke that one (the execution thread
+  could sleep in `Drain()` for good). Each sleeper now claims one of three target slots (more sleepers
+  are woken by every `Notify()`); `gpu_pipeline_tests` has a five-waiter case.
+* `RebindImages` no longer looks the null images up again on every draw: they are never registered,
+  and the rediscovery test now skips unregistered images without a guest range, as the table elements'
+  test did.
+* Lean draws (default on, `KYTY_LEAN_DRAWS=0` turns them off): a stage whose program binds the T#s
+  of its last draw keeps that draw's texture bindings, and skips `RebindImages()` and the layout
+  transitions, while no image changed since its lookups last held (to the end of that draw) and the
+  draw has the same attachments (views and layouts) and no storage image. `g_texture_epoch`
+  (`image.h`) advances on every change bindings depend on: dirty and modified flags, tracking, stencil
+  association, usage, registration, creation, deletion, replacement (`BumpGeneration`) and every
+  barrier that changes a layout or access; `ProgramImageMemo::lean_epoch` holds the epoch a program's
+  bindings held at. 65% of the stages in play keep them. Paused in-boot A/B, 6 rounds: draw 3.496 ->
+  3.433 us (-1.8%), fps 65.3 -> 66.8. `KYTY_LEAN_VERIFY=1` runs the full lookup for every kept slot,
+  the skipped rebind and transitions, and exits on any difference: none in 30 s of play and a
+  3-minute match.
+* Tried: the same for each unchanged slot of a draw that changes some of its T#s (the slot keeps its
+  binding while the epoch holds, the rebind and transitions run). Verified clean in play, but the
+  paused in-boot A/B (6 rounds) was 3.290 vs 3.276 us a draw: dropped.
+* `Image::GetBarriers` keeps up to two barriers in the object instead of a vector (a heap allocation
+  per transition that needed one was about 0.5% of the execution thread).
+* PGO v18 (2026-10-25, recorded on f1541bf1, the merge of the 14 newer upstream commits).
+* Buffer slots that miss both memos of `RebindBuffers`, by reason (`NHL27REGIONS` draws,
+  `NHL27REGIONSDISP` dispatches; region-timer build only): in play about 70,000 a second in draws
+  and 76,000 in dispatches had no by-range memo of their range. Almost none were CPU-modified ranges
+  (an upload due); in draws 85% were ranges bound before that another range had pushed out of the
+  16384-slot memo, in dispatches a third (the rest are ranges not bound in the last 1M lookups).
+  With 65536 slots, paused in-boot A/B (6 rounds): dispatch 1.969 -> 1.948 us, draw 3.161 -> 3.158
+  us, fps 79.3 -> 80.3; kept.
+* The NHL 27 FSR3 hook skips dispatches other than its four passes before timing them (it read the
+  clock twice on each of 60,000 dispatches a second).
+* DMA bases (`RenderExecutor::CacheDmaBases`): a stage looks its DMA base windows' buffers up again
+  only when its program, the base registers' dwords, the buffer set or the mappings changed
+  (`FindBuffer` only creates what is missing). The lookups (mapped-range walk under the mapping lock,
+  page-table searches) were 25 ms/s in play, 46,000 stages a second (region `dma`). Paused in-boot
+  A/B: draw 3.126 -> 3.111 us.
+* Why stages did not keep their bindings (play, region-timer build): of 340,000 stages a second
+  234,000 kept them; 62,000 had other T#s, 21,000 had a last draw whose bindings did not hold to its
+  end and 23,000 found the texture epoch moved since. Each image now also has its own stamp
+  (`Image::binding_epoch`, set from `g_texture_epoch` by every change of its own lookup state, usage
+  or layouts), and changes of the image set (creation, registration, deletion, replacement, stencil
+  association) advance `g_image_set_epoch`: kept bindings hold while the set is unchanged and none
+  of their own images changed (`KeptImagesHold()`), whatever other images did. `KYTY_LEAN_VERIFY=1`:
+  no difference in the menus and 60 s of play. Paused in-boot A/B: draw 3.297 -> 3.278 us.
+* Execution-thread waits in play (sampled): 1.5% in `CommandScheduler::WaitPriorityOperations`
+  from `PopPendingOperations` (a completed pending operation waited for the priority thread's
+  downloads of its tick). Draws and dispatches now call `PopPendingOperations(false)`: such an
+  operation stays queued for a later call. `Image::Transit` returns before `GetBarriers` when the
+  whole image is already in the wanted layout and access. Cold/warm timing (`KYTY_DBG_WARM`):
+  a transition 22 ns, a plain buffer memo check 14 / 10 ns, a texture lookup reuse 51 / 23 ns.
+* Deferred protection for every upload: `SynchronizeBuffer` on the execution thread (host copy
+  thread on, coherent staging) defers the protections of pages that gain write watchers to the
+  host copy thread, as the BDA synchronization already did. Samples in play: protect calls 1.9 ->
+  0.6% of the thread, `SynchronizeBuffer` 4.8 -> 3.0%. (An in-play in-boot A/B was too noisy:
+  scenes ran 47-82 fps.)
+* Per-slot keep, now with the per-image stamps: in a draw that changes some of its T#s, a slot with
+  the same T# keeps its binding (no `ReuseTextureLookup`) while the program's last bindings held to
+  their end, the image set is unchanged and the slot's image did not change (`KeptImageHolds()`);
+  the rebind and transitions run for the stage. `KYTY_LEAN_VERIFY=1` checks each kept slot: clean in
+  the menus and 50 s of play. Paused in-boot A/B: draw 3.117 -> 3.103 us.
+* The shipped `assets/cfgGlobal.json` (which the launcher applies over the user's settings) had
+  `KYTY_PERF_STATS=1`: the statistics timers and counters on every hot path, and BDA batch
+  boundaries emitted as operations of their own. Two boots in play: draw 4.38 vs 3.2-3.5 us,
+  dispatch 2.66 vs 2.1 us; a 3-minute match 55.7 fps at 60 Hz with it, 76-78 without. It is now
+  `0` there (set it to `1` again for the NHL27BDA, NHL27BUFFERS and other per-frame statistics).
+  A match with every variable of `cfgGlobal.json` on top of `play-nhl.ps1`'s (render scale 0.6667,
+  FSR3, loop cap 65536, skipped bounds checks...): 77.4 fps at 60 Hz once its programs were in the
+  store; the first boot with those code-generation settings compiles them (34 fps, then 10 fps on a
+  30 Hz screen, and the rare guest crash at pc 0x9093c3f41).
+* The first access to a range's by-range memo entry in `RebindBuffers` (a random entry of the 6.8
+  MB table) was the hottest single line of the execution thread (4.4% of its samples in play).
+  `FindBuffers` now prefetches the entry when a slot gets a new range, several hundred ns before
+  `RebindBuffers` reads it. Paused in-boot A/B: draw 3.404 -> 3.336 us, dispatch 2.493 -> 2.440 us.
+  The same before a non-lean stage's image slots (each description's last lookup and the image's
+  lookup-state lines, for all slots first): 3.117 / 3.114 us, no effect, dropped. Prefetching the
+  upcoming operations one further ahead (the third operation's resolution, the second's snapshot
+  arrays): draw 3.004 vs 3.014 us, fps 73.3 vs 71.5, dropped.
+* `CommitBindings` keeps each stage's descriptor write and image descriptor counts and its shader
+  stage for the stage's program (`PreparedBindings::commit_counts`) instead of walking the
+  descriptor mask every draw (paused A/B: draw 3.018 -> 3.006 us, about noise); statistics timers
+  that are off write only their flag. The region-timer build is now configured without PGO
+  (`-DKYTY_PGO=none`): every profile refresh made its ThinLTO link fail on mixed profile summaries.
+* Draws that repeat the draw before them's register snapshot (context id): the pipeline comes from
+  the last draw when the context, the programs, topology and restart, the attachment formats
+  (target slots, export mappings, samples, depth format and test) are the same and the vertex
+  stage has no fixed-function vertex input (`KYTY_PIPELINE_FRONT_VERIFY=1` looks it up anyway and
+  compares); the dynamic state is not computed again when the context, the last vertex stage's
+  program and the attachments (`m_lean_targets`) are those of the draw that last set it
+  (`KYTY_DYNAMIC_STATE_VERIFY=1` sets it anyway and exits if a value changed). Both verify modes and
+  `KYTY_LEAN_VERIFY` clean in the menus and 60 s of play. Paused in-boot A/B, both together: draw
+  3.119 -> 3.070 us.
+* A 3 x 5-minute soak on ee3f53e2: 77.2 / 77.2 / 77.4 fps at 60 Hz; the third match ended in the
+  rare guest crash at pc 0x9093c3f41 (`rax=-1`, a UI table of -1 slots; no emulator write within
+  0x400 of the pointers among the last 474,845 logged), now seen twice today in about 13 boots.
+* Texture description lookups (`m_texture_descs`) go through a direct-mapped front of 4,096
+  entries by key hash (`FindTextureDesc`): a hit reads only the map entry, which the caller reads
+  anyway; the map's bucket array and chain were about 2% of the execution thread. Paused in-boot
+  A/B: draw 2.967 -> 2.950 us, dispatch 1.989 -> 1.977 us. Dropped (no gain): prefetching only the
+  parts of an upcoming resolution the execution thread reads (3.033 vs 3.019 us), and prefetching
+  the whole queued operation after the next (2.913 vs 2.904 us).
+* GPU time in play (`KYTY_IDLE_TRACE_NO_CMDS`): 10.6 ms per flip at 75 fps (80% busy) with the
+  test settings (no resolution scale), 8.2 ms at 88 fps with the shipped `cfgGlobal.json`
+  (`KYTY_NHL_RES_SCALE=0.6667`, FSR 3): with the shipped settings the GPU just fits 120 fps in that
+  scene and the execution thread is the limit. `KYTY_DBG_COMMAND_SITES=1` counts the barriers and
+  buffer copies the emulator records by the code line that records them (`NHL27SITES` every 5 s):
+  about 1,760 barriers a frame in play, from image layout transitions (`image.cpp`, ~450), label
+  writes into cached buffers (`WriteDataBuffer`: barrier, copy, barrier, ~280), the guest's own
+  cache actions (~230) and CPU-dirty uploads (~100). The label writes' first barrier waiting only
+  for earlier transfers instead of all work: GPU 8.73 vs 8.66 ms per flip, noise, dropped (the
+  per-command timestamps inflate barrier costs).
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
@@ -1425,6 +1555,7 @@ defaults; turn them on with `KYTY_X=1` or a `flags.ctl` line, or flip the defaul
 | `KYTY_CLEAN_FROM_DIRECT` | 262144 | The strict resource-table evaluator takes words the direct reads already fetched | +3.1% paused match |
 | `KYTY_IMAGE_RECYCLE` | 512 | A deleted device image (idle on the GPU by then) is kept and handed out again by the next image with the same creation parameters instead of allocating; at most 32 images / 768 MiB, oldest out first. NHL 27 aliases about seven full-screen targets in one memory range, so the texture cache frees and recreates all of them every frame; each new VMA block cost a `vkAllocateMemory` that waits inside the driver (about 8% of the GPU thread in gameplay, `KYTY_DBG_IMAGE_RECYCLE=1` prints the hit rate) | ~97% of image creations recycled; in-match gameplay A/B +12% fps (+-5.7, 8 rounds) and -13% GPU-thread time per draw (+-9%); paused match unchanged (-1% +-2.4: no churn there) |
 | `KYTY_LDS_LANE_SLOTS` | 1073741824 | A vertex or pixel shader whose every LDS access is LaneId * 4 plus constants (the guest compiler spilling VGPRs into per-lane LDS slots) gets a small per-invocation array indexed by the constants instead of a 32 KiB one. Part of the vertex and pixel shader keys, so it switches at runtime (shaders recompile) | NHL 27's heaviest pixel shader (33037c605e42f4ce): scratch 32784 -> 0 bytes; +2.6% paused match (in-match A/B, 6 rounds) |
+| `KYTY_LEAN_DRAWS` | (env only) | A draw binding the T#s of its program's last draw keeps that draw's texture bindings and layouts while no image changed (`g_texture_epoch`); `KYTY_LEAN_VERIFY=1` checks each kept binding | -1.8% draw cost, paused in-boot A/B |
 | `KYTY_TEXTURE_DESC_CACHE` | 2048 | No consumer in the merged tree (pengui07's draw-prep delta replaces it); accepted for compatibility | was +15.5% |
 | `KYTY_ADAPTIVE_RESOURCE_MEMO` | 32768 | No consumer in the merged tree (`KYTY_RESOURCE_MEMO_BYPASS` replaces it); accepted for compatibility | was +2.3% |
 
@@ -1544,7 +1675,8 @@ the buffer slot memos, texel version table, unmap log and guest CPU sets had cha
 batching, the second draw resolver and the label path of `WRITE_DATA` since v11). Profile v17
 (2026-10-25, recorded on bc8b1125, the merge of nhl27-eadb: the merged build had kept profile data
 for only part of its functions, 1107 mismatches): three 3-minute matches 78.4 / 76.3 / 69.9 fps at
-60 Hz (the merge on v16: 71.0 with a cold shader cache / 67.0 / 70.7).
+60 Hz (the merge on v16: 71.0 with a cold shader cache / 67.0 / 70.7). Profile v18 (2026-10-25,
+recorded on f1541bf1: lean draws, the region timers and the merge of 14 more upstream commits).
 
 Single fixed-save matches of the same build differ by up to 5 fps at 60 Hz (52.2 and 57.1 within
 an hour): compare builds with `exe-ab.sh` (per-draw cost in paused boots), not one match each.

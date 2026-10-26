@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 
 #include "common/alignment.h"
+#include "graphics/host_gpu/renderer/execRegions.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/emulatorConfig.h"
@@ -54,6 +55,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <xmmintrin.h>
 
 #ifdef min
 #undef min
@@ -712,7 +714,11 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 	desc.view_info.base_level = view_base;
 	desc.type = storage ? TextureCache::BindingType::Storage : TextureCache::BindingType::Texture;
 	const auto data_size = desc.info.data.size;
-	return {std::move(desc), shader_conversion, pixel_format, view_format, data_size};
+	return {.desc              = std::move(desc),
+	        .shader_conversion = shader_conversion,
+	        .pixel_format      = pixel_format,
+	        .view_format       = view_format,
+	        .size              = data_size};
 }
 
 size_t RenderExecutor::TextureDescKeyHash::operator()(const TextureDescKey& key) const noexcept {
@@ -757,6 +763,35 @@ RenderExecutor::MakeTextureDescKey(const ShaderRecompiler::IR::ImageResource&   
 	return key;
 }
 
+static size_t TextureDescFrontSlot(uint64_t hash, size_t size) {
+	return static_cast<size_t>((hash ^ (hash >> 29u)) & (size - 1));
+}
+
+RenderExecutor::TextureDescEntry* RenderExecutor::FindTextureDesc(const TextureDescKey& key) {
+	const uint64_t hash  = TextureDescKeyHash {}(key);
+	auto&          front = m_texture_desc_front[TextureDescFrontSlot(hash, TextureDescFrontSize)];
+	if (front.entry != nullptr && front.hash == hash && front.entry->first == key) {
+		return front.entry;
+	}
+	const auto found = m_texture_descs.find(key);
+	if (found == m_texture_descs.end()) {
+		return nullptr;
+	}
+	front = {hash, &*found};
+	return &*found;
+}
+
+RenderExecutor::TextureDescEntry* RenderExecutor::AddTextureDesc(const TextureDescKey& key,
+                                                                 TextureDescDerivation&& derived) {
+	if (m_texture_descs.size() >= MaxTextureDescs) {
+		m_clear_texture_descs = true;
+	}
+	auto*          entry = &*m_texture_descs.emplace(key, std::move(derived)).first;
+	const uint64_t hash  = TextureDescKeyHash {}(key);
+	m_texture_desc_front[TextureDescFrontSlot(hash, TextureDescFrontSize)] = {hash, entry};
+	return entry;
+}
+
 bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureBinding& binding) {
 	auto&       texture_cache = m_context.GetTextureCache();
 	auto&       found         = derived.found;
@@ -765,11 +800,15 @@ bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureB
 	// Null images (no guest range) are never registered and depend on no guest pages.
 	if (image == nullptr || (!image->registered && !range.Empty()) || image->binding.needs_rebind ||
 	    ImageLookupState::Of(found.id, *image) != found.state) {
+		ExecRegions::Note(image == nullptr || (!image->registered && !range.Empty()) ? ExecRegions::ReuseNoImage
+		                  : image->binding.needs_rebind                              ? ExecRegions::ReuseRebind
+		                                                                             : ExecRegions::ReuseState);
 		found.valid = false;
 		return false;
 	}
 	if (const auto set_epoch = texture_cache.ImageSetEpoch(); found.image_set_epoch != set_epoch && !range.Empty()) {
 		if (texture_cache.ImageEpochInRegion(range.address, range.size) > found.image_set_epoch) {
+			ExecRegions::Note(ExecRegions::ReuseEpoch);
 			found.valid = false;
 			return false;
 		}
@@ -815,14 +854,11 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		if (!storage && !table_candidate && examined == nullptr &&
 		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			const auto key    = MakeTextureDescKey(resource, value);
-			auto       cached = m_texture_descs.find(key);
-			if (cached == m_texture_descs.end()) {
+			auto*      cached = FindTextureDesc(key);
+			if (cached == nullptr) {
 				TextureDescDerivation derived;
 				derived.desc = NullTextureDesc(resource, TextureCache::BindingType::Texture);
-				if (m_texture_descs.size() >= MaxTextureDescs) {
-					m_clear_texture_descs = true;
-				}
-				cached = m_texture_descs.emplace(key, std::move(derived)).first;
+				cached       = AddTextureDesc(key, std::move(derived));
 			}
 			auto& derived = cached->second;
 			if (derived.found.valid) {
@@ -831,27 +867,23 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 					return binding;
 				}
 			}
-			TextureBinding binding {texture_cache.FindImage(derived.desc), nullptr, derived.desc};
+			TextureBinding binding {.image_id = texture_cache.FindImage(derived.desc), .desc = derived.desc};
 			binding.lookup = &derived;
 			return binding;
 		}
 		auto       desc = NullTextureDesc(resource, storage ? TextureCache::BindingType::Storage
 		                                                    : TextureCache::BindingType::Texture);
 		const auto id   = texture_cache.FindImage(desc);
-		return {id, nullptr, std::move(desc)};
+		return {.image_id = id, .desc = std::move(desc)};
 	}
 
 	// The description is computed once per T# and view of it; images are looked up every time.
 	const auto key    = MakeTextureDescKey(resource, value);
-	auto       cached = m_texture_descs.find(key);
-	if (cached == m_texture_descs.end()) {
+	auto*      cached = FindTextureDesc(key);
+	if (cached == nullptr) {
 		// Derived before insertion: a derivation that exits (softly, for table candidates) leaves
 		// nothing behind.
-		auto derived = DeriveTextureDesc(resource, descriptor);
-		if (m_texture_descs.size() >= MaxTextureDescs) {
-			m_clear_texture_descs = true;
-		}
-		cached = m_texture_descs.emplace(key, std::move(derived)).first;
+		cached = AddTextureDesc(key, DeriveTextureDesc(resource, descriptor));
 	}
 	auto& derived = cached->second;
 	// Image heaps keep the descriptors of unmapped textures, which PS5 never samples.
@@ -895,7 +927,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		id = texture_cache.FindImageSpeculative(desc, shader_conversion);
 		if (!id) {
 			// Only speculative lookups decline: the table binds this element as a null image.
-			return {id, nullptr, std::move(desc)};
+			return {.image_id = id, .desc = std::move(desc)};
 		}
 	} else {
 		id = texture_cache.FindImage(desc, shader_conversion);
@@ -925,14 +957,14 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 			}
 			auto       null_desc = NullTextureDesc(resource, TextureCache::BindingType::Storage);
 			const auto null_id   = texture_cache.FindImage(null_desc);
-			return {null_id, nullptr, std::move(null_desc)};
+			return {.image_id = null_id, .desc = std::move(null_desc)};
 		}
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
-	TextureBinding binding {id, nullptr, std::move(desc)};
+	TextureBinding binding {.image_id = id, .desc = std::move(desc)};
 	// Recorded once the view is acquired (AcquireImageViews()). Stencil associations and images
 	// with stencil refresh another image as well: they are looked up every time.
 	if (reusable && !stencil_association && !image->info.HasStencil()) {
@@ -1142,6 +1174,7 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 	}
 	image.binding.is_bound = true;
 	image.binding.shader_write |= storage;
+	m_bound_storage |= storage;
 	m_bound_images.push_back(id);
 }
 
@@ -1158,9 +1191,11 @@ void RenderExecutor::ResetBindings() {
 		}
 	}
 	m_bound_images.clear();
+	m_bound_storage = false;
 	if (m_clear_texture_descs) {
 		m_clear_texture_descs = false;
 		m_texture_descs.clear();
+		m_texture_desc_front.fill({});
 		m_texture_descs_generation++;
 	}
 }
@@ -1194,6 +1229,26 @@ uint64_t ImageResourceKey(const ShaderRecompiler::IR::ImageResource& r) {
 bool DrawPrepDeltaVerifyEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_DRAWPREP_VERIFY");
+		return value != nullptr && value[0] == '1';
+	}();
+	return enabled;
+}
+
+// A draw binding the T#s of its program's last draw keeps that draw's texture bindings while no
+// image changed (see PrepareBindings()); KYTY_LEAN_DRAWS=0 turns it off. KYTY_LEAN_VERIFY=1
+// checks every kept binding against a full lookup, and runs the skipped rebind and transitions to
+// check that they change nothing.
+bool LeanDrawsEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LEAN_DRAWS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+bool LeanVerifyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_LEAN_VERIFY");
 		return value != nullptr && value[0] == '1';
 	}();
 	return enabled;
@@ -1350,6 +1405,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	}
 	prepared.image_memo    = memo;
 	prepared.images.resize(program.info.images.size());
+	ExecRegions::InDraw(ExecRegions::DrawStages);
 	// The program's buffer slots come back with it as well: FindBuffers and RebindBuffers compare a
 	// slot with what it bound the last time, and with programs alternating on a stage that was
 	// mostly another program's draw (half the buffer bindings looked up again; 40% of the slots had
@@ -1379,7 +1435,65 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	if (!same_images && !slot_reuse) {
 		image_descs.assign(program.info.images.size(), nullptr);
 	}
-	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+	ExecRegions::InDraw(ExecRegions::StagesMemo);
+	// A program binding the T#s of its last draw keeps that draw's bindings while none of their images
+	// and not the image set changed since its lookups last held (ProgramImageMemo::lean_epoch,
+	// KeptImagesHold()): each slot would reuse its description's lookup (ReuseTextureLookup) and find
+	// the same image and view. Only the per-draw bookkeeping of a reuse (access tick, binding state) is
+	// redone, and RebindImages() and the layout transitions are skipped while they hold (see
+	// CommitBindings()).
+	prepared.lookup_set_epoch = g_image_set_epoch.load(std::memory_order_relaxed);
+	prepared.lookup_epoch     = g_texture_epoch.load(std::memory_order_relaxed);
+	prepared.lean             = LeanDrawsEnabled() && same_images && memo->holder == &prepared &&
+	                memo->lean_epoch != UINT64_MAX && image_descs.size() == program.info.images.size() &&
+	                KeptImagesHold(prepared, memo->lean_epoch, memo->lean_set_epoch);
+	// A draw that changes some of the T#s: while the bindings of the program's last draw held to its
+	// end and the image set is unchanged, a slot with the same T# keeps its binding as long as its
+	// image did not change either (the rebind and the transitions run for the stage).
+	const bool     slots_held = LeanDrawsEnabled() && !prepared.lean && !same_images && slot_reuse &&
+	                        memo->holder == &prepared && memo->lean_epoch != UINT64_MAX &&
+	                        image_descs.size() == program.info.images.size();
+	const uint64_t held_epoch     = memo->lean_epoch;
+	const uint64_t held_set_epoch = memo->lean_set_epoch;
+	if (!prepared.lean) {
+		if (ExecRegions::Enabled()) {
+			ExecRegions::Note(!same_images                    ? ExecRegions::LeanOtherImages
+			                  : memo->holder != &prepared     ? ExecRegions::LeanOtherHolder
+			                  : memo->lean_epoch == UINT64_MAX ? ExecRegions::LeanNotHeld
+			                                                   : ExecRegions::LeanEpochMoved);
+		}
+		// Set again by FinishLeanBindings() once the bindings this draw makes have held to its end.
+		memo->lean_epoch = UINT64_MAX;
+	} else {
+		ExecRegions::Note(ExecRegions::LeanStages);
+		auto&      texture_cache = m_context.GetTextureCache();
+		const auto tick          = m_context.GetCommandScheduler().CurrentTick();
+		for (uint32_t i = 0; i < program.info.images.size(); i++) {
+			if (program.info.images[i].heap) {
+				continue;
+			}
+			ExecRegions::Note(ExecRegions::LeanSlots);
+			auto& binding = prepared.images[i];
+			if (LeanVerifyEnabled()) {
+				TextureBinding check;
+				auto*          derived = image_descs[i];
+				if (derived == nullptr || !derived->found.valid || !ReuseTextureLookup(*derived, check) ||
+				    check.image_id != binding.image_id || check.image_view != binding.image_view) {
+					EXIT("lean draw: image slot %u of shader 0x%016" PRIx64 " no longer reuses its lookup\n",
+					     i, program.shader_hash);
+				}
+				// RebindImages() then treats the binding as the reuse would have left it.
+				binding.lookup = derived;
+				binding.reused = true;
+				prepared.lean_layouts.resize(program.info.images.size());
+				prepared.lean_layouts[i] = binding.layout;
+			}
+			auto& image              = texture_cache.GetImage(binding.image_id);
+			image.tick_accessed_last = tick;
+			BindImage(binding.image_id, false);
+		}
+	}
+	for (uint32_t i = 0; i < program.info.images.size() && !prepared.lean; i++) {
 		// Sampled textures whose last lookup still holds are written in place.
 		const auto& resource = program.info.images[i];
 		// Bindless heap images resolve through the image heap, not the texture cache.
@@ -1387,22 +1501,55 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			prepared.images[i] = {};
 			continue;
 		}
+		ExecRegions::Note(ExecRegions::ImageSlots);
 		if (!resource.written &&
 		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			auto* derived = image_descs[i];
+			if (slots_held && derived != nullptr && last_images[i] == snapshot.images[i] &&
+			    KeptImageHolds(prepared.images[i], held_epoch, held_set_epoch)) {
+				ExecRegions::Note(ExecRegions::LeanSlots);
+				auto& binding = prepared.images[i];
+				if (LeanVerifyEnabled()) {
+					TextureBinding check;
+					if (!derived->found.valid || !ReuseTextureLookup(*derived, check) ||
+					    check.image_id != binding.image_id || check.image_view != binding.image_view) {
+						EXIT("lean draw: kept image slot %u of shader 0x%016" PRIx64 " no longer reuses its lookup\n",
+						     i, program.shader_hash);
+					}
+				}
+				// As a reuse leaves it, for RebindImages().
+				binding.lookup = derived;
+				binding.reused = true;
+				auto& image              = m_context.GetTextureCache().GetImage(binding.image_id);
+				image.tick_accessed_last = m_context.GetCommandScheduler().CurrentTick();
+				BindImage(binding.image_id, false);
+				continue;
+			}
 			if (!same_images && !(slot_reuse && last_images[i] == snapshot.images[i])) {
-				const auto cached =
-				    m_texture_descs.find(MakeTextureDescKey(resource, snapshot.images[i]));
-				derived = cached != m_texture_descs.end() ? &cached->second : nullptr;
+				ExecRegions::Note(ExecRegions::ImageMapLookups);
+				ExecRegions::InDraw(ExecRegions::StagesImages);
+				auto* const cached = FindTextureDesc(MakeTextureDescKey(resource, snapshot.images[i]));
+				derived            = cached != nullptr ? &cached->second : nullptr;
+				ExecRegions::InDraw(ExecRegions::StagesMap);
+			} else {
+				ExecRegions::Note(ExecRegions::ImageMemoDesc);
 			}
 			if (derived != nullptr && derived->found.valid &&
-			    ReuseTextureLookup(*derived, prepared.images[i])) {
+			    ExecRegions::TimedTwice(ExecRegions::WarmReuse,
+			                            [&] { return ReuseTextureLookup(*derived, prepared.images[i]); })) {
+				ExecRegions::Note(ExecRegions::ImageReused);
 				image_descs[i] = derived;
 				BindImage(prepared.images[i].image_id, false);
 				continue;
 			}
+			ExecRegions::Note(derived == nullptr ? ExecRegions::ResolveNoDesc : ExecRegions::ResolveInvalid);
+		} else {
+			ExecRegions::Note(resource.written ? ExecRegions::ResolveWritten : ExecRegions::ResolveDynamic);
 		}
+		ExecRegions::Note(ExecRegions::ImageResolved);
+		ExecRegions::InDraw(ExecRegions::StagesImages);
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
+		ExecRegions::InDraw(ExecRegions::StagesResolve);
 		// The description whose lookups later draws reuse (see ResolveTexture()).
 		image_descs[i] = binding.lookup;
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
@@ -1414,6 +1561,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		last_images = snapshot.images;
 	}
 	memo->descs_generation = m_texture_descs_generation;
+	ExecRegions::InDraw(ExecRegions::StagesImages);
 	prepared.table_images.clear();
 	prepared.table_sources.clear();
 	prepared.table_roots.clear();
@@ -1439,6 +1587,13 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			}
 		}
 	});
+	if (!prepared.lean) {
+		prepared.lean_eligible = prepared.table_images.empty();
+		for (uint32_t i = 0; i < program.info.images.size() && prepared.lean_eligible; i++) {
+			prepared.lean_eligible = program.info.images[i].heap || image_descs[i] != nullptr;
+		}
+	}
+	ExecRegions::InDraw(ExecRegions::StagesTables);
 	// Samplers live as long as the sampler cache: the same S#s of the same program give the same
 	// samplers.
 	if (!same_program || prepared.samplers.size() != program.info.samplers.size() ||
@@ -1451,6 +1606,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		}
 		prepared.last_samplers = snapshot.samplers;
 	}
+	ExecRegions::InDraw(ExecRegions::StagesSamplers);
 	prepared.last_program          = &program;
 	prepared.last_descs_generation = m_texture_descs_generation;
 	prepared.shader_data.reserve(program.bindings.ShaderDataDwords());
@@ -1488,8 +1644,16 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			if (metadata.descriptor_index == UINT32_MAX) continue;
 			auto& source = prepared.buffer_sources[metadata.descriptor_index];
 			auto& key    = prepared.buffer_keys[metadata.descriptor_index];
-			if (key.program == &program && key.generation == generation &&
+			ExecRegions::Note(ExecRegions::FindSlots);
+			if (ExecRegions::Enabled() && key.program == &program && key.generation != generation &&
 			    key.value == snapshot.buffers[resource]) {
+				ExecRegions::Note(ExecRegions::FindEpochs);
+			}
+			if (ExecRegions::TimedTwice(ExecRegions::WarmFindSlot, [&] {
+				    return key.program == &program && key.generation == generation &&
+				           key.value == snapshot.buffers[resource];
+			    })) {
+				ExecRegions::Note(ExecRegions::FindSame);
 				if (StageStats::Enabled()) {
 					StageStats::g_bind_total.fetch_add(1, std::memory_order_relaxed);
 					StageStats::g_bind_same.fetch_add(1, std::memory_order_relaxed);
@@ -1565,7 +1729,59 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			}
 
 			source = {address, size, cache.FindBuffer(address, size)};
+			// RebindBuffers() looks a new range up in its by-range memo, a random entry of a table of
+			// several MiB that is mostly not in the cache (that first access was 4.4% of the
+			// execution thread in play): start loading it now, as RebindBuffers() picks the kind. Paused
+			// in-boot A/B: draw 3.404 -> 3.336 us, dispatch 2.493 -> 2.440 us.
+			{
+				const bool    sync_raw = metadata.read && Config::SyncRawImageBuffersEnabled();
+				const uint8_t kind     = metadata.written ? 2 : sync_raw ? 0 : metadata.formatted ? 3 : 1;
+				if (kind != 0) {
+					const auto* entry = reinterpret_cast<const char*>(&BindMemoOf(address, size, kind));
+					_mm_prefetch(entry, _MM_HINT_T0);
+					_mm_prefetch(entry + 64, _MM_HINT_T0);
+				}
+			}
 		}
+	}
+}
+
+// FindBuffer only creates what is missing: while the base registers, the buffer set and the mappings
+// are unchanged, looking the bases' windows up again (a mapped-range walk under the mapping lock and
+// a page-table search per piece) finds the same buffers. That was 2.9% of the execution thread in
+// play (46,000 stages a second, 540 ns each).
+void RenderExecutor::CacheDmaBases(PreparedBindings& prepared) {
+	const auto& runtime   = *prepared.runtime;
+	const auto& program   = *runtime.program;
+	const auto& user_data = runtime.resources->user_data;
+	auto&       cache     = m_context.GetBufferCache();
+	const auto  dword     = [&](uint32_t reg, uint32_t half) -> uint32_t {
+		const auto index = static_cast<uint64_t>(reg) - program.user_data_base;
+		// As RenderContext::CacheDmaBases(): registers outside the user data are skipped.
+		return reg < program.user_data_base || index + 1u >= user_data.size() ? 0u : user_data[index + half];
+	};
+	const auto generation = [&] {
+		return cache.BufferSetEpoch() * 0x9e3779b97f4a7c15ull ^ m_context.MappingGeneration();
+	};
+	const auto& registers = program.info.dma_base_registers;
+	bool        same      = prepared.dma_program == &program && prepared.dma_generation == generation() &&
+	              prepared.dma_bases.size() == registers.size() * 2u;
+	for (size_t i = 0; same && i < registers.size(); i++) {
+		same = prepared.dma_bases[i * 2u] == dword(registers[i], 0) &&
+		       prepared.dma_bases[i * 2u + 1u] == dword(registers[i], 1);
+	}
+	if (same) {
+		ExecRegions::Note(ExecRegions::DmaMemoHits);
+		return;
+	}
+	m_context.CacheDmaBases(runtime);
+	// After the lookups, which may have created buffers.
+	prepared.dma_program    = &program;
+	prepared.dma_generation = generation();
+	prepared.dma_bases.clear();
+	for (const auto reg: registers) {
+		prepared.dma_bases.push_back(dword(reg, 0));
+		prepared.dma_bases.push_back(dword(reg, 1));
 	}
 }
 
@@ -1597,9 +1813,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	// Plain reads (most slots) whose range found the same buffer the draw before skip the lookup
 	// while no buffer was registered and the range stayed CPU-clean.
 	const bool slot_memo = Common::RuntimeFlags::Current().buffer_fast;
+	ExecRegions::InOp(ExecRegions::DrawBuffers, ExecRegions::DispBuffers);
 	for (const auto& resource: program.info.buffers) {
 		const auto index = resource.descriptor_index;
 		if (index == UINT32_MAX) continue;
+		ExecRegions::NoteOp(ExecRegions::BufferSlots);
 		uint32_t    buffer_offset = 0;
 		const auto& source        = prepared.buffer_sources[index];
 		auto&       memo          = prepared.buffer_memos[index];
@@ -1614,11 +1832,15 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                   source.size != 0;
 		if (plain && memo.buffer != nullptr && !memo.written && memo.image_version == 0 &&
 		    memo.address == source.address && memo.size == source.size &&
-		    cache.PlainReadHolds(*memo.buffer, source.address, source.size, memo.cpu_generation,
-		                         memo.registration)) {
+		    ExecRegions::TimedTwice(ExecRegions::WarmPlain, [&] {
+			    return cache.PlainReadHolds(*memo.buffer, source.address, source.size, memo.cpu_generation,
+			                                memo.registration);
+		    })) {
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
 			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[0]);
+			ExecRegions::NoteOp(ExecRegions::BufferMemoHits);
+			ExecRegions::InOp(ExecRegions::BuffersMemo, ExecRegions::DBufPlain);
 			continue;
 		}
 		if (written && memo.buffer != nullptr && memo.written && memo.address == source.address &&
@@ -1629,6 +1851,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
 			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[1]);
+			ExecRegions::NoteOp(ExecRegions::BufferMemoHits);
+			ExecRegions::InOp(ExecRegions::BuffersMemo, ExecRegions::DBufWritten);
 			continue;
 		}
 		if (texel && memo.buffer != nullptr && memo.image_version != 0 && memo.address == source.address &&
@@ -1638,12 +1862,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
 			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[2]);
+			ExecRegions::NoteOp(ExecRegions::BufferMemoHits);
+			ExecRegions::InOp(ExecRegions::BuffersMemo, ExecRegions::DBufTexel);
 			continue;
 		}
 		// The same range bound by another slot or draw before (see m_bind_memo).
 		const uint8_t kind      = plain ? 1 : written ? 2 : texel ? 3 : 0;
-		auto&         bind_memo = (*m_bind_memo)[((source.address ^ (source.size << 40u) ^ kind) *
-		                                          0x9E3779B97F4A7C15ull >> 32u) % BindMemoSlots];
+		auto&         bind_memo = BindMemoOf(source.address, source.size, kind);
 		if (kind != 0 && bind_memo.kind == kind && bind_memo.slot.address == source.address &&
 		    bind_memo.slot.size == source.size && bind_memo.slot.buffer != nullptr) {
 			auto&      global = bind_memo.slot;
@@ -1660,7 +1885,25 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 				pack_memory_offset(index, global.buffer_offset);
 				memo = global;
 				FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_global_hit[kind - 1]);
+				ExecRegions::NoteOp(ExecRegions::BufferGlobalHits);
+				ExecRegions::InOp(ExecRegions::BuffersMemo, ExecRegions::DBufGlobal);
 				continue;
+			}
+		}
+		if (ExecRegions::Enabled()) {
+			const bool range_memo = kind != 0 && bind_memo.kind == kind && bind_memo.slot.address == source.address &&
+			                        bind_memo.slot.size == source.size && bind_memo.slot.buffer != nullptr;
+			ExecRegions::NoteOp(kind == 0     ? ExecRegions::ObtainNoKind
+			                    : !range_memo ? ExecRegions::ObtainNoMemo
+			                    : kind == 1   ? ExecRegions::ObtainFailedPlain
+			                    : kind == 2   ? ExecRegions::ObtainFailedWritten
+			                                  : ExecRegions::ObtainFailedTexel);
+			if (kind != 0 && !range_memo) {
+				if (cache.IsRegionCpuModified(source.address, source.size)) ExecRegions::NoteOp(ExecRegions::ObtainNoMemoDirty);
+				if (ExecRegions::SeenRange(source.address, source.size, kind)) ExecRegions::NoteOp(ExecRegions::ObtainNoMemoEvicted);
+				if (memo.buffer != nullptr && memo.address == source.address && memo.size == source.size) {
+					ExecRegions::NoteOp(ExecRegions::ObtainNoMemoSlotSame);
+				}
 			}
 		}
 		if (FrameBreakdown::Verbose() && (plain || written || texel)) {
@@ -1695,7 +1938,13 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			bind_memo = {memo, kind};
 		} else {
 			memo.buffer = nullptr;
+			if (ExecRegions::Enabled() && (plain || written || texel)) {
+				ExecRegions::NoteOp(obtained != nullptr && cache.IsStreamBuffer(obtained) ? ExecRegions::ObtainStream
+				                                                                          : ExecRegions::ObtainNotKept);
+			}
 		}
+		ExecRegions::NoteOp(ExecRegions::BufferObtains);
+		ExecRegions::InOp(ExecRegions::BuffersObtain, ExecRegions::DBufObtain);
 	}
 	lookup_timer.Stop();
 	FrameBreakdown::Timer upload_timer(FrameBreakdown::g_counters.dp_rebind_upload_ns);
@@ -1724,6 +1973,15 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	auto&       images   = prepared.images;
 	EXIT_IF(images.size() != program.info.images.size());
 	auto& texture_cache = m_context.GetTextureCache();
+	// Kept bindings (see PrepareBindings()) whose images nothing changed since.
+	const bool kept = prepared.lean && KeptImagesHold(prepared, prepared.lookup_epoch, prepared.lookup_set_epoch);
+	if (kept && !LeanVerifyEnabled()) {
+		return;
+	}
+	std::array<vk::ImageView, 64> kept_views {};
+	for (uint32_t i = 0; kept && i < images.size() && i < kept_views.size(); i++) {
+		kept_views[i] = images[i].image_view;
+	}
 	const auto stale = [&](const TextureBinding& binding) {
 		const auto* image = texture_cache.m_slot_images.try_get(binding.image_id);
 		return image == nullptr || (!image->registered && !image->info.data.Empty()) ||
@@ -1739,7 +1997,9 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
 		const auto old_image = texture_cache.m_slot_images.try_get(images[i].image_id);
-		if (old_image == nullptr || !old_image->registered ||
+		// Null images (no guest range) are never registered: as for the table elements below,
+		// they need no rediscovery (each draw looked every null slot up again).
+		if (old_image == nullptr || (!old_image->registered && !old_image->info.data.Empty()) ||
 		    old_image->binding.needs_rebind) {
 			if (old_image != nullptr) {
 				old_image->binding = {};
@@ -1773,6 +2033,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 		view_timer.Stop();
 		auto&      image   = texture_cache.GetImage(binding.image_id);
 		const bool storage = binding.desc.type == TextureCache::BindingType::Storage;
+		if (storage ? !image.usage.storage : !image.usage.texture) image.StateChanged();
 		image.usage.storage |= storage;
 		image.usage.texture |= !storage;
 		if (binding.lookup != nullptr && !binding.reused) {
@@ -1802,8 +2063,71 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			BindImage(texture.image_id, false);
 		}
 		texture.image_view = texture_cache.FindTexture(texture.image_id, texture.desc);
-		texture_cache.GetImage(texture.image_id).usage.texture = true;
+		auto& table_image  = texture_cache.GetImage(texture.image_id);
+		if (!table_image.usage.texture) table_image.StateChanged();
+		table_image.usage.texture = true;
 
+	}
+	// (The epoch itself may move meanwhile: other threads change images too, the presentation
+	// thread transitions the images it shows.)
+	if (kept) {
+		uint32_t slot = 0;
+		while (slot < images.size() && slot < kept_views.size() && images[slot].image_view == kept_views[slot]) {
+			slot++;
+		}
+		if (slot < std::min(images.size(), kept_views.size())) {
+			EXIT("lean draw: rebinding the kept images of shader 0x%016" PRIx64 " changed view %u of %zu\n",
+			     program.shader_hash, slot, images.size());
+		}
+	}
+}
+
+bool RenderExecutor::KeptImagesHold(const PreparedBindings& prepared, uint64_t epoch, uint64_t set_epoch) {
+	if (g_texture_epoch.load(std::memory_order_relaxed) == epoch) {
+		return true;
+	}
+	if (g_image_set_epoch.load(std::memory_order_relaxed) != set_epoch) {
+		return false;
+	}
+	// Other images changed (layouts, guest writes, targets of other passes): the bindings hold while
+	// none of their own did.
+	const auto& resources = prepared.runtime->program->info.images;
+	if (prepared.images.size() != resources.size()) {
+		return false;
+	}
+	auto& texture_cache = m_context.GetTextureCache();
+	for (uint32_t i = 0; i < resources.size(); i++) {
+		if (resources[i].heap) {
+			continue;
+		}
+		const auto* image = texture_cache.m_slot_images.try_get(prepared.images[i].image_id);
+		if (image == nullptr || image->binding_epoch.load(std::memory_order_relaxed) > epoch) {
+			return false;
+		}
+	}
+	return true;
+}
+
+bool RenderExecutor::KeptImageHolds(const TextureBinding& binding, uint64_t epoch, uint64_t set_epoch) {
+	if (g_image_set_epoch.load(std::memory_order_relaxed) != set_epoch) {
+		return false;
+	}
+	const auto* image = m_context.GetTextureCache().m_slot_images.try_get(binding.image_id);
+	return image != nullptr && image->binding_epoch.load(std::memory_order_relaxed) <= epoch;
+}
+
+void RenderExecutor::FinishLeanBindings(std::span<PreparedBindings* const> stages) {
+	for (auto* stage: stages) {
+		auto* memo = stage->image_memo;
+		if (memo == nullptr) {
+			continue;
+		}
+		// From when the lookups were made: a change of one of the images after then has a later stamp.
+		const bool held = stage->lean_eligible && memo->holder == stage &&
+		                  KeptImagesHold(*stage, stage->lookup_epoch, stage->lookup_set_epoch);
+		memo->lean_epoch     = held ? stage->lookup_epoch : UINT64_MAX;
+		memo->lean_set_epoch = stage->lookup_set_epoch;
+		memo->lean_targets   = m_lean_targets;
 	}
 }
 
@@ -1814,17 +2138,23 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	bool uses_image_heap = false;
 
 	FindBuffers(stages);
+	ExecRegions::To(ExecRegions::DrawFindBuffers);
 	for (auto* stage: stages) {
 		if (stage->runtime->program->info.uses_dma) {
-			m_context.CacheDmaBases(*stage->runtime);
+			ExecRegions::Note(ExecRegions::DmaStages);
+			CacheDmaBases(*stage);
 			uses_dma = true;
 		}
 		uses_image_heap |= stage->runtime->program->info.uses_image_heap;
 	}
+	ExecRegions::To(ExecRegions::DrawDma);
 	if (uses_dma) m_context.PrepareBda();
+	ExecRegions::To(ExecRegions::DrawBda);
 	if (uses_image_heap) {
+		ExecRegions::Note(ExecRegions::HeapRebinds);
 		m_context.GetImageHeap().Rebind(*this);
 	}
+	ExecRegions::To(ExecRegions::DrawHeap);
 	{
 		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dp_textures_ns);
 		FrameBreakdown::TexScope tex_scope;
@@ -1852,6 +2182,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 			}
 		}
 	}
+	ExecRegions::To(ExecRegions::DrawImages);
 	// Discovery can read back PS5 metadata and submit the scheduler. Reserve draw buffers only
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
 	{
@@ -1886,25 +2217,34 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	vk::ShaderStageFlags push_stages = pipeline_bind_point == vk::PipelineBindPoint::eGraphics
 	                                       ? vk::ShaderStageFlagBits::eFragment
 	                                       : vk::ShaderStageFlags {};
-	for (const auto* prepared: prepared_bindings) {
+	ExecRegions::InDraw(ExecRegions::CommitStart);
+	for (auto* prepared: prepared_bindings) {
 		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		const auto& program = *prepared->runtime->program;
-		write_count += std::popcount(program.bindings.descriptor_mask);
-		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
-			const auto index = std::countr_zero(mask);
-			const auto count = program.bindings.descriptor_counts[index];
-			if (index >= ShaderRecompiler::IR::FirstImageBinding &&
-			    index <= static_cast<size_t>(BindingKind::Samplers)) {
-				image_descriptor_count += count;
+		// The counts are the program's: worked out again only when the stage's program changes.
+		if (prepared->commit_program != &program) {
+			auto& counts  = prepared->commit_counts;
+			counts.writes = static_cast<uint32_t>(std::popcount(program.bindings.descriptor_mask));
+			counts.images = 0;
+			for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
+				const auto index = std::countr_zero(mask);
+				if (index >= ShaderRecompiler::IR::FirstImageBinding &&
+				    index <= static_cast<size_t>(BindingKind::Samplers)) {
+					counts.images += program.bindings.descriptor_counts[index];
+				}
 			}
+			counts.stage = NativeShaderStage(program.stage);
+			EXIT_IF((pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
+			         (counts.stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
+			        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
+			         counts.stage != vk::ShaderStageFlagBits::eCompute));
+			prepared->commit_program = &program;
 		}
-		const auto shader_stage = NativeShaderStage(program.stage);
-		push_stages |= shader_stage;
-		EXIT_IF((pipeline_bind_point == vk::PipelineBindPoint::eGraphics &&
-		         (shader_stage & GraphicsStages) == vk::ShaderStageFlags {}) ||
-		        (pipeline_bind_point == vk::PipelineBindPoint::eCompute &&
-		         shader_stage != vk::ShaderStageFlagBits::eCompute));
+		write_count += prepared->commit_counts.writes;
+		image_descriptor_count += prepared->commit_counts.images;
+		push_stages |= prepared->commit_counts.stage;
 	}
+	ExecRegions::InDraw(ExecRegions::CommitCounts);
 	// The written ranges do not depend on the read, so collect them once per commit
 	// (bound images can number in the hundreds; slot lookups per read dominated here).
 	bool     written_ready = false;
@@ -1982,6 +2322,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	if (pipeline.uses_image_heap) {
 		m_context.GetImageHeap().Commit(buffer, pipeline_bind_point, pipeline.pipeline_layout);
 	}
+	ExecRegions::InDraw(ExecRegions::CommitSetup);
 	m_descriptor_images.resize(image_descriptor_count);
 	m_descriptor_writes.clear();
 	m_descriptor_writes.reserve(write_count);
@@ -2047,12 +2388,44 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			binding.layout = image.backing.state.layout;
 		};
-		for (auto& binding: descriptors.images) {
-			transit(binding);
+		ExecRegions::InDraw(ExecRegions::CommitWrites);
+		// Kept bindings (see PrepareBindings()) are in the layouts the draw that made them left
+		// while no image changed since.
+		const bool keep_layouts =
+		    descriptors.lean && KeptImagesHold(descriptors, descriptors.lookup_epoch, descriptors.lookup_set_epoch) &&
+		    pipeline_bind_point == vk::PipelineBindPoint::eGraphics && descriptors.image_memo != nullptr &&
+		    descriptors.image_memo->lean_targets == m_lean_targets;
+		if (!keep_layouts || LeanVerifyEnabled()) {
+			// The layouts the kept bindings had when PrepareBindings() kept them (RebindImages()
+			// looks up the null images again, which resets theirs).
+			const auto& kept_layouts = descriptors.lean_layouts;
+			for (auto& binding: descriptors.images) {
+				// KYTY_DBG_WARM: sampled bindings' transitions repeat without effect.
+				if (ExecRegions::Enabled() && binding.desc.type != TextureCache::BindingType::Storage) {
+					(void)ExecRegions::TimedTwice(ExecRegions::WarmTransit, [&] {
+						transit(binding);
+						return true;
+					});
+				} else {
+					transit(binding);
+				}
+			}
+			for (auto& binding: descriptors.table_images) {
+				transit(binding);
+			}
+			for (size_t i = 0; keep_layouts && i < descriptors.images.size() && i < kept_layouts.size(); i++) {
+				const auto& binding = descriptors.images[i];
+				if (!binding.image_id || binding.layout == kept_layouts[i]) continue;
+				const auto& image = m_context.GetTextureCache().GetImage(binding.image_id);
+				EXIT("lean draw: kept image %zu of shader 0x%016" PRIx64 " needed a transition %s -> %s "
+				     "(target=%d general=%d write=%d depth=%d empty=%d storage=%d)\n",
+				     i, program.shader_hash, vk::to_string(kept_layouts[i]).c_str(), vk::to_string(binding.layout).c_str(),
+				     image.binding.is_target, image.binding.force_general, image.binding.shader_write,
+				     image.info.IsDepth(), image.info.data.Empty(),
+				     binding.desc.type == TextureCache::BindingType::Storage);
+			}
 		}
-		for (auto& binding: descriptors.table_images) {
-			transit(binding);
-		}
+		ExecRegions::InDraw(ExecRegions::CommitTransit);
 
 		std::array<size_t, ShaderRecompiler::IR::ImageBindingCount> image_starts {};
 		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
@@ -2150,6 +2523,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
+	ExecRegions::InDraw(ExecRegions::CommitWrites);
 	// Keep this draw's push-constant block on each stage for the frame dump (FrameDump::OnDraw).
 	for (auto* prepared: prepared_bindings) {
 		if (!FrameDump::Enabled()) break;

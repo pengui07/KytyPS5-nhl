@@ -644,13 +644,15 @@ private:
 	bool                   m_active;
 };
 
-// Adds the elapsed time to sink when the scope ends, or earlier through Stop().
+// Adds the elapsed time to sink when the scope ends, or earlier through Stop(). An inactive timer
+// writes only its flag (twenty of them run per draw).
 class Timer {
 public:
 	explicit Timer(std::atomic<uint64_t>& sink, bool condition = true) noexcept
-	    : m_sink(&sink), m_active(condition && Enabled()) {
+	    : m_active(condition && Enabled()) {
 		if (m_active) {
-			m_start = Clock::now();
+			m_sink  = &sink;
+			m_start = Clock::now().time_since_epoch().count();
 		}
 	}
 	Timer(const Timer&)            = delete;
@@ -662,14 +664,16 @@ public:
 		if (!m_active) {
 			return;
 		}
-		m_active = false;
-		const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - m_start);
+		m_active      = false;
+		const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+		    Clock::now() - Clock::time_point(Clock::duration(m_start)));
 		m_sink->fetch_add(static_cast<uint64_t>(ns.count()), std::memory_order_relaxed);
 	}
 
 private:
+	// Set only while active.
 	std::atomic<uint64_t>* m_sink;
-	Clock::time_point      m_start {};
+	Clock::rep             m_start;
 	bool                   m_active;
 };
 

@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/common.h"
 
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -81,15 +82,17 @@ private:
 	uint64_t                              m_iterations = 0;
 };
 
-// A monotonically increasing counter one thread advances and one other thread waits on.
+// A monotonically increasing counter one thread advances and other threads wait on.
 //
-// The waiter spins (SpinWait) and only then sleeps. A wake-up is only issued when the value
-// reaches the sleeping thread's target. WaitFor() stores the target and then reads the value,
-// seq_cst; Notify() issues a seq_cst fence and then reads the target. Either the waiter sees a
-// value published before the fence, or Notify() sees the target and wakes the waiter;
-// atomic::wait() also returns at once when the value already differs from the one the waiter
-// read. Publish() alone is a plain release store: a sleeper it satisfies wakes at the next
-// Notify().
+// A waiter spins (SpinWait) and only then sleeps. A wake-up is only issued when the value reaches
+// a sleeping thread's target. Each sleeper claims a target slot (seq_cst) and then reads the value,
+// seq_cst; Notify() issues a seq_cst fence and then reads the slots. Either the waiter sees a value
+// published before the fence, or Notify() sees its target and wakes the waiters; atomic::wait()
+// also returns at once when the value already differs from the one the waiter read. Publish() alone
+// is a plain release store: a sleeper it satisfies wakes at the next Notify(). Several threads wait
+// at once (the host copy counter: the recording thread before a submission and the execution
+// thread's Drain()); with one shared target, one waiter cleared or raised another's, which then
+// slept through its own. More sleepers than slots are woken by every Notify().
 class ProgressCounter {
 public:
 	ProgressCounter() = default;
@@ -101,8 +104,12 @@ public:
 
 	void Notify() noexcept {
 		std::atomic_thread_fence(std::memory_order_seq_cst);
-		if (m_wait_target.load(std::memory_order_relaxed) <=
-		    m_value.load(std::memory_order_relaxed)) {
+		const auto value = m_value.load(std::memory_order_relaxed);
+		bool       wake  = m_overflow.load(std::memory_order_relaxed) != 0;
+		for (const auto& target: m_targets) {
+			wake = wake || target.load(std::memory_order_relaxed) <= value;
+		}
+		if (wake) {
 			m_value.notify_all();
 		}
 	}
@@ -124,7 +131,17 @@ public:
 				return;
 			}
 		}
-		m_wait_target.store(target, std::memory_order_seq_cst);
+		std::atomic_uint64_t* slot = nullptr;
+		for (auto& candidate: m_targets) {
+			uint64_t free = NoTarget;
+			if (candidate.compare_exchange_strong(free, target, std::memory_order_seq_cst)) {
+				slot = &candidate;
+				break;
+			}
+		}
+		if (slot == nullptr) {
+			m_overflow.fetch_add(1, std::memory_order_seq_cst);
+		}
 		for (;;) {
 			const auto value = m_value.load(std::memory_order_seq_cst);
 			if (value >= target) {
@@ -132,14 +149,19 @@ public:
 			}
 			m_value.wait(value, std::memory_order_seq_cst);
 		}
-		m_wait_target.store(NoTarget, std::memory_order_relaxed);
+		if (slot != nullptr) {
+			slot->store(NoTarget, std::memory_order_relaxed);
+		} else {
+			m_overflow.fetch_sub(1, std::memory_order_relaxed);
+		}
 	}
 
 private:
 	static constexpr uint64_t NoTarget = ~uint64_t {0};
 
 	alignas(64) std::atomic_uint64_t m_value {0};
-	alignas(64) std::atomic_uint64_t m_wait_target {NoTarget};
+	alignas(64) std::array<std::atomic_uint64_t, 3> m_targets {NoTarget, NoTarget, NoTarget};
+	std::atomic_uint32_t m_overflow {0};
 };
 
 // A bounded lock-free single-producer single-consumer ring. Push() waits while the ring is full

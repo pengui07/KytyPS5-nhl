@@ -975,6 +975,9 @@ bool Nhl27Fsr3::Enabled() {
 void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint64_t hash,
 						  const PreparedBindings& bindings) {
 	if (!Enabled() || m->failed.load(std::memory_order_acquire)) return;
+	// Only the four passes matter; timing every other dispatch read the clock twice each (60,000
+	// dispatches a second).
+	if (std::ranges::find(kPass, hash) == kPass.end()) return;
 	struct Timer {
 		uint64_t& total;
 		uint64_t start = Impl::Now();
