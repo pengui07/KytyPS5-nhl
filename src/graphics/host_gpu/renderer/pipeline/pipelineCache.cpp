@@ -2840,6 +2840,10 @@ ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs
 	                                    ahead != nullptr ? &ahead->reads : nullptr);
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
+	// A shader the guest never registered (see PrepareProgram): the dispatch is skipped.
+	if (params.code.empty()) {
+		return {};
+	}
 	if (ahead != nullptr && ahead->reads.Failed()) {
 		return {};
 	}
@@ -2859,7 +2863,7 @@ ShaderProgram PipelineCache::GetComputeProgramAhead(const HW::ComputeShaderInfo&
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const ShaderGuestReaderScope reader(ReadAheadShaderState, &ahead.reads);
 	const auto params = PrepareProgram(regs, sh, input_info);
-	if (ahead.reads.Failed()) {
+	if (params.code.empty() || ahead.reads.Failed()) {
 		return {};
 	}
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >

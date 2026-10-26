@@ -6,6 +6,7 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/stringUtils.h"
+#include "common/virtualMemory.h"
 #include "graphics/guest_gpu/gpu_defs.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
@@ -27,6 +28,7 @@
 #include <initializer_list>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -83,7 +85,10 @@ bool ShaderMapContains(std::initializer_list<uint64_t> addrs) {
 	});
 }
 
-static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
+// A shader the guest runs at an address AgcCreateShader never saw (a copy of a registered one: NHL 27
+// crashed here once, 26 minutes into a session): a registered shader whose code is at that address
+// too stands in for it, and is registered there as well.
+static std::optional<ShaderMapEntry> ShaderFindMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 
 	std::scoped_lock lock(g_shader_map_mutex);
@@ -91,7 +96,29 @@ static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
 		return iter->second;
 	}
+	std::optional<ShaderMapEntry> copy;
+	for (const auto& [base, entry]: *g_shader_map) {
+		const auto size = entry.data.code_size_bytes;
+		if (size != 0 && Common::VirtualMemory::IsReadable(addr, size) &&
+		    std::memcmp(reinterpret_cast<const void*>(addr), reinterpret_cast<const void*>(base), size) == 0) {
+			copy = entry;
+			std::printf("NHL27SHADERMAP: %s shader=0x%016" PRIx64 " was not registered; it has the code of 0x%016" PRIx64
+			            "\n",
+			            label, addr, base);
+			std::fflush(stdout);
+			break;
+		}
+	}
+	if (copy) {
+		(*g_shader_map)[addr] = *copy;
+	}
+	return copy;
+}
 
+static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
+	if (auto entry = ShaderFindMappedData(addr, label)) {
+		return *entry;
+	}
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
 }
 
@@ -814,7 +841,21 @@ ShaderParams PrepareProgram(
 
 ShaderParams PrepareProgram(const HW::ComputeShaderInfo& regs, const HW::ShaderRegisters& sh,
                             ShaderComputeInputInfo& info) {
-	const auto [data, hash] = ShaderGetMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
+	const auto entry = ShaderFindMappedData(regs.cs_regs.data_addr, "ShaderGetInputInfoCS():");
+	if (!entry) {
+		// Unknown code: the dispatch is skipped (empty params, see GetComputeProgram) instead of
+		// ending the game.
+		static std::mutex                   reported_mutex;
+		static std::unordered_set<uint64_t> reported;
+		std::scoped_lock                    lock(reported_mutex);
+		if (reported.insert(regs.cs_regs.data_addr).second) {
+			std::printf("Warning: compute shader 0x%016" PRIx64 " is not registered; skipping its dispatches\n",
+			            regs.cs_regs.data_addr);
+			std::fflush(stdout);
+		}
+		return {};
+	}
+	const auto& [data, hash] = *entry;
 	ShaderGetStaticInputInfoCS(regs, sh, data, info);
 	DbgPrintGuestRegisters("cs", hash, regs.cs_regs.vgprs, info.wave_size);
 	return GetShaderParams(
