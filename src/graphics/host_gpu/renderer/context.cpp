@@ -75,8 +75,22 @@ void CommandBuffer::SetDebugInfo(uint32_t op, uint64_t submit_id, uint32_t arg0,
 	m_debug_arg4      = arg4;
 }
 
+// Only the attachments in use: the defaulted compare went through all eight color attachments.
+static bool SameRenderState(const RenderState& a, const RenderState& b) {
+	if (a.num_color_attachments != b.num_color_attachments || a.width != b.width || a.height != b.height ||
+	    a.num_layers != b.num_layers || !(a.depth_stencil_attachment == b.depth_stencil_attachment)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < a.num_color_attachments && i < a.color_attachments.size(); i++) {
+		if (!(a.color_attachments[i] == b.color_attachments[i])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void CommandBuffer::BeginRendering(const RenderState& state) const {
-	if (m_rendering && m_render_state == state) {
+	if (m_rendering && SameRenderState(m_render_state, state)) {
 		return;
 	}
 	EXIT_IF(state.width == 0 || state.height == 0 || state.num_layers == 0 ||
