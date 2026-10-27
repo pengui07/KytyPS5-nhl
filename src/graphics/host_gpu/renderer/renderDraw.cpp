@@ -25,6 +25,7 @@
 #include "graphics/host_gpu/renderer/execRegions.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/frameDump.h"
+#include "graphics/host_gpu/regionManager.h"
 #include <xmmintrin.h>
 #include <chrono>
 #include <fmt/format.h>
@@ -575,6 +576,11 @@ struct RenderExecutor::RenderTargetMemo {
 	uint64_t                                                       tick                 = 0;
 	uint64_t                                                       image_set_epoch      = 0;
 	uint64_t                                                       gpu_write_generation = 0;
+	// The image and CPU-dirty epochs when the images and metadata below were last found current:
+	// while neither moved, they still are (no image state or page changed since).
+	bool                                                           verified             = false;
+	uint64_t                                                       verified_texture_epoch = 0;
+	uint64_t                                                       verified_cpu_epoch     = 0;
 	std::array<MetadataEpoch, RENDER_COLOR_ATTACHMENTS_MAX + 1>    metadata {};
 	uint32_t                                                       metadata_count = 0;
 	std::array<ImageLookupState, RENDER_COLOR_ATTACHMENTS_MAX + 2> images {};
@@ -636,28 +642,47 @@ void RenderExecutor::CaptureRenderTargetKey(const HW::Context& hw, uint32_t mrt_
 }
 
 bool RenderExecutor::RenderTargetMemoCurrent() {
-	const auto& memo  = *m_render_target_memo;
-	auto&       cache = m_context.GetTextureCache();
+	auto& memo  = *m_render_target_memo;
+	auto& cache = m_context.GetTextureCache();
 	if (memo.tick != m_context.GetCommandScheduler().CurrentTick() ||
 	    memo.image_set_epoch != cache.ImageSetEpoch() ||
 	    memo.gpu_write_generation != m_context.GetBufferCache().GpuWriteGeneration()) {
 		return false;
 	}
+	// Read before the checks: a change during them moves an epoch, and the next call checks again.
+	const auto texture_epoch = g_texture_epoch.load(std::memory_order_acquire);
+	const auto cpu_epoch     = RegionManager::CpuDirtyEpoch();
+	// KYTY_RT_MEMO_VERIFY=1 checks the images and metadata anyway and exits if they changed.
+	static const bool verify = std::getenv("KYTY_RT_MEMO_VERIFY") != nullptr;
+	const bool        unchanged =
+	    memo.verified && memo.verified_texture_epoch == texture_epoch && memo.verified_cpu_epoch == cpu_epoch;
+	if (unchanged && !verify) {
+		return true;
+	}
+	const auto stale = [&](const char* what) {
+		if (unchanged) {
+			EXIT("render target memo: %s changed with the image and CPU-dirty epochs unchanged\n", what);
+		}
+		return false;
+	};
 	for (uint32_t i = 0; i < memo.image_count; i++) {
 		const auto& state = memo.images[i];
 		const auto* image = cache.m_slot_images.try_get(state.id);
 		if (image == nullptr || !image->registered || image->binding.needs_rebind ||
 		    ImageLookupState::Of(state.id, *image) != state) {
-			return false;
+			return stale("a target image");
 		}
 	}
 	auto& buffers = m_context.GetBufferCache();
 	for (uint32_t i = 0; i < memo.metadata_count; i++) {
 		const auto& metadata = memo.metadata[i];
 		if (buffers.CpuDirtyEpoch(metadata.range.address, metadata.range.size) != metadata.epoch) {
-			return false;
+			return stale("target metadata");
 		}
 	}
+	memo.verified               = true;
+	memo.verified_texture_epoch = texture_epoch;
+	memo.verified_cpu_epoch     = cpu_epoch;
 	return true;
 }
 
@@ -761,6 +786,7 @@ void RenderExecutor::StoreRenderTargetMemo(const RenderColorInfo* colors, uint32
 	memo.tick                 = m_context.GetCommandScheduler().CurrentTick();
 	memo.image_set_epoch      = cache.ImageSetEpoch();
 	memo.gpu_write_generation = buffers.GpuWriteGeneration();
+	memo.verified             = false;
 	memo.valid                = true;
 }
 
