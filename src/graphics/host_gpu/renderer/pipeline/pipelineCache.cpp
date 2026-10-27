@@ -603,6 +603,28 @@ bool GuestReadLog::StillValid(bool without_faults) const {
 	const auto check_entry = [&](const Entry& entry) {
 		const auto* recorded = m_bytes.data() + entry.offset;
 		if (entry.strict) {
+			// Under the rule of the plain reads below (no operation since the resolution wrote the
+			// pages, the bytes were not GPU-owned then) and with no GPU-owned bytes on the page now
+			// (image writes are not in PageWriteSeq), the bytes still hold without reading them:
+			// the strict checks were most of a dispatch's (2% of the execution thread).
+			if (skips && !entry.unsafe &&
+			    PageWriteSeq::Last(entry.address, entry.size) <= m_base && known_clean(entry.address, entry.size, true)) {
+				if (stage_stats) {
+					StageStats::g_check_skipped[without_faults ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+				}
+				if (!verify_skips) {
+					return true;
+				}
+				if (!SameGuestBytes(reinterpret_cast<const void*>(entry.address), recorded, entry.size)) {
+					static std::atomic<uint32_t> reported {0};
+					if (reported.fetch_add(1, std::memory_order_relaxed) < 32) {
+						std::printf("NHL27SKIPBAD: strict read 0x%016llx+%u changed after resolve (base %llu, %s)\n",
+						            static_cast<unsigned long long>(entry.address), entry.size,
+						            static_cast<unsigned long long>(m_base), without_faults ? "dispatch" : "draw");
+						std::fflush(stdout);
+					}
+				}
+			}
 			// As specialization memory is read on the execution thread: GPU-owned bytes fail.
 			if (entry.size > buffer.size() ||
 			    !(known_clean(entry.address, entry.size, true)
