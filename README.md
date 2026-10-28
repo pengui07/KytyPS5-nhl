@@ -192,19 +192,13 @@ Useful debug options:
 
 ## Building
 
-Build exactly as upstream KytyPS5: Windows with clang-cl + Ninja + Qt 6. See the
+Windows builds use clang-cl + Ninja. See the
 [upstream README](https://github.com/KytyPS5/KytyPS5#building). Quick version (Windows, x64 Native Tools prompt):
 
 ```powershell
 git submodule update --init --recursive
-cmake -S . -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64"
+cmake -S . -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
 cmake --build _Build/windows --target kyty_emulator
-```
-
-Build the launcher and stage a runnable installation:
-
-```powershell
-cmake --build _Build/windows --target launcher
 cmake --install _Build/windows --prefix _Build/windows/install
 ```
 
@@ -225,36 +219,19 @@ sudo apt-get install --no-install-recommends \
   libasound2-dev libpulse-dev libudev-dev libdbus-1-dev libwayland-dev wayland-protocols
 ```
 
-Qt 6 (Concurrent, Network, and Widgets) is required for the launcher. Use your distribution's
-packages (`qt6-base-dev`) or an official Qt installation.
-
 ```bash
 git submodule update --init --recursive
 
 cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_PREFIX_PATH="$Qt6_DIR"
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 
-cmake --build _Build/linux --target launcher --parallel
+cmake --build _Build/linux --target kyty_emulator --parallel
 cmake --install _Build/linux --prefix _Build/linux/install
 ```
 
-The install step copies the Qt libraries and plugins next to the binaries, so
-`_Build/linux/install` runs without a matching system Qt installation. FFmpeg is linked statically
-from the pinned [KytyPS5 FFmpeg core](https://github.com/KytyPS5/ext-ffmpeg-core)
-release, including VP9 and WebM support. System FFmpeg packages are not required.
-
-To build `kyty_emulator` and the `kyty_tests` target without Qt, use a separate build directory:
-
-```bash
-git submodule update --init --recursive
-
-cmake -S . -B _Build/linux-no-qt -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DKYTY_BUILD_LAUNCHER=OFF
-
-cmake --build _Build/linux-no-qt --target kyty_emulator kyty_tests --parallel
-```
+FFmpeg is linked statically from the pinned
+[KytyPS5 FFmpeg core](https://github.com/KytyPS5/ext-ffmpeg-core) release, including VP9 and
+WebM support. System FFmpeg packages are not required.
 
 As on Windows, the MSVC compiler is not used; Clang is required. `cl.exe` is rejected at configure
 time.
@@ -263,10 +240,8 @@ The CMake source root is the repository root.
 
 ### Building on NixOS
 
-A development shell provides Clang, CMake, Ninja, Qt 6, the Vulkan headers, and the SDL3 backend
-libraries. Enter it and configure exactly as on other Linux distributions; the shell exports
-`CMAKE_PREFIX_PATH` and `QT_PLUGIN_PATH`, so the `-DCMAKE_PREFIX_PATH="$Qt6_DIR"` argument is not
-needed:
+A development shell provides Clang, CMake, Ninja, the Vulkan headers, and the SDL3 backend
+libraries. Enter it and configure exactly as on other Linux distributions:
 
 ```bash
 nix-shell # or: nix develop
@@ -275,7 +250,7 @@ git submodule update --init --recursive
 cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 
-cmake --build _Build/linux --target launcher --parallel
+cmake --build _Build/linux --target kyty_emulator --parallel
 cmake --install _Build/linux --prefix _Build/linux/install
 ```
 
@@ -296,7 +271,7 @@ distrobox create --name kyty-build --image registry.fedoraproject.org/fedora:lat
 distrobox enter kyty-build
 ```
 
-Install the toolchain, Qt 6 and SDL3 dependencies:
+Install the toolchain and SDL3 dependencies:
 
 ```bash
 sudo dnf install -y \
@@ -304,22 +279,12 @@ sudo dnf install -y \
   mesa-libGL-devel libX11-devel libXcursor-devel libXext-devel libXfixes-devel \
   libXi-devel libXrandr-devel libXScrnSaver-devel libXtst-devel libxkbcommon-devel \
   alsa-lib-devel pulseaudio-libs-devel systemd-devel dbus-devel \
-  wayland-devel wayland-protocols-devel qt6-qtbase-devel
+  wayland-devel wayland-protocols-devel
 ```
 
-From the repository root, follow the launcher configure, build and install steps in
-[Building on Linux](#building-on-linux), omitting `-DCMAKE_PREFIX_PATH="$Qt6_DIR"`; CMake finds
-Fedora's packaged Qt 6 automatically.
-
-Run `./_Build/linux/install/kyty_launcher` on regular Fedora or inside the container. To launch a
-container build from the host, leave the container with `exit`, then run from the repository root:
-
-```bash
-distrobox enter kyty-build -- ./_Build/linux/install/kyty_launcher
-```
-
-Qt libraries and plugins are bundled. You can also launch directly on a Fedora Atomic host
-if its other system libraries are compatible with the container build.
+From the repository root, follow the configure, build and install steps in
+[Building on Linux](#building-on-linux). Run `./_Build/linux/install/kyty_emulator` on regular
+Fedora or inside the container; from the host, prefix it with `distrobox enter kyty-build --`.
 
 ### Building on macOS
 
@@ -332,39 +297,31 @@ Requirements:
 - An Apple Silicon Mac with Rosetta 2 installed (`softwareupdate --install-rosetta`)
 - Xcode (or the Command Line Tools)
 - Homebrew packages: `brew install cmake ninja glslang python`
-- Qt 6 (Concurrent, Network, and Widgets) with x86-64 support. The official Qt installation is
-  universal and works; Homebrew's Qt is arm64-only and will not link
 
 ```bash
 git submodule update --init --recursive
 
 cmake -S . -B _Build/macos -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-  -DCMAKE_PREFIX_PATH="$Qt6_DIR"
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 
-cmake --build _Build/macos --target launcher --parallel
+cmake --build _Build/macos --target kyty_emulator --parallel
 cmake --install _Build/macos --prefix _Build/macos/install
 ```
 
 The build re-signs `kyty_emulator` with the JIT entitlements it needs to execute translated
-guest code; no manual signing step is required. When the launcher is built, the installation
-also produces `_Build/macos/install/KytyPS5.app` — double-click to launch the GUI.
-A flat `kyty_emulator` is kept for CLI usage.
+guest code; no manual signing step is required.
 
 Vulkan comes from MoltenVK. Download `MoltenVK-macos.tar` from the
 [MoltenVK releases](https://github.com/KhronosGroup/MoltenVK/releases), then copy
-`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to the flat `kyty_emulator`
-(and, for the bundle, into `KytyPS5.app/Contents/Frameworks/`) and sign it with an ad hoc signature:
+`MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib` next to `kyty_emulator` and sign it with an ad
+hoc signature:
 
 ```bash
 codesign --force --sign - _Build/macos/install/libMoltenVK.dylib
-# For the bundle (if present):
-codesign --force --sign - _Build/macos/install/KytyPS5.app/Contents/Frameworks/libMoltenVK.dylib
-codesign --force --sign - _Build/macos/install/KytyPS5.app
 ```
 
-Release archives already include a signed `libMoltenVK.dylib` (both flat and inside the bundle).
+Release archives already include a signed `libMoltenVK.dylib`.
 
 ### Regression tests
 
@@ -380,52 +337,23 @@ Use `_Build/linux` instead of `_Build/windows` for a Linux build.
 ### Visual Studio Code
 
 A ready-made Visual Studio Code setup is included in [`.vscode`](.vscode). It configures CMake
-Tools to build the project with Ninja and `clang-cl` and provides launch profiles for both
-`kyty_launcher.exe` and `kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
+Tools to build the project with Ninja and `clang-cl` and provides launch profiles for
+`kyty_emulator.exe`. It is Windows-only: VS Code settings cannot select a
 compiler per platform, so on Linux configure from the command line as shown above.
 
 Before using it:
 
 1. Install the **CMake Tools** and **C/C++** extensions in Visual Studio Code.
-2. Update `CMAKE_PREFIX_PATH` in [`.vscode/settings.json`](.vscode/settings.json) to point to your
-   Qt 6 MSVC installation.
-3. Update the `--game` path in [`.vscode/launch.json`](.vscode/launch.json) for the
+2. Update the `--game` path in [`.vscode/launch.json`](.vscode/launch.json) for the
    **Debug kyty_emulator** profile.
-4. Open the repository in an x64 Visual Studio developer environment, configure the CMake project,
+3. Open the repository in an x64 Visual Studio developer environment, configure the CMake project,
    and select a launch profile from **Run and Debug**.
 
 ## Running
 
 Update your graphics driver before reporting rendering problems.
 
-To use the graphical launcher:
-
-```powershell
-.\_Build\windows\install\kyty_launcher.exe
-```
-
-```bash
-./_Build/linux/install/kyty_launcher
-```
-
-```bash
-open _Build/macos/install/KytyPS5.app  # or double-click in Finder
-```
-
-On first launch, add one or more game folders in the global settings. The launcher searches those
-folders recursively for game directories containing `eboot.bin` and ZArchive (`.zar`) game dumps
-whose archive root contains `eboot.bin`. Select a detected game and run it from the game list.
-ZArchive dumps are mounted read-only and streamed directly; they do not need to be extracted first.
-
-Official release builds include a built-in updater. Leave **Check for updates on startup** enabled,
-or click **Check for updates**, then choose **Install Update**. The launcher downloads the package
-for your platform from GitHub, checks its SHA-256 checksum, and restarts after installation. Close
-any running games first. Settings, saves, patches, and other files outside the release package are
-preserved; replacement failures restore the previous files. The installation folder must be writable.
-If a package cannot be installed automatically, the updater offers the GitHub release page.
-Source builds and builds from forks do not replace themselves with official releases.
-
-The emulator can also be started directly with a legally obtained game directory, ELF file, or
+Start the emulator with a legally obtained game directory, ELF file, or
 ZArchive dump:
 
 ```powershell

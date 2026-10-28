@@ -186,16 +186,12 @@ if (CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0.0)
 	list(APPEND KYTY_IWYU
 		kyty_emulator
 		common
-		#launcher
 	)
 	list(APPEND KYTY_CLANG_TIDY
 		kyty_emulator
 		#common
-		launcher
 	)
 endif()
-
-option(KYTY_BUILD_LAUNCHER "Build Slint launcher (fetches Slint, needs Rust)" ON)
 
 config_compiler_and_linker()
 
@@ -953,7 +949,7 @@ add_custom_target(kyty_trophy_sound
 add_dependencies(kyty_emulator kyty_trophy_sound)
 install(FILES "${KYTY_TROPHY_UNLOCK_SOUND}" DESTINATION assets/sounds)
 
-# Build-wide config the launcher reads from the emulator's folder.
+# Build-wide config read from the emulator's folder.
 set(KYTY_GLOBAL_CONFIG "${CMAKE_CURRENT_SOURCE_DIR}/assets/cfgGlobal.json")
 add_custom_target(kyty_global_config
 	COMMAND ${CMAKE_COMMAND} -E copy_if_different "${KYTY_GLOBAL_CONFIG}"
@@ -1120,13 +1116,6 @@ if(APPLE)
 endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
-if(KYTY_BUILD_LAUNCHER)
-	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
-
-	if(LINUX)
-		target_link_options(launcher PRIVATE $<$<CONFIG:Release>:-Wl,--strip-all>)
-	endif()
-endif()
 if(KYTY_CLANG_CL)
 	install(FILES "${KYTY_THIRD_PARTY_DIR}/winpthread/bin/libwinpthread-1.dll" DESTINATION .)
 endif()

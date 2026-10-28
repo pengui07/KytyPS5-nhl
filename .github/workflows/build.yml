@@ -62,9 +62,6 @@ jobs:
           & (Join-Path $bin "glslang.exe") --version
           $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
 
@@ -76,8 +73,6 @@ jobs:
           ninja --version
           clang-cl --version
           glslang --version
-          cargo --version
-          rustc --version
 
       - name: Configure
         shell: cmd
@@ -97,7 +92,7 @@ jobs:
       - name: Build
         shell: cmd
         run: |
-          cmake --build _Build/windows --target launcher kyty_emulator kyty_updater ^
+          cmake --build _Build/windows --target kyty_emulator ^
             audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests ^
             shader_recompiler_compute_tests ^
             resource_tracking_tests scalar_provenance_tests ^
@@ -145,15 +140,6 @@ jobs:
         shell: bash
         run: brew install glslang
 
-      - name: Install Qt 6.10.3
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: "6.10.3"
-          host: mac
-          target: desktop
-          arch: clang_64
-          cache: true
-
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
 
@@ -166,7 +152,6 @@ jobs:
           clang++ --version
           glslangValidator --version
           echo "Host architecture: $(uname -m)"
-          echo "QT_ROOT_DIR=$QT_ROOT_DIR"
 
       - name: Configure
         shell: bash
@@ -182,14 +167,13 @@ jobs:
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_C_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache \
-            -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
       - name: Build
         shell: bash
         run: |
           cmake --build _Build/macos \
-            --target launcher kyty_emulator kyty_updater audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
+            --target kyty_emulator audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               memory_tracker_tests page_manager_tests shader_recompiler_compute_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
@@ -215,50 +199,29 @@ jobs:
           archive="$RUNNER_TEMP/MoltenVK-macos.tar"
           package="$RUNNER_TEMP/MoltenVK"
           install_dir="_Build/macos/install"
-          app_dir="$install_dir/KytyPS5.app"
           moltenvk="$install_dir/libMoltenVK.dylib"
           curl --fail --location --retry 3 \
             --output "$archive" \
             "https://github.com/KhronosGroup/MoltenVK/releases/download/$MOLTENVK_VERSION/MoltenVK-macos.tar"
           echo "$MOLTENVK_SHA256  $archive" | shasum -a 256 --check
           tar -xf "$archive" -C "$RUNNER_TEMP"
-          test -d "$app_dir"
           install -m 755 \
             "$package/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib" \
             "$moltenvk"
           install -m 644 "$package/LICENSE" "$install_dir/LICENSE.MoltenVK"
           codesign --force --sign - --timestamp=none "$moltenvk"
-          install -d -m 755 "$app_dir/Contents/Frameworks" "$app_dir/Contents/Resources"
-          install -m 755 "$moltenvk" "$app_dir/Contents/Frameworks/libMoltenVK.dylib"
-          install -m 644 "$package/LICENSE" "$app_dir/Contents/Resources/LICENSE.MoltenVK"
-          codesign --force --sign - --timestamp=none "$app_dir"
 
       - name: Verify artifacts
         shell: bash
         run: |
           install_dir="_Build/macos/install"
-          app_dir="$install_dir/KytyPS5.app"
-          test -d "$app_dir"
           for binary in \
             "$install_dir/kyty_emulator" \
-            "$install_dir/libMoltenVK.dylib" \
-            "$app_dir/Contents/MacOS/KytyPS5" \
-            "$app_dir/Contents/MacOS/kyty_emulator" \
-            "$app_dir/Contents/MacOS/kyty_updater" \
-            "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
+            "$install_dir/libMoltenVK.dylib"; do
             file "$binary"
             lipo "$binary" -verify_arch x86_64
-          done
-          for binary in \
-            "$install_dir/kyty_emulator" \
-            "$install_dir/libMoltenVK.dylib" \
-            "$app_dir/Contents/MacOS/KytyPS5" \
-            "$app_dir/Contents/MacOS/kyty_emulator" \
-            "$app_dir/Contents/MacOS/kyty_updater" \
-            "$app_dir/Contents/Frameworks/libMoltenVK.dylib"; do
             codesign --verify --strict "$binary"
           done
-          codesign --verify --deep --strict --verbose=2 "$app_dir"
 
       - name: Package macOS artifacts
         shell: bash
@@ -317,9 +280,6 @@ jobs:
             pkg-config \
             wayland-protocols
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.11
 
@@ -332,8 +292,6 @@ jobs:
           clang++ --version
           ld.lld --version
           glslangValidator --version
-          cargo --version
-          rustc --version
 
       - name: Configure
         shell: bash
@@ -370,7 +328,7 @@ jobs:
         shell: bash
         run: |
           cmake --build _Build/linux \
-            --target launcher kyty_emulator kyty_updater page_manager_tests memory_tracker_tests \
+            --target kyty_emulator page_manager_tests memory_tracker_tests \
               audio_out2_port_tests pad_haptics_tests controller_settings_tests host_input_tests ime_dialog_tests lru_cache_tests virtual_memory_allocation_tests \
               resource_tracking_tests scalar_provenance_tests \
               resource_materialization_tests shader_vertex_metadata_tests archive_file_tests avplayer_file_tests \
@@ -390,10 +348,7 @@ jobs:
       - name: Verify artifacts
         shell: bash
         run: |
-          file _Build/linux/install/kyty_launcher
-          test -x _Build/linux/install/kyty_launcher
           file _Build/linux/install/kyty_emulator
-          test -x _Build/linux/install/kyty_updater
           file _Build/linux/install/kyty_emulator | grep -q "ELF 64-bit LSB .*x86-64"
           ldd _Build/linux/install/kyty_emulator > /dev/null
           _Build/linux/install/kyty_emulator --help > /dev/null
@@ -464,11 +419,7 @@ jobs:
         run: |
           linux_dir="artifacts/KytyPS5-Linux-x86_64"
           test -d "$linux_dir"
-          chmod a+x \
-            "$linux_dir/kyty_launcher" \
-            "$linux_dir/launcher" \
-            "$linux_dir/kyty_emulator" \
-            "$linux_dir/kyty_updater"
+          chmod a+x "$linux_dir/kyty_emulator"
           tar -C "$linux_dir" -czf \
             "$GITHUB_WORKSPACE/$RELEASE_NAME-Linux-x86_64.tar.gz" .
 

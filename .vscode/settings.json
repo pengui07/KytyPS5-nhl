@@ -9,8 +9,7 @@
     },
     "cmake.configureSettings": {
         "CMAKE_C_COMPILER": "clang-cl",
-        "CMAKE_CXX_COMPILER": "clang-cl",
-        "CMAKE_PREFIX_PATH": "C:/Qt/6.11.0/msvc2022_64"
+        "CMAKE_CXX_COMPILER": "clang-cl"
     },
     "C_Cpp.default.intelliSenseMode": "windows-clang-x64",
     "C_Cpp.default.compileCommands": "${workspaceFolder}/_Build/vscode-clang/compile_commands.json",
