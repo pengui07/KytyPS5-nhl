@@ -469,8 +469,9 @@ void TestRumbleFallbackGains() {
 		                     gains.data()) == 2 * 1000000 / 48000,
 		      "rumble fallback playback time is wrong");
 	};
+	// The motors follow the RMS above 0.1, full at 0.4: RMS 0.125 is (0.125 - 0.1) / 0.3 of full.
 	queue({0.0f, 0.25f});
-	Check(pad_rumble[2].large == 0 && pad_rumble[2].small == 16383,
+	Check(pad_rumble[2].large == 0 && pad_rumble[2].small == 5461,
 	      "rumble fallback ignored per-channel gains");
 	queue({0.5f, 0.0f});
 	Check(pad_rumble[2].large == 32767 && pad_rumble[2].small == 0,
