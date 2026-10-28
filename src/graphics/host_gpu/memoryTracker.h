@@ -248,8 +248,20 @@ public:
 	                               Func&& func) {
 		ValidateRange(vaddr, size);
 		CheckNotInUploadCallback();
-		const auto                                  end = vaddr + size;
-		std::vector<std::pair<uint64_t, uint64_t>> spans; // [begin, end)
+		const auto end = vaddr + size;
+		// [begin, end). The outermost call of a thread reuses one vector (an allocation per call was
+		// 0.4% of the execution thread); func may call back in, which then takes its own.
+		thread_local std::vector<std::pair<uint64_t, uint64_t>> t_spans;
+		thread_local uint32_t                                   t_depth = 0;
+		std::vector<std::pair<uint64_t, uint64_t>>              local;
+		const bool reuse = t_depth == 0;
+		auto&      spans = reuse ? t_spans : local;
+		spans.clear();
+		struct Depth {
+			uint32_t& depth;
+			explicit Depth(uint32_t& d): depth(d) { depth++; }
+			~Depth() { depth--; }
+		} const nesting(t_depth);
 		const auto add = [&](uint64_t begin, uint64_t finish) {
 			begin  = std::max(begin, vaddr);
 			finish = std::min(finish, end);

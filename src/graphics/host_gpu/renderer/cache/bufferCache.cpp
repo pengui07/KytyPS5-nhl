@@ -2528,7 +2528,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uin
 }
 
 bool BufferCache::PlainReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& cpu_generation,
-                                 uint64_t registration) {
+                                 uint64_t registration, uint64_t& touched) {
 	if (&buffer == &m_stream_buffer || registration != m_registration_generation) {
 		return false;
 	}
@@ -2538,7 +2538,10 @@ bool BufferCache::PlainReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, 
 	}
 	cpu_generation = cpu;
 	FrameBreakdown::BdaBatchNoteUsed(vaddr, size);
-	TouchBuffer(buffer);
+	if (touched != m_gc_tick) {
+		TouchBuffer(buffer);
+		touched = m_gc_tick;
+	}
 	return true;
 }
 
@@ -2583,9 +2586,9 @@ bool BufferCache::WrittenBindHolds(Buffer& buffer, uint64_t vaddr, uint64_t size
 }
 
 bool BufferCache::TexelReadHolds(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& cpu_generation,
-                                 uint64_t registration, uint64_t image_version) {
+                                 uint64_t registration, uint64_t image_version, uint64_t& touched) {
 	return image_version == m_texture_cache.AddressBucketVersion(vaddr) &&
-	       PlainReadHolds(buffer, vaddr, size, cpu_generation, registration);
+	       PlainReadHolds(buffer, vaddr, size, cpu_generation, registration, touched);
 }
 
 bool BufferCache::TexelReadKeepable(uint64_t vaddr) {

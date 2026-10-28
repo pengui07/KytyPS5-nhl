@@ -141,6 +141,8 @@ struct PreparedBindings {
 		uint64_t                 image_version  = 0; // texel reads (0: not one)
 		vk::DescriptorBufferInfo info;
 		uint32_t                 buffer_offset = 0;
+		// The buffer cache's LRU tick when a hit last touched the buffer (see PlainReadHolds()).
+		uint64_t                 touched = ~uint64_t {0};
 	};
 	std::vector<BufferSlotMemo> buffer_memos;
 	std::vector<TextureBinding>           images;

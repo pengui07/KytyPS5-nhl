@@ -1834,7 +1834,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		    memo.address == source.address && memo.size == source.size &&
 		    ExecRegions::TimedTwice(ExecRegions::WarmPlain, [&] {
 			    return cache.PlainReadHolds(*memo.buffer, source.address, source.size, memo.cpu_generation,
-			                                memo.registration);
+			                                memo.registration, memo.touched);
 		    })) {
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
@@ -1858,7 +1858,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		if (texel && memo.buffer != nullptr && memo.image_version != 0 && memo.address == source.address &&
 		    memo.size == source.size &&
 		    cache.TexelReadHolds(*memo.buffer, source.address, source.size, memo.cpu_generation,
-		                         memo.registration, memo.image_version)) {
+		                         memo.registration, memo.image_version, memo.touched)) {
 			prepared.buffers[index] = memo.info;
 			pack_memory_offset(index, memo.buffer_offset);
 			FrameBreakdown::VAdd(FrameBreakdown::g_counters.slot_hit[2]);
@@ -1874,11 +1874,11 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 			auto&      global = bind_memo.slot;
 			const bool holds =
 			    kind == 1   ? cache.PlainReadHolds(*global.buffer, source.address, source.size, global.cpu_generation,
-			                                       global.registration)
+			                                       global.registration, global.touched)
 			    : kind == 2 ? cache.WrittenBindHolds(*global.buffer, source.address, source.size,
 			                                         global.ranges_version, global.registration)
 			                : cache.TexelReadHolds(*global.buffer, source.address, source.size, global.cpu_generation,
-			                                       global.registration, global.image_version);
+			                                       global.registration, global.image_version, global.touched);
 			if (holds) {
 				if (kind == 2) m_context.GetTextureCache().InvalidateMemoryFromGPU(source.address, source.size);
 				prepared.buffers[index] = global.info;

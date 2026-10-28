@@ -1520,6 +1520,28 @@ Toward 120 fps (2026-10-23):
   cache actions (~230) and CPU-dirty uploads (~100). The label writes' first barrier waiting only
   for earlier transfers instead of all work: GPU 8.73 vs 8.66 ms per flip, noise, dropped (the
   per-command timestamps inflate barrier costs).
+* Resolved draws: 192 per ring (96 per draw resolver) instead of 320. Each is about 38 KB; 320 (12
+  MB) did not stay in cache or within the TLB's reach. Paused A/B with 48 per resolver: draw -1.2%,
+  dispatch -1.9%; but in play 48 let the resolvers fall behind (execution thread idle 163 vs 94
+  ms/s, about -6% fps), while 96 did not (idle 171 vs 212 ms/s against 160). A 64-entry dispatch
+  ring instead of 320 was noise.
+* Guest data copies under deferred page protection (`StreamGuestData`) whose range no single
+  mapping holds drained the whole host copy queue and copied on the execution thread (about 2% of
+  it in play, waiting); they now go to the copy thread a page at a time. In-play A/B: draw 3.572 ->
+  3.342 us, dispatch 2.304 -> 2.231 us.
+* Pads without a gyro (Xbox): View/Back toggled emulated gyro tilt, which takes over the right
+  stick, so NHL 27 lost the right stick until View was pressed again. View/Back/Create now presses
+  the touch pad and gyro emulation has no default button. Their rumble stands in for the DualSense
+  haptic audio stream: it followed each block's doubled peak, so the stream's continuous texture
+  (RMS 0.02-0.1 in NHL 27; events reach 0.2-0.5) shook the pad all the time. The motors now follow
+  the RMS above 0.1 (full at 0.4); `KYTY_DBG_HAPTICS=1` prints the stream's levels
+  (`NHL27HAPTICS`). Test runs pass `--controller-vibration 0`.
+* A compute dispatch with a shader at an address `AgcCreateShader` never saw ended the emulator
+  ("missing from ShaderMap", once, 26 minutes into a session). A registered shader with the same
+  code at that address now stands in for it (`NHL27SHADERMAP`); with no match the dispatches are
+  skipped with a warning.
+* An hour of real play on 44fb96d5 with the shipped settings (`cfgGlobal.json`: resolution scale
+  2/3 and FSR 3): 92.1 fps at 60 Hz, 69.0 fps in the 30 Hz scenes, no crash.
 
 ## Merged defaults (nhl27 + claude/nhl27-perf)
 
