@@ -6,7 +6,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+
+#if defined(_MSC_VER)
 #include <intrin.h>
+#elif defined(__x86_64__)
+#include <x86intrin.h>
+#endif
 
 // KYTY_DBG_EXEC_REGIONS=1: the execution thread's time by region of the draw and dispatch paths,
 // from the time stamp counter (a few cycles per region), every 5 s as ms per second (NHL27REGIONS).
