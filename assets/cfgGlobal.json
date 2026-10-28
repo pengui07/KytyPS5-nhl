@@ -35,7 +35,7 @@
       "KYTY_FAST_MINMAX": "1",
       "KYTY_SKIP_BOUNDS_CHECKS": "1",
 
-      "KYTY_DBG_LOOP_CAP": "65536",
+      "KYTY_DBG_LOOP_CAP": "16384",
       "KYTY_DBG_SKIP_BAD_SHADERS": "1",
       "KYTY_DBG_BREADCRUMBS": "0",
       "KYTY_DBG_FRAME_DUMP": "0",
